@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-provider-protocol = { path = "../provider-protocol" }
-operation-protocol = { path = "../operation-protocol" }
+provider-protocol = { path = "../protocol/provider" }
+operation-protocol = { path = "../protocol/operation" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

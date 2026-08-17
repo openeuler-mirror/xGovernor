@@ -23,8 +23,8 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-session-protocol = { path = "../../crates/session-protocol" }
-provider-protocol = { path = "../../crates/provider-protocol" }
+session-protocol = { path = "../../crates/protocol/session" }
+provider-protocol = { path = "../../crates/protocol/provider" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }

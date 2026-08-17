@@ -1,0 +1,5 @@
+[source.crates-io]
+replace-with = 'mirror'
+
+[source.mirror]
+registry ="sparse+http://mirrors.huaweicloud.com/artifactory/api/cargo/cargo-remote/index/"

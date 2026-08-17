@@ -10,9 +10,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
-session-protocol = { path = "../../crates/session-protocol" }
-provider-protocol = { path = "../../crates/provider-protocol" }
-operation-protocol = { path = "../../crates/operation-protocol" }
+session-protocol = { path = "../../crates/protocol/session" }
+provider-protocol = { path = "../../crates/protocol/provider" }
+operation-protocol = { path = "../../crates/protocol/operation" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }
