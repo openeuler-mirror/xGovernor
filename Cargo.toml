@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "apps/server",
+    "apps/runtime-local",
+    "apps/runtime-e2b",
+    "apps/runtime-pi",
+    "crates/provider-protocol",
+    "crates/session-protocol",
+    "crates/operation-protocol",
+    "crates/backend",
+    "crates/core",
+    "crates/manager",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MulanPSL-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "1.0"
+tokio = { version = "1.35", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+arc-swap = "1.7"
+tempfile = "3.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "rustls-tls-native-roots"] }
+shellexpand = "3"
+arboard = { version = "3", default-features = false }
+base64 = "0.22"
+crossterm = { version = "0.28", features = ["event-stream"] }
+toml = "0.8"
+parking_lot = "0.12"
+futures = "0.3"
+futures-util = "0.3"
+tokio-stream = "0.1"
+ratatui = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ulid = "1.1"
+clap = { version = "4.5", features = ["derive"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["fs"] }
+rust-embed = "8.5"
+mime_guess = "2.0"
+dirs = "5"
+aes-gcm = "0.10"
+rand = "0.8"
+hex = "0.4"
+url = "2.5"
+# Cerberus dependencies (disabled by default)
+# cerberus-core = { path = "crates/cerberus/cerberus-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
