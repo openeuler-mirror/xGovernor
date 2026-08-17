@@ -1,0 +1,18 @@
+[package]
+name = "xgovernor-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+provider-protocol = { path = "../provider-protocol" }
+operation-protocol = { path = "../operation-protocol" }
+backend = { path = "../backend" }
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

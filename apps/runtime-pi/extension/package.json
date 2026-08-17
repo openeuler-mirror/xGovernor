@@ -1,0 +1,29 @@
+{
+  "name": "xgovernor-bridge-extension",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Pi extension that redirects pi's built-in file/exec tools to xGovernor's local HTTP bridge (apps/runtime-pi) instead of touching the daemon host's filesystem directly.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "typebox": "1.3.7"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
