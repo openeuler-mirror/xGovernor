@@ -29,7 +29,7 @@
 //! WAL mode is enabled on open, matching this codebase's single-writer
 //! control-plane posture (`docs/tenancy_design.md` line 4: "单写者控制面").
 
-use crate::application::SessionRepository;
+use crate::application::{SessionListPage, SessionRepository};
 use crate::domain::{
     CheckpointLineage, EffectiveCapabilities, IsolationFacts, OpaqueRuntimeState, ResolvedLlm,
     SessionDomainError, SessionLease, SessionRecord, SessionStatus, WorkspaceFacts,
@@ -291,6 +291,64 @@ impl SessionRepository for SqliteSessionRepository {
         .map_err(|error| internal_error(format!("sqlite save task panicked: {error}")))?;
 
         result.map_err(|error| internal_error(format!("sqlite save failed: {error}")))
+    }
+
+    /// Two indexed queries (COUNT then SELECT...LIMIT) inside one
+    /// `spawn_blocking` closure sharing the same locked connection — a read
+    /// endpoint, so the extra round trip over a single combined query is a
+    /// non-issue, and it keeps the "true total" and "capped page" logic each
+    /// expressed as an ordinary SQL query rather than fetched-then-truncated
+    /// in Rust (which would require pulling every matching row over just to
+    /// count them).
+    async fn list_active(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        let conn = self.conn.clone();
+        let tenant_id = tenant_id.map(str::to_string);
+        let limit = limit as i64;
+        let result = tokio::task::spawn_blocking(move || -> Result<SessionListPage, String> {
+            const ACTIVE_STATUSES: &str = "status IN ('opening','idle','running','paused')";
+            let conn = conn
+                .lock()
+                .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+
+            let total_active: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions \
+                         WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL)"
+                    ),
+                    params![tenant_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT * FROM sessions \
+                     WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL) \
+                     ORDER BY updated_at_ms DESC LIMIT ?2"
+                ))
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![tenant_id, limit], row_to_record)
+                .map_err(|error| error.to_string())?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                sessions.push(row.map_err(|error| error.to_string())??);
+            }
+
+            Ok(SessionListPage {
+                sessions,
+                total_active: total_active.max(0) as u32,
+            })
+        })
+        .await
+        .map_err(|error| internal_error(format!("sqlite list_active task panicked: {error}")))?;
+
+        result.map_err(|error| internal_error(format!("sqlite list_active failed: {error}")))
     }
 }
 

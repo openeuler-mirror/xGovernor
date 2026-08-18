@@ -1,14 +1,16 @@
 use crate::{
-    project_runtime_event, project_session, CheckpointLineage, EffectiveCapabilities,
-    IsolationBoundary, IsolationFacts, LeaseCheckFailure, OpaqueRuntimeState, RuntimeAdapter,
-    RuntimeCapability, RuntimeEntryContext, RuntimeInteractionInput, RuntimeStartRequest,
-    RuntimeTurnInput, SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable,
-    SessionRecord, SessionStatus, WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
+    project_runtime_event, project_session, project_session_summary, CheckpointLineage,
+    EffectiveCapabilities, IsolationBoundary, IsolationFacts, LeaseCheckFailure,
+    OpaqueRuntimeState, RuntimeAdapter, RuntimeCapability, RuntimeEntryContext,
+    RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput, SecurityContext,
+    SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord, SessionStatus,
+    WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
 };
 use session_protocol::{
     SessionControlResponse, SessionEvent, SessionForkRequest, SessionHeartbeatResponse,
-    SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionOpenRequest,
-    SessionOpenResponse, SessionSubmitReceipt, SessionTurnRequest,
+    SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionListResponse,
+    SessionOpenRequest, SessionOpenResponse, SessionSubmitReceipt, SessionTurnRequest,
+    TenantQuotaSnapshot,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -1041,12 +1043,64 @@ impl SessionApplication {
     ) -> Result<(), SessionDomainError> {
         self.require_session(ctx, runtime_id).await.map(|_| ())
     }
+
+    /// Thin audit-logging wrapper around [`Self::list_sessions_impl`] — see
+    /// [`audit_log`]. Not tied to one `runtime_id`, so the audit line carries
+    /// `runtime_id = "-"`.
+    pub async fn list_sessions(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+    ) -> Result<SessionListResponse, SessionDomainError> {
+        let result = self.list_sessions_impl(ctx, limit).await;
+        audit_log(ctx, "list_sessions", None, &result);
+        result
+    }
+
+    /// v1 self-service query (`docs/tenancy_design.md` §4 closing line):
+    /// most-recent-N active sessions visible to `ctx` plus a quota snapshot.
+    /// Ownership scoping is the same `ctx.tenant_id()` passthrough used
+    /// elsewhere (`None` = admin's global view, `Some(id)` = that tenant's
+    /// own sessions only) — no separate admin-only branch.
+    async fn list_sessions_impl(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+    ) -> Result<SessionListResponse, SessionDomainError> {
+        let page = self.records.list_active(ctx.tenant_id(), limit).await?;
+        let has_more = page.total_active as usize > page.sessions.len();
+        Ok(SessionListResponse {
+            sessions: page.sessions.iter().map(project_session_summary).collect(),
+            has_more,
+            quota: TenantQuotaSnapshot {
+                max_sessions: ctx.quota.max_sessions,
+                active_sessions: page.total_active,
+                max_requests_per_minute: ctx.quota.max_requests_per_minute,
+            },
+        })
+    }
+}
+
+/// Result of [`SessionRepository::list_active`]: `sessions` is capped at the
+/// caller-supplied `limit` (most-recently-updated first), `total_active` is
+/// the true count matching the filter, uncapped — callers derive `has_more`
+/// from the two (`total_active > sessions.len()`) and can report an accurate
+/// quota-usage number even when the list itself is truncated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionListPage {
+    pub sessions: Vec<SessionRecord>,
+    pub total_active: u32,
 }
 
 #[async_trait::async_trait]
 pub trait SessionRepository: Send + Sync {
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError>;
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError>;
+    async fn list_active(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError>;
 }
 
 pub trait TurnIdGenerator: Send + Sync {
@@ -1280,6 +1334,39 @@ mod tests {
         SecurityContext::tenant("tenant-a", "test")
     }
 
+    /// Shared `list_active` logic for the in-memory test doubles below
+    /// ([`MemoryRepository`], [`MapRepository`]) so each one only has to
+    /// supply its records; the filter/sort/cap semantics stay in one place
+    /// rather than being duplicated per double.
+    fn select_active(
+        records: impl Iterator<Item = SessionRecord>,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> SessionListPage {
+        let mut matching: Vec<SessionRecord> = records
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    SessionStatus::Opening
+                        | SessionStatus::Idle
+                        | SessionStatus::Running
+                        | SessionStatus::Paused
+                )
+            })
+            .filter(|record| match tenant_id {
+                None => true,
+                Some(id) => record.tenant_id.as_deref() == Some(id),
+            })
+            .collect();
+        matching.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        let total_active = matching.len() as u32;
+        matching.truncate(limit);
+        SessionListPage {
+            sessions: matching,
+            total_active,
+        }
+    }
+
     struct EmptyRepository;
 
     #[async_trait]
@@ -1293,6 +1380,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -1457,6 +1555,18 @@ mod tests {
         async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
             *self.0.lock().await = Some(record);
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            tenant_id: Option<&str>,
+            limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(select_active(
+                self.0.lock().await.clone().into_iter(),
+                tenant_id,
+                limit,
+            ))
         }
     }
 
@@ -2690,6 +2800,18 @@ mod tests {
                 .await
                 .insert(record.runtime_id.clone(), record);
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            tenant_id: Option<&str>,
+            limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(select_active(
+                self.0.lock().await.values().cloned(),
+                tenant_id,
+                limit,
+            ))
         }
     }
 

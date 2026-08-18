@@ -127,7 +127,9 @@ impl std::error::Error for TenantConfigError {}
 /// Reads and parses `path`, then validates it into a flat
 /// token → [`SecurityContext`] map — the exact shape [`super::auth::TokenTable`]
 /// stores, whether this is the initial load at startup or a `SIGHUP` reload.
-pub fn load_tenants_file(path: &Path) -> Result<HashMap<String, SecurityContext>, TenantConfigError> {
+pub fn load_tenants_file(
+    path: &Path,
+) -> Result<HashMap<String, SecurityContext>, TenantConfigError> {
     let contents = std::fs::read_to_string(path).map_err(TenantConfigError::Read)?;
     let file: TenantsFile = toml::from_str(&contents).map_err(TenantConfigError::Parse)?;
     into_entries(file)
@@ -138,10 +140,7 @@ fn into_entries(file: TenantsFile) -> Result<HashMap<String, SecurityContext>, T
 
     for token in file.admin.tokens {
         if entries
-            .insert(
-                token.clone(),
-                SecurityContext::admin(ADMIN_PRINCIPAL_LABEL),
-            )
+            .insert(token.clone(), SecurityContext::admin(ADMIN_PRINCIPAL_LABEL))
             .is_some()
         {
             return Err(TenantConfigError::DuplicateToken(token));

@@ -176,7 +176,7 @@ mod tests {
         Clock, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEventReceiver,
         RuntimeIdGenerator, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
         SecurityContext, SessionApplication, SessionDomainError, SessionEnvironmentNormalizer,
-        SessionRecord,
+        SessionListPage, SessionRecord,
     };
 
     struct EmptyRepository;
@@ -192,6 +192,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 

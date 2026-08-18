@@ -168,25 +168,24 @@ fn load_token_table_at_startup(path: &Path, path_is_explicit: bool) -> Option<To
     }
 }
 
-
 #[cfg(unix)]
 fn spawn_tenants_reload_task(
     table: TokenTable,
     path: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut signal =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                Ok(signal) => signal,
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        "failed to install the SIGHUP signal handler; tenants config hot-reload \
-                         is disabled for this run"
-                    );
-                    return;
-                }
-            };
+        let mut signal = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "failed to install the SIGHUP signal handler; tenants config hot-reload \
+                     is disabled for this run"
+                );
+                return;
+            }
+        };
         loop {
             signal.recv().await;
             match load_tenants_file(&path) {

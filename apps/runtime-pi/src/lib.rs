@@ -325,11 +325,13 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 .expect("GitWorkspaceMetadata serialization is infallible");
                 (E2B_WORKSPACE_ROOT.to_string(), reference.clone(), metadata)
             }
-            (workspace, backend_id) => return Err(SessionDomainError::InvalidRequest {
-                message: format!(
+            (workspace, backend_id) => {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: format!(
                     "workspace kind {workspace:?} is not supported by PI backend_id '{backend_id}'"
                 ),
-            }),
+                })
+            }
         };
 
         let (boundary, network, capabilities) = match ext.backend_id.as_str() {

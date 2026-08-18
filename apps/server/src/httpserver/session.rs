@@ -22,6 +22,10 @@ use xgovernor_core::{project_session_error, SecurityContext, SessionApplication}
 const STREAM_ENTRY_TTL: Duration = Duration::from_secs(30);
 const STREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_PENDING_STREAMS: usize = 1000;
+/// Cap on `GET /api/v1/sessions` — v1 has no real pagination
+/// (`docs/tenancy_design.md` §4 addendum): callers get the most-recent N
+/// active sessions, full stop.
+const DEFAULT_SESSION_LIST_LIMIT: usize = 100;
 
 /// One pending stream: the receiving half of a turn's forwarded eventx w
 /// channel, plus when it was registered (for TTL expiry).
@@ -131,6 +135,7 @@ pub fn session_router(state: Arc<SessionHttpState>) -> Router {
             "/api/v1/sessions/:runtime_id/turns/:turn_id/events",
             get(stream_turn_events),
         )
+        .route("/api/v1/sessions", get(list_sessions))
         .with_state(state)
 }
 
@@ -267,6 +272,20 @@ async fn fork_session(
     }
 }
 
+async fn list_sessions(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+) -> Response {
+    match state
+        .application
+        .list_sessions(&ctx, DEFAULT_SESSION_LIST_LIMIT)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
 async fn stream_turn_events(
     State(state): State<Arc<SessionHttpState>>,
     Extension(ctx): Extension<SecurityContext>,
@@ -349,7 +368,7 @@ mod tests {
     use xgovernor_core::{
         Clock, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver,
         RuntimeIdGenerator, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-        SessionDomainError, SessionEnvironmentNormalizer, SessionRecord,
+        SessionDomainError, SessionEnvironmentNormalizer, SessionListPage, SessionRecord,
     };
 
     struct EmptyRepository;
@@ -365,6 +384,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -432,6 +462,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -808,6 +849,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 

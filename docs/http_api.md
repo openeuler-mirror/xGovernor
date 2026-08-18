@@ -26,6 +26,7 @@
 | 路由                                                     | 方法   | 请求体                       | 成功响应                         |
 | ------------------------------------------------------ | ---- | ------------------------- | ---------------------------- |
 | `/api/v1/health`                                       | GET  | —                         | 200                          |
+| `/api/v1/sessions`                                     | GET  | —                         | 200 SessionListResponse      |
 | `/api/v1/sessions/open`                                | POST | SessionOpenRequest        | 200 SessionOpenResponse      |
 | `/api/v1/sessions/turns`                               | POST | SessionTurnRequest        | 202 SessionSubmitReceipt     |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | —                         | 200 SSE 流                    |
@@ -43,6 +44,7 @@
 | 路由                                                     | 方法   | 用途                             |
 | ------------------------------------------------------ | ---- | ------------------------------ |
 | `/api/v1/health`                                       | GET  | 存活探测                           |
+| `/api/v1/sessions`                                     | GET  | 自助查询：调用方可见的活跃会话列表 + 配额快照       |
 | `/api/v1/sessions/open`                                | POST | 打开会话（携带 `runtime_id` 时为幂等重附着）  |
 | `/api/v1/sessions/turns`                               | POST | 提交 turn → 回执携带服务端签发的 `turn_id` |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | 单个 turn 的 SSE 事件流              |
@@ -59,6 +61,30 @@
 ## 3. 会话控制面
 
 
+
+### 会话列表 / 配额自助查询
+
+`GET /api/v1/sessions`，无请求体。与其余路由同一条共享路由，按调用方身份自动过滤（[tenancy_design.md](./tenancy_design.md) §4）：tenant 身份只看到自己名下的活跃会话，admin 身份看到全部租户。
+
+```json
+{
+  "sessions": [
+    {
+      "runtime_id": "runtime-…", "conversation_id": "demo", "sender_id": "me",
+      "status": "idle", "runtime_kind": "mock",
+      "created_at_ms": 0, "updated_at_ms": 0
+    }
+  ],
+  "has_more": false,
+  "quota": { "max_sessions": 10, "active_sessions": 1, "max_requests_per_minute": null }
+}
+```
+
+- `sessions` 只含**活跃**会话（`opening | idle | running | paused`），从不包含 `failed`/`closed`；按 `updated_at_ms` 降序排列。
+- v1 无真正分页：`sessions` 最多返回服务端固定上限（当前 100）条最近更新的记录；`has_more` 为 true 表示调用方真实活跃会话数超过了这个上限。
+- `quota.active_sessions` 是调用方可见范围内的**真实计数**（来自 SQLite 查询，不是准入路径 `open()` 用的内存计数器——两者已知在 daemon 重启后可能短暂不一致，这里刻意不复用准入路径的计数，见 [tenancy_design.md](./tenancy_design.md) §4 附注），不受 `sessions` 截断影响。
+- `quota.max_sessions` / `max_requests_per_minute` 直接取自调用方自身的配额配置；admin 身份没有配额上限，两个字段为 `null`。
+- 不返回历史/已关闭会话，也不暴露审计日志——这两者是 v1 明确排除的范围（[tenancy_design.md](./tenancy_design.md) §4）。
 
 ### open
 

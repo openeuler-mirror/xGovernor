@@ -671,8 +671,8 @@ mod tests {
         NormalizedSessionEnvironment as CoreNormalizedSessionEnvironment, RuntimeIdGenerator,
         SecurityContext as CoreSecurityContext, SessionApplication,
         SessionDomainError as DomainError, SessionEnvironmentNormalizer as CoreEnvNormalizer,
-        SessionRecord, SessionRepository, TurnIdGenerator, WorkspaceAccess as CoreWorkspaceAccess,
-        WorkspaceFacts as CoreWorkspaceFacts,
+        SessionListPage, SessionRecord, SessionRepository, TurnIdGenerator,
+        WorkspaceAccess as CoreWorkspaceAccess, WorkspaceFacts as CoreWorkspaceFacts,
     };
 
     fn backend_ext(backend_id: &str) -> SessionExtensions {
@@ -900,6 +900,16 @@ mod tests {
         async fn save(&self, record: SessionRecord) -> Result<(), DomainError> {
             *self.0.lock().unwrap() = Some(record);
             Ok(())
+        }
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, DomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 

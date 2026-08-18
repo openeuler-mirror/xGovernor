@@ -103,7 +103,6 @@ impl TokenTable {
             true
         }
     }
-
 }
 
 /// Install the auth middleware. With `Some(table)`, every request must carry
