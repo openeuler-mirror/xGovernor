@@ -292,8 +292,8 @@ fail-closed 验证（§11 的「沙箱已死」分支）：外部手工 `DELETE 
 
 ## 11. 已知边界（demo 场景下要知道的坑）
 
-- ~~沙箱、配额、跨重启 reconcile 现在都在——它们由 `ext.runtime_pi.backend_id` 选中的那个 `InstanceManager` 正常提供，与 `apps/runtime-local`/
-`apps/runtime-e2b` 无异。仍然没有的只是 `pi` **子进程自己**的账本：daemon 进程重启后，之前 `pi` 子进程的进程内注册表随之清空——正在跑的
+- ~~沙箱、配额、跨重启 reconcile 现在都在——它们由 `ext.runtime_pi.backend_id` 选中的那个 `InstanceManager` 正常提供，与
+`apps/runtime-mock` 无异。仍然没有的只是 `pi` **子进程自己**的账本：daemon 进程重启后，之前 `pi` 子进程的进程内注册表随之清空——正在跑的
 turn 不会在重启后自动恢复（它所附着的沙箱本身不受影响，只是没有 `pi` 进程再跟它对话了）。~~
   **已修复（2026-08-17，惰性复原，见 §10.5）**：daemon 重启后 `pi` 子进程注册表确实随进程清空，但
   会话的复原信息已随 open 持久化进 `SessionRecord.runtime`（`backend_id`/`pi_session_dir`/……），
@@ -318,7 +318,7 @@ turn 不会在重启后自动恢复（它所附着的沙箱本身不受影响，
   因为沙箱网络未禁，不夸大隔离；`isolation.metadata` 里带 `tool_backend_id`/`controller_boundary` 说明是
   「宿主控制进程 + 远程工具后端」的复合部署）。准入矩阵变成：tenant + git + e2b 通过（url 需过 https 卫生检查），
   tenant + git + local 拒绝，tenant + 非 git 一律拒绝。配套：e2b 的 git 会话在 `PiRuntime::start()` 里先
-  `git clone` 到沙箱 `/home/user/workspace`（失败则回滚删沙箱），与 `apps/runtime-e2b` 的 `clone_git_workspace`
+  `git clone` 到沙箱 `/home/user/workspace`（失败则回滚删沙箱），与 `apps/runtime-mock` 的 `clone_git_workspace`
   行为一致；e2b 的 workspace root 恒为沙箱内 `/home/user/workspace`，不再把宿主路径当远程事实。
 - **~~daemon 重启后，旧会话的沙箱不会随 close 销毁~~（已修复，2026-08-17，见 §10.5）**：旧实现里
   pi 子进程注册表是进程内的，重启后对旧 `runtime_id` close 返回 `not_found`，但沙箱仍活着，只能等

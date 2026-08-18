@@ -20,14 +20,6 @@ use xgovernor_server::{create_router, SessionHttpState, TokenTable};
 
 const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Per-owner / global concurrent-sandbox caps for the `InstanceManager`s this
-/// binary composes directly (see [`build_local_instance_manager`]/
-/// [`build_e2b_instance_manager`]). Mirrors `apps/runtime-local`'s and
-/// `apps/runtime-e2b`'s own `DEFAULT_MAX_SANDBOXES_PER_OWNER`/`_GLOBAL`
-/// constants exactly; those are private to their crates (and this binary
-/// doesn't compose `LocalMockRuntime`/`E2bMockRuntime` — `PiRuntime` needs the
-/// bare `Arc<InstanceManager>`s themselves, see [`main`]'s wiring), so this is
-/// its own copy rather than a shared export introduced just for two numbers.
 const DEFAULT_MAX_SANDBOXES_PER_OWNER: usize = 20;
 const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
 
@@ -41,10 +33,10 @@ const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
 const E2B_API_KEY_ENV: &str = "E2B_API_KEY";
 
 /// Builds the `InstanceManager` wrapping a real [`LocalProvider`], replicating
-/// `apps/runtime-local::LocalMockRuntime`'s private `with_ledger` constructor
+/// `apps/runtime-mock`'s private `in_memory_local_manager` construction shape
 /// (see that crate for the canonical version — this binary needs the bare
-/// `Arc<InstanceManager>` itself to hand to [`PiRuntime::new`], not the
-/// `LocalMockRuntime` wrapper, since `PiRuntime` composes `InstanceManager`s
+/// `Arc<InstanceManager>` itself to hand to [`PiRuntime::new`], not a
+/// `MockRuntime` wrapper, since `PiRuntime` composes `InstanceManager`s
 /// directly rather than delegating to another `RuntimeAdapter`). `db_path`
 /// points at the same physical SQLite file `SqliteSessionRepository` above
 /// already opened; a second, independent `rusqlite::Connection` onto that file
@@ -74,8 +66,8 @@ fn build_local_instance_manager(db_path: &Path) -> Arc<InstanceManager> {
 
 /// Builds the `InstanceManager` wrapping a real [`E2bProvider`] — same
 /// rationale and construction shape as [`build_local_instance_manager`],
-/// mirroring `apps/runtime-e2b::E2bMockRuntime`'s private `with_ledger`
-/// constructor. Only called when [`E2B_API_KEY_ENV`] is set (see [`main`]):
+/// mirroring `apps/runtime-mock`'s private `in_memory_e2b_manager`
+/// construction shape. Only called when [`E2B_API_KEY_ENV`] is set (see [`main`]):
 /// `E2bProvider::new()` itself never fails (it takes no config), but every
 /// sandbox it would actually create needs that env var at `create` time
 /// (`resolve_api_key`), so gating construction on it here turns a
@@ -103,8 +95,8 @@ fn build_e2b_instance_manager(db_path: &Path) -> Arc<InstanceManager> {
 }
 
 /// Reconciles `manager` against its ledger (`InstanceManager::reconcile` —
-/// see `apps/runtime-local::LocalMockRuntime::reconcile_on_startup`'s doc for
-/// why this must run once before a manager serves real traffic) and spawns
+/// see `apps/runtime-mock`'s own startup-reconcile usage for why this must
+/// run once before a manager serves real traffic) and spawns
 /// its pending-release retry loop. Exits the process on a reconcile failure,
 /// matching the fail-closed treatment `SqliteSessionRepository::open` above
 /// already gets: a `InstanceManager` that can't be trusted to agree with its
@@ -378,14 +370,14 @@ async fn main() {
         std::process::exit(1);
     });
     // `PiRuntime` now composes `xgovernor_manager::InstanceManager` the same
-    // way `LocalMockRuntime`/`E2bMockRuntime` do — real provider-instance
+    // way `MockRuntime` (`apps/runtime-mock`) does — real provider-instance
     // ledger, startup reconciliation, quota enforcement, pending-release
     // retry loop, one `InstanceManager` per provider `backend_id` it is
     // willing to route to. `main.rs` builds those `InstanceManager`s itself
     // (`build_local_instance_manager`/`build_e2b_instance_manager` above)
-    // rather than composing `LocalMockRuntime`/`E2bMockRuntime`, since
-    // `PiRuntime::new` needs the bare `Arc<InstanceManager>`s, not another
-    // `RuntimeAdapter` layered on top of them.
+    // rather than composing `MockRuntime`, since `PiRuntime::new` needs the
+    // bare `Arc<InstanceManager>`s, not another `RuntimeAdapter` layered on
+    // top of them.
     //
     // What actually changed, and what didn't: Pi's tool *execution* (file
     // read/write/edit, exec, grep/glob) no longer touches this host's

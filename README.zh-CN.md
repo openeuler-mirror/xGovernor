@@ -83,8 +83,7 @@ pi --version   # 需要 >= 0.84.2
 | `crates/core`               | 域模型与应用层：`SessionApplication`、持有 **opaque runtime 状态**的会话记录、所有 agent runtime 接入的 `RuntimeAdapter` 接缝、租约表、孤儿回收器、准入闸门、wire 投影。                                |
 | `crates/backend`            | 各 adapter 共享的 provider 实现：本机目录沙箱、E2B 远程沙箱、SQLite provider 实例账本。                                                                                            |
 | `crates/manager`            | `InstanceManager`：统一的 provider 实例编排——按 owner 配额 + 全局上限、per-runtime_id 创建幂等、attach 失败补偿删除、delete 失败 pending-release 重试队列、创建路径信号量准入 + 退避重试、启动时对账（reconcile）。 |
-| `apps/runtime-local`        | 架在**真实**本地沙箱之上的 mock runtime adapter——验证全链路管线，但不假装自己是 LLM。                                                                                                 |
-| `apps/runtime-e2b`          | 架在**真实** E2B provider 之上的 mock runtime adapter，含沙箱内 `git clone`（git 工作区）。                                                                                  |
+| `apps/runtime-mock`         | 架在**真实**本地沙箱与 E2B provider 之上的 mock runtime adapter（按 `ext.runtime_mock.backend_id` 分发）——验证全链路管线，含沙箱内 `git clone`（git 工作区），但不假装自己是 LLM。            |
 | `apps/runtime-pi`           | **真实** pi runtime adapter：每会话 spawn `pi --mode rpc`，以逐行 JSON 驱动，工具执行经桥接层路由进沙箱（`local` / `e2b`）。                                                            |
 | `apps/server`               | 可运行的 daemon（`xgovernor-server`）：双监听器（admin 回环 + tenant）、HTTP/SSE 传输、SQLite 会话仓库、装配。                                                                        |
 

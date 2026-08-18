@@ -47,8 +47,8 @@ pub fn pi_runtime_ext() -> SessionExtensions {
 
 /// Builds the `backend_id -> InstanceManager` map every `PiRuntime::new` call
 /// in these tests needs, composing a real in-memory-ledger `LocalProvider`
-/// under the `"local"` key — mirrors `apps/runtime-local`'s own test setup
-/// (`LocalMockRuntime::with_ledger`), since `PiRuntime` now routes Pi's tool
+/// under the `"local"` key — mirrors `apps/runtime-mock`'s own test setup
+/// (`in_memory_local_manager`), since `PiRuntime` now routes Pi's tool
 /// execution through the exact same `InstanceManager`/`OperationBackend`
 /// plumbing that adapter uses.
 pub fn build_managers() -> HashMap<String, StdArc<InstanceManager>> {

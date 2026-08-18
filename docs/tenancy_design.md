@@ -305,3 +305,5 @@ match (role, workspace_spec, provider):
    循环跑 30 次（10+20 两轮）全绿后才认定修好，单跑一次绿不算数（之前那版"看似修好"的单跑同样是假阳性）。
 
 五步均不依赖持久化——内存态同样成立；持久化落地时 tenant_id 已在记录中。
+
+> 2026-08 后续更新：步骤 3/4 提到的 `apps/runtime-local`/`apps/runtime-e2b`（crate 名 `xgovernor-runtime-local`/`xgovernor-runtime-e2b`，类型 `LocalMockRuntime`/`E2bMockRuntime`）已合并为单一 crate `apps/runtime-mock`（`xgovernor-runtime-mock`，`MockRuntime`，按 `ext.runtime_mock.backend_id` 分发 local/e2b 两个 `InstanceManager`）；测试数随之从两个 crate 各自的计数合并为 `xgovernor-runtime-mock` 一个计数。与 line 58 同理，本节以上保留原文，作为对应决策发生时的真实记录，不逐处修改路径。

@@ -1917,6 +1917,125 @@ mod tests {
         eprintln!("live E2B structured grep passed: {}", stdout.trim());
     }
 
+    /// End-to-end smoke test for the git-sandbox path
+    /// `apps/runtime-mock::GitSandboxWorkspaceEnvironment` /
+    /// `apps/runtime-mock::MockRuntime` exercise against a real e2b sandbox:
+    /// creates a sandbox with `allow_internet_access` on, `git clone`s a real
+    /// public repo into `DEFAULT_WORKSPACE_ROOT` via the operation-plane
+    /// `exec`, verifies the clone landed with `git rev-parse HEAD`, then tears
+    /// the sandbox down. This used to live in `apps/runtime-e2b`'s own test
+    /// module (exercised through `RuntimeAdapter::start`/`stop`) before that
+    /// crate was folded into `apps/runtime-mock`; it is rewritten here in raw
+    /// `provider_protocol` calls, matching this module's own
+    /// `live_create_attach_exec_and_delete` above, so this crate's live e2b
+    /// coverage does not depend on `crates/manager` or `xgovernor-core`
+    /// wiring at all — only on the `Provider`/`OperationAttach` contract this
+    /// file itself implements. Requires `E2B_API_KEY` and outbound network
+    /// access, so it stays `#[ignore]`d like its neighbor.
+    #[tokio::test]
+    #[ignore = "requires E2B_API_KEY and creates a real E2B sandbox with network access"]
+    async fn live_git_clone_into_a_real_e2b_sandbox() {
+        assert!(
+            std::env::var_os("E2B_API_KEY").is_some(),
+            "E2B_API_KEY must be set"
+        );
+
+        let provider = E2bProvider::new();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let backend_id = BackendId(format!("e2b-live-git-clone:{suffix}"));
+
+        let instance = provider
+            .lifecycle()
+            .create(ProviderCreateRequest {
+                backend_id: backend_id.clone(),
+                owner_ref: format!("e2b-live-git-clone-owner:{suffix}"),
+                reason: ProviderLifecycleReason::Acquire,
+                resource_limits: Default::default(),
+                provider_options: json!({
+                    "api_key_env": "E2B_API_KEY",
+                    "template_id": "base",
+                    "timeout_secs": 300,
+                    "default_shell": "/bin/sh",
+                    "allow_internet_access": true
+                }),
+                correlation: Value::Null,
+            })
+            .await
+            .expect("create live E2B backend");
+
+        let backend = provider
+            .attach(&instance)
+            .await
+            .expect("attach to live E2B backend");
+
+        let clone_result: Result<String, String> = async {
+            let clone_output = backend
+                .exec()
+                .exec(ExecRequest {
+                    command: "git".to_string(),
+                    args: vec![
+                        "clone".to_string(),
+                        "https://github.com/octocat/Hello-World.git".to_string(),
+                        DEFAULT_WORKSPACE_ROOT.to_string(),
+                    ],
+                    shell: None,
+                    cwd: None,
+                    timeout_ms: Some(120_000),
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("git clone exec failed: {error}"))?;
+            if clone_output.exit_code != Some(0) {
+                return Err(format!(
+                    "git clone exited with {:?}; stderr: {}",
+                    clone_output.exit_code,
+                    String::from_utf8_lossy(&clone_output.stderr)
+                ));
+            }
+
+            let rev_parse_output = backend
+                .exec()
+                .exec(ExecRequest {
+                    command: "git".to_string(),
+                    args: vec![
+                        "-C".to_string(),
+                        DEFAULT_WORKSPACE_ROOT.to_string(),
+                        "rev-parse".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    shell: None,
+                    cwd: None,
+                    timeout_ms: Some(10_000),
+                    env: None,
+                })
+                .await
+                .map_err(|error| format!("git rev-parse exec failed: {error}"))?;
+            if rev_parse_output.exit_code != Some(0) {
+                return Err(format!(
+                    "git rev-parse exited with {:?}; stderr: {}",
+                    rev_parse_output.exit_code,
+                    String::from_utf8_lossy(&rev_parse_output.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&rev_parse_output.stdout).into_owned())
+        }
+        .await;
+
+        let cleanup_result = provider
+            .lifecycle()
+            .delete(ProviderDeleteRequest {
+                backend_id,
+                instance_id: Some(instance.instance_id.clone()),
+                snapshot_id: None,
+                reason: ProviderLifecycleReason::UserRequested,
+                correlation: Value::Null,
+            })
+            .await;
+        cleanup_result.expect("delete live E2B sandbox");
+        let head_sha = clone_result.expect("git clone + rev-parse smoke");
+        eprintln!("live E2B git clone passed: HEAD={}", head_sha.trim());
+    }
+
     #[tokio::test]
     async fn workspace_initialization_retries_transient_failures() {
         let attempts = Cell::new(0usize);

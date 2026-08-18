@@ -5,12 +5,11 @@
 //! *execution* (file read/write/edit, exec, grep/glob) no longer touches the
 //! daemon host's filesystem directly. It is routed through xGovernor's usual
 //! `provider-protocol`/`operation-protocol`/`xgovernor_manager::InstanceManager`
-//! machinery — the same machinery `apps/runtime-local`/`apps/runtime-e2b`
-//! compose — via a small local HTTP bridge (see [`bridge`]) that a
-//! TypeScript Pi extension calls instead of Pi's built-in tools reaching the
-//! host fs. `start()` therefore: (1) looks up the `InstanceManager` for the
-//! requested `backend_id`, (2) calls `start_instance` on it exactly like
-//! `LocalMockRuntime`/`E2bMockRuntime` do, obtaining a real
+//! machinery — the same machinery `apps/runtime-mock` composes — via a small
+//! local HTTP bridge (see [`bridge`]) that a TypeScript Pi extension calls
+//! instead of Pi's built-in tools reaching the host fs. `start()` therefore:
+//! (1) looks up the `InstanceManager` for the requested `backend_id`, (2)
+//! calls `start_instance` on it exactly like `MockRuntime` does, obtaining a real
 //! `Arc<dyn OperationBackend>`, (3) registers that backend with the bridge
 //! under a freshly generated bearer token, and (4) spawns `pi --mode rpc`
 //! with that token/URL/workspace-root handed to it via environment
@@ -31,7 +30,7 @@
 //! background and a runnable walkthrough (some of which now describes the
 //! superseded bypass design; the bridge is the current source of truth).
 //!
-//! Scope cut, still intentional: unlike `LocalMockRuntime`, this crate keeps
+//! Scope cut, still intentional: unlike `MockRuntime`, this crate keeps
 //! its own in-process `runtime_id -> PiInstance` registry (for the `pi`
 //! child process and its stdio plumbing) rather than relying on
 //! `InstanceManager` for that part — `InstanceManager` here only owns the
@@ -597,7 +596,7 @@ impl PiRuntime {
             })?;
 
         // E2B sandboxes created by PI sessions keep internet access, exactly
-        // like `apps/runtime-e2b`'s `E2bMockRuntime::start` does
+        // like `apps/runtime-mock`'s `MockRuntime::start` does
         // (create-time-only knob); `PiSessionEnvironment` therefore reports
         // `NetworkIsolation::None`, not a stronger claim. `LocalProvider` has
         // no such option — local backends are host processes — so it is only
@@ -622,7 +621,7 @@ impl PiRuntime {
         let workspace_metadata_snapshot = request.workspace.metadata.clone();
 
         // A Git workspace normalized by `PiSessionEnvironment` carries
-        // `GitWorkspaceMetadata` (mirroring `apps/runtime-e2b`'s
+        // `GitWorkspaceMetadata` (mirroring `apps/runtime-mock`'s
         // `clone_git_workspace`); materialize the clone inside the sandbox
         // before attaching the bridge, and roll the sandbox back if it fails.
         if request.workspace.metadata != Value::Null {
