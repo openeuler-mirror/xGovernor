@@ -36,6 +36,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | SessionHeartbeatRequest   | 200 SessionHeartbeatResponse |
 | `/api/v1/sessions/detach`                              | POST | SessionDetachRequest      | 200 SessionControlResponse   |
 | `/api/v1/sessions/close`                               | POST | SessionCloseRequest       | 200 SessionControlResponse   |
+| `/api/v1/admin/tenants`                                | POST | TenantCreateRequest       | 201 TenantCreateResponse     |
+| `/api/v1/admin/tenants/{tenant_id}`                    | PATCH| TenantPatchRequest        | 200 TenantPatchResponse      |
+| `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | —                        | 200 TenantDeleteResponse     |
 
 
 ### 功能一览
@@ -54,6 +57,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | 维持租约心跳                         |
 | `/api/v1/sessions/detach`                              | POST | 释放租约、保留会话                      |
 | `/api/v1/sessions/close`                               | POST | 关闭会话（销毁沙箱）                     |
+| `/api/v1/admin/tenants`                                | POST | 新建租户（生成 token，仅明文返回一次）         |
+| `/api/v1/admin/tenants/{tenant_id}`                    | PATCH | 修改租户配额（部分字段更新）                 |
+| `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | 删除租户（存在活跃会话则拒绝）               |
 
 
 
@@ -150,6 +156,47 @@
 
 省略的字段继承父会话。成功返回新会话的 `SessionOpenResponse`；runtime 不支持时 422 `unsupported_capability`。
 
+### 租户管理（管控面，admin-only）
+
+三条路由，仅 admin 身份可达（§3.1 的角色闸；tenant 身份访问一律 403）。且仅当服务端启动时加载了真实 `tenants.toml`（[tenancy_design.md](./tenancy_design.md) §4）才存在——dev 模式（无 `tenants.toml`，隐式 admin 全开）下这三条路由整体不挂载，请求直接 404，而不是任何 handler 内部判断"鉴权是否已配置"。持久化直接改写 `tenants.toml`（原子写：临时文件 + rename）并复用既有 `SIGHUP` 重载逻辑同一份代码路径热更新内存中的 `TokenTable`，不是另一张 SQLite 表。
+
+**`POST /api/v1/admin/tenants`** — 新建租户。
+
+```json
+{ "tenant_id": "acme", "principal": null, "max_sessions": 5, "max_requests_per_minute": null }
+```
+
+- `tenant_id` 必填、非空（去除首尾空白后仍为空则 400）；与已有 `[[tenant]]` 块的 `tenant_id` 冲突则 409。
+- `principal`、`max_sessions`、`max_requests_per_minute` 均可省略；`principal` 缺省为 `"tenant"`，配额字段缺省为 `null`（不设上限）——与 `tenants.toml` 文件本身的字段缺省语义一致。
+- token **由服务端生成**（`xgt_` 前缀 + 40 位随机字母数字，约 238 bit 熵），不接受客户端传入。
+
+响应 201 `TenantCreateResponse`：
+
+```json
+{ "tenant_id": "acme", "token": "xgt_...", "principal": "tenant", "max_sessions": 5, "max_requests_per_minute": null }
+```
+
+- `token` **仅在这一次响应中以明文返回**——之后任何接口（含未来可能出现的租户查询接口）都不会再回显它；遗失即只能删除重建该租户，当前没有单独的 token 轮换接口。
+
+**`PATCH /api/v1/admin/tenants/{tenant_id}`** — 修改租户配额，**部分字段更新语义**：请求体中缺席的字段保持原值不变；字段存在且为 `null` 表示清空为不设上限；字段存在且为数字表示设置该值。
+
+```json
+{ "max_sessions": 20 }
+```
+
+```json
+{ "max_sessions": null }
+```
+
+目标 `tenant_id` 不存在返回 404 `tenant_not_found`。响应 200 `TenantPatchResponse`，形态同 `TenantCreateResponse` 但不含 `token` 字段。
+
+**`DELETE /api/v1/admin/tenants/{tenant_id}`** — 删除租户。
+
+- 该租户存在**活跃会话**（`opening | idle | running | paused`）时拒绝，返回 409 `conflict`——不会强制关闭会话；需先关闭所有会话再删除。
+- 删除后若会导致 `tenants.toml` 中**零凭证**（既无 `[admin]` 也无其余 `[[tenant]]`），同样拒绝并返回 409——与 `SIGHUP` 重载路径"reload 产出空表永不应用"的不变式一致，这里是同一条不变式的主动前置检查。
+- 目标 `tenant_id` 不存在返回 404 `tenant_not_found`。
+- 成功返回 200 `TenantDeleteResponse`：`{ "tenant_id": "acme" }`。
+
 ## 4. 会话交互面
 
 
@@ -220,7 +267,8 @@
 | `invalid_request`        | 400  | 请求形态/字段非法（含未知字段、未支持的 workspace 种类）                                           |
 | `lease_required`         | 401  | 需要租约身份（如匿名 heartbeat）                                                        |
 | `not_found`              | 404  | 会话或 turn 流不存在                                                                |
-| `conflict`               | 409  | 会话状态冲突                                                                       |
+| `tenant_not_found`       | 404  | 管控面按 `tenant_id` 查找的租户不存在（与 `not_found` 分属不同标识符空间，见 §3 租户管理）                |
+| `conflict`               | 409  | 会话状态冲突，或管控面删除租户被拒绝（存在活跃会话 / 会清空全部凭证）                                        |
 | `lease_conflict`         | 409  | 他人活跃持有租约（附 holder_client_id / holder_pid / holder_hostname）                  |
 | `unsupported_capability` | 422  | 能力门控拒绝（附 family: sandbox/runtime 与 capability 名，capability 保持字符串以便客户端解码未来能力） |
 | `internal`               | 500  | 内部错误                                                                         |

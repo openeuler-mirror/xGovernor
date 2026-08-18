@@ -1,3 +1,4 @@
+use super::admin_tenants::{admin_tenants_router, TenantAdminState};
 use super::auth::{require_role, security_layer, TokenTable};
 use super::session::{session_router, SessionHttpState};
 use axum::{
@@ -143,13 +144,16 @@ pub fn create_router(
     session_state: SessionHttpState,
     token_table: Option<TokenTable>,
     role_gate: Option<Role>,
+    tenant_admin: Option<TenantAdminState>,
 ) -> Router {
     let state = Arc::new(session_state);
-    let router = apply_transport_defenses(
-        Router::new()
-            .route("/api/v1/health", get(health))
-            .merge(session_router(state.clone())),
-    );
+    let mut router = Router::new()
+        .route("/api/v1/health", get(health))
+        .merge(session_router(state.clone()));
+    if let Some(tenant_admin_state) = tenant_admin {
+        router = router.merge(admin_tenants_router(tenant_admin_state));
+    }
+    let router = apply_transport_defenses(router);
     let router = match role_gate {
         Some(role) => require_role(router, role),
         None => router,
@@ -286,20 +290,24 @@ mod tests {
         }
     }
 
-    fn test_state() -> SessionHttpState {
-        SessionHttpState::new(SessionApplication::new(
+    fn test_application() -> SessionApplication {
+        SessionApplication::new(
             Arc::new(UnusedRuntime),
             Arc::new(EmptyRepository),
             Arc::new(UnusedIds),
             Arc::new(UnusedIds),
             Arc::new(UnusedEnvironment),
             Arc::new(UnusedIds),
-        ))
+        )
+    }
+
+    fn test_state() -> SessionHttpState {
+        SessionHttpState::new(test_application())
     }
 
     #[tokio::test]
     async fn health_is_reachable_without_a_token_table() {
-        let router = create_router(test_state(), None, None);
+        let router = create_router(test_state(), None, None, None);
         let response = router
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
             .await
@@ -317,7 +325,7 @@ mod tests {
 
         let mut entries = HashMap::new();
         entries.insert("root-token".to_string(), SecurityContext::admin("root"));
-        let router = create_router(test_state(), Some(TokenTable::new(entries)), None);
+        let router = create_router(test_state(), Some(TokenTable::new(entries)), None, None);
 
         let response = router
             .clone()
@@ -352,7 +360,7 @@ mod tests {
             "tenant-token".to_string(),
             SecurityContext::tenant("tenant-a", "alice"),
         );
-        let router = create_router(test_state(), Some(TokenTable::new(entries)), None);
+        let router = create_router(test_state(), Some(TokenTable::new(entries)), None, None);
 
         let response = router
             .oneshot(
@@ -382,6 +390,7 @@ mod tests {
             test_state(),
             Some(TokenTable::new(entries)),
             Some(Role::Admin),
+            None,
         );
 
         let response = router
@@ -416,7 +425,7 @@ mod tests {
         // silently become "admin reachable on the public listener".
         use xgovernor_core::Role;
 
-        let router = create_router(test_state(), None, Some(Role::Tenant));
+        let router = create_router(test_state(), None, Some(Role::Tenant), None);
         let response = router
             .oneshot(Request::get("/api/v1/health").body(Body::empty()).unwrap())
             .await
@@ -433,7 +442,7 @@ mod tests {
         // throwaway one) so this exercises the actual production
         // composition in create_router, not just the guard_with helper.
         let big_body = "x".repeat(MAX_REQUEST_BODY_BYTES + 1);
-        let router = create_router(test_state(), None, None);
+        let router = create_router(test_state(), None, None, None);
         let response = router
             .oneshot(
                 Request::post("/api/v1/sessions/open")
@@ -522,7 +531,7 @@ mod tests {
         // registered, so this hits the ordinary "session not found" branch
         // -- proving the route exists and reaches the real handler, not that
         // it 404s for some routing/composition mistake.
-        let router = create_router(test_state(), None, None);
+        let router = create_router(test_state(), None, None, None);
         let response = router
             .oneshot(
                 Request::get("/api/v1/sessions/runtime-x/turns/turn-y/events")

@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use xgovernor_core::{SecurityContext, TenantQuota};
 
 /// Label baked into every admin `SecurityContext` sourced from this file —
@@ -48,33 +48,33 @@ fn default_principal() -> String {
     "tenant".to_string()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TenantsFile {
+pub(crate) struct TenantsFile {
     #[serde(default)]
-    admin: AdminSection,
+    pub(crate) admin: AdminSection,
     #[serde(default)]
-    tenant: Vec<TenantSection>,
+    pub(crate) tenant: Vec<TenantSection>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AdminSection {
+pub(crate) struct AdminSection {
     #[serde(default)]
-    tokens: Vec<String>,
+    pub(crate) tokens: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TenantSection {
-    tenant_id: String,
-    tokens: Vec<String>,
+pub(crate) struct TenantSection {
+    pub(crate) tenant_id: String,
+    pub(crate) tokens: Vec<String>,
     #[serde(default = "default_principal")]
-    principal: String,
+    pub(crate) principal: String,
     #[serde(default)]
-    max_sessions: Option<u32>,
+    pub(crate) max_sessions: Option<u32>,
     #[serde(default)]
-    max_requests_per_minute: Option<u32>,
+    pub(crate) max_requests_per_minute: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -96,6 +96,13 @@ pub enum TenantConfigError {
     /// request — almost certainly a mistake, not an intentionally-disabled
     /// tenant (comment the block out instead).
     EmptyTokenList(String),
+    /// Serializing the updated [`TenantsFile`] or writing/renaming the temp
+    /// file failed (`httpserver::admin_tenants`'s write path via
+    /// [`write_tenants_file_atomically`]) — disk full, permissions, the
+    /// directory disappeared, etc. Distinct from `Read`: this is the admin
+    /// API failing to persist a change, not a startup/reload failing to
+    /// load one.
+    Write(std::io::Error),
 }
 
 impl std::fmt::Display for TenantConfigError {
@@ -118,6 +125,7 @@ impl std::fmt::Display for TenantConfigError {
                 "tenant {tenant_id:?} has an empty tokens list — it can never be reached by any \
                  request; remove the block or give it at least one token"
             ),
+            Self::Write(error) => write!(f, "could not write tenants config file: {error}"),
         }
     }
 }
@@ -130,12 +138,43 @@ impl std::error::Error for TenantConfigError {}
 pub fn load_tenants_file(
     path: &Path,
 ) -> Result<HashMap<String, SecurityContext>, TenantConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(TenantConfigError::Read)?;
-    let file: TenantsFile = toml::from_str(&contents).map_err(TenantConfigError::Parse)?;
-    into_entries(file)
+    into_entries(read_tenants_file_raw(path)?)
 }
 
-fn into_entries(file: TenantsFile) -> Result<HashMap<String, SecurityContext>, TenantConfigError> {
+/// Reads and parses `path` into the raw [`TenantsFile`] shape, *without* the
+/// duplicate-token/duplicate-tenant-id/empty-token-list validation
+/// [`into_entries`] does — `httpserver::admin_tenants`'s create/patch/delete
+/// handlers need the raw, still-mutable struct (to add/edit/remove one
+/// `[[tenant]]` block) before re-running that same validation on the result
+/// via `into_entries`, so the read and validate steps are split apart here
+/// rather than folded together the way [`load_tenants_file`] folds them for
+/// its read-only callers (startup, `SIGHUP`).
+pub(crate) fn read_tenants_file_raw(path: &Path) -> Result<TenantsFile, TenantConfigError> {
+    let contents = std::fs::read_to_string(path).map_err(TenantConfigError::Read)?;
+    toml::from_str(&contents).map_err(TenantConfigError::Parse)
+}
+
+pub(crate) fn write_tenants_file_atomically(
+    path: &Path,
+    file: &TenantsFile,
+) -> Result<(), TenantConfigError> {
+    let contents = toml::to_string_pretty(file).map_err(|error| {
+        TenantConfigError::Write(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file =
+        tempfile::NamedTempFile::new_in(dir).map_err(TenantConfigError::Write)?;
+    std::io::Write::write_all(&mut temp_file, contents.as_bytes())
+        .map_err(TenantConfigError::Write)?;
+    temp_file.persist(path).map_err(|error| {
+        TenantConfigError::Write(error.error)
+    })?;
+    Ok(())
+}
+
+pub(crate) fn into_entries(
+    file: TenantsFile,
+) -> Result<HashMap<String, SecurityContext>, TenantConfigError> {
     let mut entries = HashMap::new();
 
     for token in file.admin.tokens {

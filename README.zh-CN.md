@@ -53,12 +53,14 @@ export DEEPSEEK_API_KEY=sk-...
 
 ```toml
 [admin]
-tokens = ["demo-admin-token"]
+tokens = ["demo-admin-token"]   # admin token，可配多个用于轮换
 
 [[tenant]]
-tenant_id = "demo-tenant"
-tokens = ["demo-tenant-token"]
-# principal / max_sessions / max_requests_per_minute 均可选
+tenant_id = "demo-tenant"        # 必填，全局唯一
+tokens = ["demo-tenant-token"]   # 必填，至少一个；全局唯一
+principal = "demo-ops"           # 可选，默认 "tenant"
+max_sessions = 20                # 可选，默认不限
+max_requests_per_minute = 120    # 可选，默认不限
 ```
 
 最小启动配置：
@@ -141,6 +143,40 @@ curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' 
 ```
 
 提交 turn 与订阅事件流和 admin 面完全一样（`POST /api/v1/sessions/turns`、`GET /api/v1/sessions/<runtime_id>/turns/<turn_id>/events`），只把监听地址换成 `8788`、token 换成该租户自己的。每个租户的 token 对应一个 `tenant_id`，会话按租户隔离（配额、访问互不可见）。
+
+### 新增一个租户
+
+没有运行时管理 API——新增租户就是改配置文件 + 热重载：
+
+1. **编辑 `tenants.toml`**（默认 `~/.xgovernor/tenants.toml`），加一个 `[[tenant]]` 块：
+
+   ```toml
+   [[tenant]]
+   tenant_id = "acme"                        # 必填，不能与其他租户重复
+   tokens = ["acme-token-1", "acme-token-2"] # 必填，至少一个；全局唯一（不能与任何 admin token 重复）
+   principal = "acme-ops"                    # 可选，默认 "tenant"
+   max_sessions = 20                         # 可选，默认不限
+   max_requests_per_minute = 120             # 可选，默认不限
+   ```
+
+   一个租户可以配多个 token（轮换用）；同一个 token 只能属于一个身份。
+
+2. **热重载，无需重启**：
+
+   ```bash
+   kill -HUP <xgovernor-server pid>
+   ```
+
+   服务重读文件并整体替换 token 表，两个监听面同时生效。重载失败（TOML 解析错误、token / tenant_id 重复、空 tokens 列表）时**保留旧配置**并打错误日志；Windows 或 dev 模式启动的服务没有热重载，需重启。
+
+3. **验证新租户**：
+
+   ```bash
+   curl -s localhost:8788/api/v1/health -H 'Authorization: Bearer acme-token-1'
+   # → 200 生效；401 说明 token 未被识别
+   ```
+
+删除租户 = 删掉对应的 `[[tenant]]` 块再热重载（注意整体替换语义：确认新文件完整再触发重载）。
 
 ## 开发
 

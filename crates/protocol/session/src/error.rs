@@ -16,6 +16,12 @@ pub enum SessionWireError {
     InvalidRequest { message: String },
     #[error("session not found: {runtime_id}")]
     NotFound { runtime_id: String },
+    /// Distinct from `NotFound` (which always carries a `runtime_id`) —
+    /// the admin tenant-management API (`docs/tenancy_design.md` §4,
+    /// `apps/server/src/httpserver/admin_tenants.rs`) looks tenants up by
+    /// `tenant_id`, a different identifier space entirely.
+    #[error("tenant not found: {tenant_id}")]
+    TenantNotFound { tenant_id: String },
     #[error("session conflict: {message}")]
     Conflict { message: String },
     #[error("session lease is required: {runtime_id}")]
@@ -62,6 +68,7 @@ impl SessionWireError {
         match self {
             Self::InvalidRequest { .. } => 400,
             Self::NotFound { .. } => 404,
+            Self::TenantNotFound { .. } => 404,
             Self::Conflict { .. } | Self::LeaseConflict { .. } => 409,
             Self::LeaseRequired { .. } => 401,
             Self::UnsupportedCapability { .. } => 422,
@@ -77,6 +84,18 @@ impl SessionWireError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tenant_not_found_is_distinct_from_session_not_found() {
+        let error = SessionWireError::TenantNotFound {
+            tenant_id: "acme".into(),
+        };
+        assert_eq!(error.http_status(), 404);
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({ "code": "tenant_not_found", "tenant_id": "acme" })
+        );
+    }
 
     #[test]
     fn wire_error_has_one_tagged_shape_and_status_mapping() {

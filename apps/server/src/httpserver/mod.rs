@@ -6,12 +6,14 @@
 //! [`router::create_router`], and the actual session handlers live in
 //! [`session`]. This keeps route composition separate from wire handlers.
 
+pub mod admin_tenants;
 pub mod auth;
 pub mod response;
 pub mod router;
 pub mod session;
 pub mod tenant_config;
 
+pub use admin_tenants::{admin_tenants_router, TenantAdminState};
 pub use auth::TokenTable;
 pub use router::create_router;
 pub use session::{session_router, SessionHttpState};

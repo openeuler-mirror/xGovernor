@@ -1079,6 +1079,14 @@ impl SessionApplication {
             },
         })
     }
+
+    pub async fn tenant_has_active_sessions(
+        &self,
+        tenant_id: &str,
+    ) -> Result<bool, SessionDomainError> {
+        let page = self.records.list_active(Some(tenant_id), 1).await?;
+        Ok(page.total_active > 0)
+    }
 }
 
 /// Result of [`SessionRepository::list_active`]: `sessions` is capped at the

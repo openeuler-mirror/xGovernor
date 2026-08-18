@@ -17,7 +17,8 @@ use xgovernor_core::{
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, PiSessionEnvironment};
 use xgovernor_server::{
-    create_router, load_tenants_file, SessionHttpState, TenantConfigError, TokenTable,
+    create_router, load_tenants_file, SessionHttpState, TenantAdminState, TenantConfigError,
+    TokenTable,
 };
 
 const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -523,13 +524,27 @@ async fn main() {
     // `SessionHttpState::spawn_stream_sweeper`'s doc comment. Same
     // dropped-handle convention as `_orphan_reaper` above: the sweepers run
     // for the life of this process.
+    let tenant_admin_state = token_table.clone().map(|table| {
+        TenantAdminState::new(table, tenants_config_path.clone(), application.clone())
+    });
+
     let admin_state = SessionHttpState::new(application.clone());
     let _admin_stream_sweeper = admin_state.spawn_stream_sweeper();
-    let admin_router = create_router(admin_state, token_table.clone(), Some(Role::Admin));
+    let admin_router = create_router(
+        admin_state,
+        token_table.clone(),
+        Some(Role::Admin),
+        tenant_admin_state,
+    );
 
     let tenant_state = SessionHttpState::new(application);
     let _tenant_stream_sweeper = tenant_state.spawn_stream_sweeper();
-    let tenant_router = create_router(tenant_state, token_table.clone(), Some(Role::Tenant));
+    let tenant_router = create_router(
+        tenant_state,
+        token_table.clone(),
+        Some(Role::Tenant),
+        None,
+    );
 
     // SIGHUP-triggered tenants.toml hot reload — only wired up when the
     // server actually started with a real token table (see
