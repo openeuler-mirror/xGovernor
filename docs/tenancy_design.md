@@ -115,6 +115,8 @@ owner_ref 推导落地后，`QuotaEnforcedLifecycle` 现成的按 owner 沙箱�
 
 启动加载 + SIGHUP 热重载。租户数上百、需要自助开通时再考虑数据库与管理 API——现在建即是过度工程。
 
+> 2026-08 后续更新：本节的启动加载 + SIGHUP 热重载已实现，但 schema 做了刻意收窄——只落地表格里当前真有强制点的字段（tokens、role、max_sessions、max_requests_per_minute），`allowed_workspace_kinds`/`git_host_allowlist`/`capability_ceiling`/`min_isolation_boundary`/`allowed_runtimes`/`max_concurrent_turns`/`max_sandboxes` 均**未**收进 `tenants.toml`——加一个没有消费者的 TOML 字段只是死配置，等某处代码真正读它时再补。实现：`apps/server/src/httpserver/tenant_config.rs`（schema/解析/校验，`#[serde(deny_unknown_fields)]`，拒绝重复 token/重复 tenant_id/空 tokens 列表）+ `apps/server/src/httpserver/auth.rs`（`TokenTable.entries` 改为 `Arc<ArcSwap<..>>`，新增 `reload()`，删除旧 `from_env()`/`TenantTokenEntry`）+ `apps/server/src/main.rs`（`XGOVERNOR_TENANTS_CONFIG_PATH`，默认 `$XGOVERNOR_DATA_DIR/tenants.toml`；`SIGHUP` 触发重载，reload 失败或产出空表**永不**应用，保留最后一份好的配置）。这是本文原定的"启动加载 + SIGHUP 热重载"目标的落地，取代了 §7 步骤 1/4 提到的 `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON` 环境变量通道（已删除，无兼容路径）。租户自助查询/管理 API 仍是本节末句提到的、留给未来讨论的下一步，未实现。
+
 ---
 
 
@@ -199,6 +201,8 @@ match (role, workspace_spec, provider):
    跨租户 HTTP 集成测试见 `session.rs` 测试模块（`a_foreign_tenant_gets_not_found_not_forbidden_on_someone_elses_session`
    等）。尚未落地：`tenants.toml` 完整策略文件（§4，token 表只是凭证→身份映射，非配额/workspace_kind 等策略）、
    §6 审计日志。（§3.1 admin 面绑 loopback 已随步骤2落地，见下。）
+
+   > 2026-08 后续更新：`TokenTable::from_env()` 及其读取的 `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON` 已删除，本段"尚未落地"提到的 `tenants.toml` 完整策略文件现已落地（见 §4 addendum）——`TokenTable.entries` 改为 `Arc<ArcSwap<..>>`，`security_layer` 未配置 token 表时的隐式 admin dev 模式行为不变，只是判定条件从"环境变量未设置"改为"默认路径下 `tenants.toml` 不存在"。
 2. **场景公理落地**：normalizer 三元组校验 + fail-closed 断言 + 测试；admin 面绑 loopback。
   **落地状态：已实现。** 两处独立强制点：(a) `crates/core/src/application.rs` 新增 `enforce_workspace_axiom(ctx, workspace,  provider_is_sandbox)` 自由函数，落实 §5.4 三元组匹配（admin 放行 / tenant+sandbox+git(https，无嵌入凭证) 放行 / 其余拒绝），  
    由每个 `SessionEnvironmentNormalizer::normalize` 实现调用（`normalize` 签名新增 `ctx: &SecurityContext` 首参，全仓库 7 处实现  
@@ -282,6 +286,8 @@ match (role, workspace_spec, provider):
    `Self::QuotaExceeded { .. } => 429`），本步骤只是第一次真正产出它，映射链路本身无需新增代码。admin 会话永远不占用租户配额
    （`SecurityContext::admin` 的 `tenant_id()` 恒为 `None`，`reserve_tenant_session` 只按 `tenant_id` 记账）。测试：
    `fork_counts_against_the_same_tenant_session_quota` 等锁定"open 占额、close 放额、fork 与 open 共享同一计数"。
+
+   > 2026-08 后续更新：本段的 `XGOVERNOR_TENANT_TOKENS_JSON`/`TenantTokenEntry` 通道已删除，`max_sessions` 现从 §4 落地的 `tenants.toml` 读取（`tenant_config.rs` 的 schema），语义不变（可选字段、`None` = 不设上限），只是搬到了新文件。
 5. **审计日志**。
   **落地状态：已实现。** `crates/core/src/application.rs` 新增 `audit_log<T>(ctx, operation, runtime_id, result)` 自由函数：
    每次调用发一条 `tracing::info!(target: "audit", principal, tenant, operation, runtime_id, result = "ok"/"error", [error])`——

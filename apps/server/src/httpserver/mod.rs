@@ -10,7 +10,9 @@ pub mod auth;
 pub mod response;
 pub mod router;
 pub mod session;
+pub mod tenant_config;
 
 pub use auth::TokenTable;
 pub use router::create_router;
 pub use session::{session_router, SessionHttpState};
+pub use tenant_config::{load_tenants_file, TenantConfigError};

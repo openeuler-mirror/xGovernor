@@ -8,7 +8,7 @@
 ## 1. 约定
 
 - Base path：`/api/v1`，请求与响应均为 JSON（`content-type: application/json`）。
-- **鉴权**：设置了 `XGOVERNOR_BEARER_TOKEN`（旧式单 admin token，兼容保留）或 `XGOVERNOR_TENANT_TOKENS_JSON`（`[{"token","tenant_id","principal"?}]` 数组，签发 tenant 身份）任一个时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。两者均未设置时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
+- **鉴权**：凭证与身份来自 `tenants.toml` 声明式策略文件（[tenancy_design.md](./tenancy_design.md) §4，默认路径 `$XGOVERNOR_DATA_DIR/tenants.toml`，可用 `XGOVERNOR_TENANTS_CONFIG_PATH` 覆盖，支持 `SIGHUP` 热重载）——`[admin]` 节的 `tokens` 签发 admin 身份，`[[tenant]]` 节的 `tokens` 签发对应 `tenant_id` 的 tenant 身份。配置了该文件（且非空）时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。**默认路径**下该文件不存在时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致；**显式**设置 `XGOVERNOR_TENANTS_CONFIG_PATH` 却指向不存在的文件，或文件存在但解析/校验失败，则 fail-closed 拒绝启动。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
 - **跨租户所有权**：非 admin 身份访问不属于自己租户的 `runtime_id` 时，一律返回 `not_found`（404）而非 403——存在性对无权限的调用方不可见（[tenancy_design.md](./tenancy_design.md) §3.2 "404 不泄露存在性信息"）。admin 身份不受此约束。
 - **未知字段**：请求 DTO 一律 `deny_unknown_fields`——多传字段是 400 错误，不是静默忽略。唯一例外是 `ext` 扩展袋内部。
 - **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 runtime adapter 消费（例如 `ext.runtime_mock`、`ext.runtime_pi`、未来的 `ext.xiaoo`）。

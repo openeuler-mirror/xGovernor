@@ -2,4 +2,7 @@
 
 pub mod httpserver;
 
-pub use httpserver::{create_router, session_router, SessionHttpState, TokenTable};
+pub use httpserver::{
+    create_router, load_tenants_file, session_router, SessionHttpState, TenantConfigError,
+    TokenTable,
+};

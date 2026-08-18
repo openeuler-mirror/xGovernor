@@ -89,19 +89,27 @@ npm install
 ```bash
 export XGOVERNOR_BIND_ADDR=127.0.0.1:8787            # admin 面，默认值就是这个，可省略
 export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788      # 必须显式设置，没有默认值
-export XGOVERNOR_BEARER_TOKEN=demo-admin-token         # admin 面 token
-export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'
+export XGOVERNOR_DATA_DIR=/tmp/xgovernor-pi-demo-home/.xgovernor   # tenants.toml 与 SQLite 都落在这里
 export XGOVERNOR_DEFAULT_WORKSPACE_ROOT=/tmp/xgovernor-pi-demo   # 可选；不设则退化为系统临时目录
 export E2B_API_KEY=e2b_...          # 本 demo 用 e2b 后端，必填；只用 local 后端可省略
 export DEEPSEEK_API_KEY=sk-...      # pi 的 LLM key（见 §0.1）；换 provider 就换对应环境变量
 export HOME=/tmp/xgovernor-pi-demo-home  # 保证 pi 能写 ~/.pi/agent/sessions（见 §0.2）；本机有正常 HOME 可省略
-mkdir -p "$XGOVERNOR_DEFAULT_WORKSPACE_ROOT" "$HOME"
+mkdir -p "$XGOVERNOR_DEFAULT_WORKSPACE_ROOT" "$HOME" "$XGOVERNOR_DATA_DIR"
+
+cat > "$XGOVERNOR_DATA_DIR/tenants.toml" <<'EOF'
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+EOF
 
 cargo run -p xgovernor-server
 ```
 
-`XGOVERNOR_TENANT_TOKENS_JSON` 里每个条目的 `quota`/`rate_limit` 字段省略即视为不限（`apps/server/src/httpserver/auth.rs`）。会话数据（SQLite）默认落在
-`~/.xgovernor/xgovernor.db`，可用 `XGOVERNOR_DATA_DIR` 改路径——`local`/`e2b` 两个 `InstanceManager` 的 provider-instance ledger 也共享这个文件。
+凭证与身份来自 `tenants.toml`（`docs/tenancy_design.md` §4），启动时加载，`SIGHUP` 热重载；`[[tenant]]` 节的 `max_sessions`/`max_requests_per_minute` 字段省略即视为不限（`apps/server/src/httpserver/tenant_config.rs`）。会话数据（SQLite）默认落在
+`~/.xgovernor/xgovernor.db`，可用 `XGOVERNOR_DATA_DIR` 改路径（`tenants.toml` 的默认路径也跟着搬家，除非另设 `XGOVERNOR_TENANTS_CONFIG_PATH`）——`local`/`e2b` 两个 `InstanceManager` 的 provider-instance ledger 也共享这个文件。
 
 `local` 这个 `backend_id` 总是可用；`e2b` 是否可用取决于启动时是否设置了 `E2B_API_KEY`——没设的话 `apps/server` 只会注册 `local`，
 日志里会打一条 info 说明，服务照常启动（不是致命错误）。这份 demo 后面全用 `e2b`（已实测跑通）；离线自测把 §3 里的

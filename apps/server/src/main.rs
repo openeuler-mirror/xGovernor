@@ -16,7 +16,9 @@ use xgovernor_core::{
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, PiSessionEnvironment};
-use xgovernor_server::{create_router, SessionHttpState, TokenTable};
+use xgovernor_server::{
+    create_router, load_tenants_file, SessionHttpState, TenantConfigError, TokenTable,
+};
 
 const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -108,6 +110,122 @@ fn xgovernor_data_dir() -> std::path::PathBuf {
 
 fn xgovernor_db_path() -> std::path::PathBuf {
     xgovernor_data_dir().join("xgovernor.db")
+}
+
+/// Resolves the `tenants.toml` path (`docs/tenancy_design.md` §4) and
+/// whether it was explicitly requested via `XGOVERNOR_TENANTS_CONFIG_PATH`
+/// (as opposed to falling back to the default `$XGOVERNOR_DATA_DIR/tenants.toml`).
+/// The distinction matters to [`load_token_table_at_startup`]: a *default*
+/// path that doesn't exist means "auth not configured, run in dev mode"; an
+/// *explicit* path that doesn't exist means "operator asked for a specific
+/// file and it isn't there" — a fail-closed startup error, not a silent
+/// downgrade to dev mode.
+fn xgovernor_tenants_config_path() -> (std::path::PathBuf, bool) {
+    if let Ok(path) = std::env::var("XGOVERNOR_TENANTS_CONFIG_PATH") {
+        (std::path::PathBuf::from(path), true)
+    } else {
+        (xgovernor_data_dir().join("tenants.toml"), false)
+    }
+}
+
+fn load_token_table_at_startup(path: &Path, path_is_explicit: bool) -> Option<TokenTable> {
+    match load_tenants_file(path) {
+        Ok(entries) if entries.is_empty() => {
+            tracing::warn!(
+                path = %path.display(),
+                "tenants config file parsed but contains zero admin/tenant tokens; running in \
+                 dev mode (every request resolves to implicit admin) — if this wasn't \
+                 intentional, check for a stray empty [admin]/[[tenant]] block"
+            );
+            None
+        }
+        Ok(entries) => {
+            tracing::info!(
+                path = %path.display(),
+                tokens = entries.len(),
+                "loaded tenants config"
+            );
+            Some(TokenTable::new(entries))
+        }
+        Err(TenantConfigError::Read(io_error))
+            if io_error.kind() == std::io::ErrorKind::NotFound && !path_is_explicit =>
+        {
+            tracing::info!(
+                path = %path.display(),
+                "no tenants config file at the default path; running in dev mode (every request \
+                 resolves to implicit admin). Write a tenants.toml there, or set \
+                 XGOVERNOR_TENANTS_CONFIG_PATH, to enable auth."
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "refusing to start: failed to load tenants config file {}: {error}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+
+#[cfg(unix)]
+fn spawn_tenants_reload_task(
+    table: TokenTable,
+    path: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut signal =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "failed to install the SIGHUP signal handler; tenants config hot-reload \
+                         is disabled for this run"
+                    );
+                    return;
+                }
+            };
+        loop {
+            signal.recv().await;
+            match load_tenants_file(&path) {
+                Ok(entries) if entries.is_empty() => {
+                    tracing::error!(
+                        path = %path.display(),
+                        "SIGHUP reload produced zero tokens; refusing to apply it and keeping \
+                         the last-good tenants config (to intentionally lock everyone out, stop \
+                         the server rather than emptying this file)"
+                    );
+                }
+                Ok(entries) => {
+                    let tokens = entries.len();
+                    table.reload(entries);
+                    tracing::info!(
+                        path = %path.display(),
+                        tokens,
+                        "reloaded tenants config on SIGHUP"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        "SIGHUP reload failed to read/parse/validate tenants config; keeping the \
+                         last-good config"
+                    );
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_tenants_reload_task(
+    _table: TokenTable,
+    _path: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(std::future::pending())
 }
 
 fn xgovernor_pi_session_root() -> std::path::PathBuf {
@@ -324,16 +442,9 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    let Some(token_table) = TokenTable::from_env() else {
-        eprintln!(
-            "refusing to start: no XGOVERNOR_BEARER_TOKEN/XGOVERNOR_TENANT_TOKENS_JSON is \
-             configured. Without a token table every request resolves to implicit admin, which \
-             the tenant listener would then reject outright, silently bricking it. Configure \
-             XGOVERNOR_TENANT_TOKENS_JSON (tenant entries) and, if the admin surface should be \
-             reachable, XGOVERNOR_BEARER_TOKEN."
-        );
-        std::process::exit(1);
-    };
+    let (tenants_config_path, tenants_config_path_is_explicit) = xgovernor_tenants_config_path();
+    let token_table =
+        load_token_table_at_startup(&tenants_config_path, tenants_config_path_is_explicit);
     let default_workspace_root = std::env::var("XGOVERNOR_DEFAULT_WORKSPACE_ROOT")
         .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
 
@@ -415,11 +526,18 @@ async fn main() {
     // for the life of this process.
     let admin_state = SessionHttpState::new(application.clone());
     let _admin_stream_sweeper = admin_state.spawn_stream_sweeper();
-    let admin_router = create_router(admin_state, Some(token_table.clone()), Some(Role::Admin));
+    let admin_router = create_router(admin_state, token_table.clone(), Some(Role::Admin));
 
     let tenant_state = SessionHttpState::new(application);
     let _tenant_stream_sweeper = tenant_state.spawn_stream_sweeper();
-    let tenant_router = create_router(tenant_state, Some(token_table), Some(Role::Tenant));
+    let tenant_router = create_router(tenant_state, token_table.clone(), Some(Role::Tenant));
+
+    // SIGHUP-triggered tenants.toml hot reload — only wired up when the
+    // server actually started with a real token table (see
+    // spawn_tenants_reload_task's doc comment for why a dev-mode server gets
+    // no reload capability).
+    let _tenants_reload_task =
+        token_table.map(|table| spawn_tenants_reload_task(table, tenants_config_path));
 
     let admin_listener = tokio::net::TcpListener::bind(&admin_bind_addr)
         .await

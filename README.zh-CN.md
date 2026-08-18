@@ -43,19 +43,37 @@ export DEEPSEEK_API_KEY=sk-...
 |---|---|---|
 | `XGOVERNOR_BIND_ADDR` | `127.0.0.1:8787` | admin 面监听地址（必须是回环地址） |
 | `XGOVERNOR_TENANT_BIND_ADDR` | *(必填，无默认)* | tenant 面监听地址 |
-| `XGOVERNOR_BEARER_TOKEN` | *(必填)* | admin 面 token |
-| `XGOVERNOR_TENANT_TOKENS_JSON` | *(必填)* | tenant 面 token 表，每个条目对应一个租户自己的 token：`[{"token":"...","tenant_id":"...","quota":{...}}]`（quota 可选） |
-| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录 |
+| `XGOVERNOR_TENANTS_CONFIG_PATH` | `$XGOVERNOR_DATA_DIR/tenants.toml` | 声明式凭证/身份策略文件（见下）；**默认路径**缺失 = dev 模式（每个请求隐式获得 admin 身份）；**显式设置**的路径缺失则 fail-closed 拒绝启动 |
+| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录（默认也是 `tenants.toml` 所在目录） |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | 系统临时目录 | 会话工作区根目录 |
 | `E2B_API_KEY` | *(未设置)* | 设置后注册 `e2b` 远程沙箱后端 |
 | `DEEPSEEK_API_KEY` 等 | *(未设置)* | 透传给 pi 子进程的 LLM key |
+
+凭证与角色配置在 `tenants.toml` 文件里（`docs/tenancy_design.md` §4），启动时加载，支持 `SIGHUP` 热重载——轮换 token 或新增租户不需要重启：
+
+```toml
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+# principal / max_sessions / max_requests_per_minute 均可选
+```
 
 最小启动配置：
 
 ```bash
 export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788
-export XGOVERNOR_BEARER_TOKEN=demo-admin-token
-export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'  # 该 token 属于 demo-tenant 这个租户
+mkdir -p "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}"
+cat > "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}/tenants.toml" <<'EOF'
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+EOF
 export DEEPSEEK_API_KEY=sk-...
 cargo run -p xgovernor-server
 ```
@@ -64,7 +82,7 @@ cargo run -p xgovernor-server
 
 ### admin 面（管理端）
 
-以下请求打 admin 监听地址（`127.0.0.1:8787`），用 `XGOVERNOR_BEARER_TOKEN` 配置的 admin token。
+以下请求打 admin 监听地址（`127.0.0.1:8787`），用 `tenants.toml` 里 `[admin]` 节配置的 admin token。
 
 **1. 打开一个 pi 会话**
 
@@ -103,7 +121,7 @@ curl -N localhost:8787/api/v1/sessions/<runtime_id>/turns/<turn_id>/events \
 
 ### tenant 面（普通租户用自己的 token）
 
-普通租户请求打 **tenant 监听地址**（`127.0.0.1:8788`），用的是启动配置里 `XGOVERNOR_TENANT_TOKENS_JSON` 中**该租户自己的 token**（`demo-tenant-token`），不是 admin token。
+普通租户请求打 **tenant 监听地址**（`127.0.0.1:8788`），用的是 `tenants.toml` 里**该租户自己的 token**（`demo-tenant-token`），不是 admin token。
 
 租户会话有准入约束，与 admin 不同：
 

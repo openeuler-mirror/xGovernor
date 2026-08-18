@@ -16,7 +16,7 @@
 #   bash apps/runtime-pi/demo/multi_agent_demo.sh --keep-server   # 跑完后保留 server 进程
 #
 # 可调环境变量：
-#   XGOVERNOR_BIND_ADDR / XGOVERNOR_TENANT_BIND_ADDR / XGOVERNOR_BEARER_TOKEN
+#   XGOVERNOR_BIND_ADDR / XGOVERNOR_TENANT_BIND_ADDR / XGOVERNOR_ADMIN_TOKEN（写入 tenants.toml 的 admin token，默认 demo-admin-token）
 #   XGOVERNOR_REPO_DIR        Agent A 分析的仓库（默认：本仓库根目录）
 #   XGOVERNOR_DEMO_TIMEOUT_S  单个 agent 的等待上限（秒，默认 600）
 #   XGOVERNOR_DEMO_ROOT       演示数据目录（默认 mktemp）
@@ -33,7 +33,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 ADMIN_ADDR="${XGOVERNOR_BIND_ADDR:-127.0.0.1:8787}"
 TENANT_ADDR="${XGOVERNOR_TENANT_BIND_ADDR:-127.0.0.1:8788}"
-ADMIN_TOKEN="${XGOVERNOR_BEARER_TOKEN:-demo-admin-token}"
+ADMIN_TOKEN="${XGOVERNOR_ADMIN_TOKEN:-demo-admin-token}"
 REPO_DIR="${XGOVERNOR_REPO_DIR:-$REPO_ROOT}"
 TIMEOUT_S="${XGOVERNOR_DEMO_TIMEOUT_S:-600}"
 DEMO_ROOT="${XGOVERNOR_DEMO_ROOT:-$(mktemp -d /tmp/xgovernor-two-agent.XXXXXX)}"
@@ -126,11 +126,19 @@ say "构建并启动 xgovernor-server"
 if [[ ! -x "$SERVER_BIN" ]]; then
   (cd "$REPO_ROOT" && cargo build -p xgovernor-server) 2>&1 | tail -3
 fi
+mkdir -p "$WORK_HOME/.xgovernor"
+cat > "$WORK_HOME/.xgovernor/tenants.toml" <<EOF
+[admin]
+tokens = ["$ADMIN_TOKEN"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+EOF
+
 (
   export XGOVERNOR_BIND_ADDR="$ADMIN_ADDR"
   export XGOVERNOR_TENANT_BIND_ADDR="$TENANT_ADDR"
-  export XGOVERNOR_BEARER_TOKEN="$ADMIN_TOKEN"
-  export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'
   export XGOVERNOR_DEFAULT_WORKSPACE_ROOT="$WORK_ROOT"
   export XGOVERNOR_DATA_DIR="$WORK_HOME/.xgovernor"
   export HOME="$WORK_HOME"

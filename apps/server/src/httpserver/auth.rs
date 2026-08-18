@@ -1,14 +1,14 @@
+use arc_swap::ArcSwap;
 use axum::{
     extract::State,
     http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use xgovernor_core::{Role, SecurityContext, TenantQuota};
+use xgovernor_core::{Role, SecurityContext};
 
 /// Fixed-window width for the per-tenant request-rate defense
 /// (`TokenTable::check_rate_limit`) — a plain 60s wall-clock window, not a
@@ -25,10 +25,16 @@ struct RateWindow {
 }
 
 /// Bearer token → [`SecurityContext`] map. This is the "token 表" of
-/// `docs/tenancy_design.md` §7 step 1 — deliberately just a credential →
-/// identity lookup, not the full per-tenant policy file (`tenants.toml`,
-/// quotas/workspace-kind ceilings/etc., §4) which is a later, separate
-/// landing-order step.
+/// `docs/tenancy_design.md` §7 step 1, now sourced from the full policy file
+/// (`tenants.toml`, §4 — parsed by [`super::tenant_config::load_tenants_file`])
+/// instead of the old `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON`
+/// env-var pair.
+///
+/// `entries` lives behind an [`ArcSwap`] rather than a plain `Arc` so the
+/// table can be hot-reloaded on `SIGHUP` (`apps/server/src/main.rs`) without
+/// tearing down either listener: every clone of a `TokenTable` (the admin
+/// router and the tenant router each hold one) shares the same underlying
+/// `ArcSwap`, so a single [`TokenTable::reload`] call updates both at once.
 ///
 /// Also carries the per-tenant request-rate counters
 /// (`XGovernor 传输层四道防线` item 2 — the lightweight companion to the
@@ -39,36 +45,35 @@ struct RateWindow {
 /// instead of standing up a parallel subsystem.
 #[derive(Clone)]
 pub struct TokenTable {
-    entries: Arc<HashMap<String, SecurityContext>>,
+    entries: Arc<ArcSwap<HashMap<String, SecurityContext>>>,
     rate_limiter: Arc<Mutex<HashMap<String, RateWindow>>>,
-}
-
-#[derive(Deserialize)]
-struct TenantTokenEntry {
-    token: String,
-    tenant_id: String,
-    #[serde(default = "default_principal")]
-    principal: String,
-    #[serde(default)]
-    max_sessions: Option<u32>,
-    #[serde(default)]
-    max_requests_per_minute: Option<u32>,
-}
-
-fn default_principal() -> String {
-    "tenant".to_string()
 }
 
 impl TokenTable {
     pub fn new(entries: HashMap<String, SecurityContext>) -> Self {
         Self {
-            entries: Arc::new(entries),
+            entries: Arc::new(ArcSwap::from_pointee(entries)),
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn resolve(&self, token: &str) -> Option<SecurityContext> {
-        self.entries.get(token).cloned()
+        self.entries.load().get(token).cloned()
+    }
+
+    /// Atomically replace the token → identity map — the `SIGHUP` reload
+    /// path in `apps/server/src/main.rs`. Callers are expected to have
+    /// already validated `entries` (via
+    /// [`super::tenant_config::load_tenants_file`]) and decided it's safe to
+    /// apply; this method itself does no validation and never rejects a
+    /// swap, including an empty map. That "never rejects" behavior is
+    /// intentional at this layer — the *caller* is responsible for the
+    /// safety invariant that a reload producing zero entries (a truncated or
+    /// briefly-empty file mid-edit, say) must not be passed to `reload` at
+    /// all, since an empty table would silently strip auth off a listener
+    /// that started with real tokens configured.
+    pub fn reload(&self, entries: HashMap<String, SecurityContext>) {
+        self.entries.store(Arc::new(entries));
     }
 
     /// Fixed-window check for `tenant_id`: returns `true` (and records the
@@ -99,70 +104,6 @@ impl TokenTable {
         }
     }
 
-    /// Build a table from environment variables:
-    ///
-    /// - `XGOVERNOR_BEARER_TOKEN` — legacy single admin token (today's only
-    ///   credential mechanism), mapped to `SecurityContext::admin(..)`.
-    ///   Preserved unchanged so existing single-operator deployments keep
-    ///   working with no config migration.
-    /// - `XGOVERNOR_TENANT_TOKENS_JSON` — a JSON array of
-    ///   `{"token": "...", "tenant_id": "...", "principal": "...",
-    ///   "max_sessions": ..., "max_requests_per_minute": ...}` objects
-    ///   (`principal`/`max_sessions`/`max_requests_per_minute` all optional —
-    ///   an omitted `max_sessions`/`max_requests_per_minute` means
-    ///   unlimited), each mapped to
-    ///   `SecurityContext::tenant(..).with_quota(..)`. JSON via
-    ///   `serde_json` rather than a `tenants.toml` file: this step is scoped
-    ///   to auth (+ the session-count and request-rate quota tiers, §7 step
-    ///   4) only, not the full policy file of `docs/tenancy_design.md` §4.
-    ///
-    /// Returns `None` when neither variable is set (or both are empty) —
-    /// callers should then leave auth off entirely via [`security_layer`],
-    /// matching today's "wide open" dev-mode behavior.
-    pub fn from_env() -> Option<Self> {
-        let mut entries = HashMap::new();
-
-        if let Ok(admin_token) = std::env::var("XGOVERNOR_BEARER_TOKEN") {
-            if !admin_token.is_empty() {
-                entries.insert(
-                    admin_token,
-                    SecurityContext::admin("env:XGOVERNOR_BEARER_TOKEN"),
-                );
-            }
-        }
-
-        if let Ok(tenant_json) = std::env::var("XGOVERNOR_TENANT_TOKENS_JSON") {
-            if !tenant_json.trim().is_empty() {
-                match serde_json::from_str::<Vec<TenantTokenEntry>>(&tenant_json) {
-                    Ok(parsed) => {
-                        for entry in parsed {
-                            let quota = TenantQuota {
-                                max_sessions: entry.max_sessions,
-                                max_requests_per_minute: entry.max_requests_per_minute,
-                            };
-                            entries.insert(
-                                entry.token,
-                                SecurityContext::tenant(entry.tenant_id, entry.principal)
-                                    .with_quota(quota),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "warning: XGOVERNOR_TENANT_TOKENS_JSON failed to parse ({error}); \
-                             tenant tokens from it were not loaded"
-                        );
-                    }
-                }
-            }
-        }
-
-        if entries.is_empty() {
-            None
-        } else {
-            Some(Self::new(entries))
-        }
-    }
 }
 
 /// Install the auth middleware. With `Some(table)`, every request must carry
@@ -274,7 +215,7 @@ fn parse_bearer_token(headers: &HeaderMap) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xgovernor_core::Role;
+    use xgovernor_core::{Role, TenantQuota};
 
     #[test]
     fn bearer_parser_rejects_extra_parts() {
@@ -284,12 +225,44 @@ mod tests {
     }
 
     #[test]
-    fn from_env_is_none_when_nothing_is_set() {
-        // SAFETY (test-only, single-threaded env mutation): clearing these
-        // two vars is scoped to this test's assertion window.
-        std::env::remove_var("XGOVERNOR_BEARER_TOKEN");
-        std::env::remove_var("XGOVERNOR_TENANT_TOKENS_JSON");
-        assert!(TokenTable::from_env().is_none());
+    fn reload_atomically_replaces_the_entry_map() {
+        let mut entries = HashMap::new();
+        entries.insert("old-token".to_string(), SecurityContext::admin("root"));
+        let table = TokenTable::new(entries);
+        assert!(table.resolve("old-token").is_some());
+
+        let mut new_entries = HashMap::new();
+        new_entries.insert(
+            "new-token".to_string(),
+            SecurityContext::tenant("tenant-a", "alice"),
+        );
+        table.reload(new_entries);
+
+        assert!(
+            table.resolve("old-token").is_none(),
+            "reload must fully replace the map, not merge into it"
+        );
+        let ctx = table.resolve("new-token").expect("new token must resolve");
+        assert_eq!(ctx.role, Role::Tenant);
+    }
+
+    #[test]
+    fn reload_is_visible_through_a_cloned_table() {
+        // Every TokenTable clone shares the same underlying ArcSwap, so a
+        // reload via one clone must be visible through another -- this is
+        // the property that lets main.rs reload once and have it take
+        // effect on both the admin and tenant listener's router state.
+        let mut entries = HashMap::new();
+        entries.insert("old-token".to_string(), SecurityContext::admin("root"));
+        let table = TokenTable::new(entries);
+        let cloned = table.clone();
+
+        let mut new_entries = HashMap::new();
+        new_entries.insert("new-token".to_string(), SecurityContext::admin("root"));
+        table.reload(new_entries);
+
+        assert!(cloned.resolve("old-token").is_none());
+        assert!(cloned.resolve("new-token").is_some());
     }
 
     #[test]
@@ -354,49 +327,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[test]
-    fn tenant_token_json_parses_into_tenant_contexts() {
-        let json = r#"[
-            {"token": "t-a", "tenant_id": "tenant-a", "principal": "alice"},
-            {"token": "t-b", "tenant_id": "tenant-b"}
-        ]"#;
-        let parsed: Vec<TenantTokenEntry> = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].principal, "alice");
-        assert_eq!(
-            parsed[1].principal, "tenant",
-            "principal defaults when omitted"
-        );
-    }
-
-    #[test]
-    fn tenant_token_json_quota_field_defaults_to_unlimited_and_can_be_set() {
-        let json = r#"[
-            {"token": "t-a", "tenant_id": "tenant-a", "max_sessions": 5},
-            {"token": "t-b", "tenant_id": "tenant-b"}
-        ]"#;
-        let parsed: Vec<TenantTokenEntry> = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed[0].max_sessions, Some(5));
-        assert_eq!(
-            parsed[1].max_sessions, None,
-            "omitted quota field means unlimited"
-        );
-    }
-
-    #[test]
-    fn tenant_token_json_rate_field_defaults_to_unlimited_and_can_be_set() {
-        let json = r#"[
-            {"token": "t-a", "tenant_id": "tenant-a", "max_requests_per_minute": 30},
-            {"token": "t-b", "tenant_id": "tenant-b"}
-        ]"#;
-        let parsed: Vec<TenantTokenEntry> = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed[0].max_requests_per_minute, Some(30));
-        assert_eq!(
-            parsed[1].max_requests_per_minute, None,
-            "omitted rate field means unlimited"
-        );
     }
 
     fn rate_limited_router() -> axum::Router {
