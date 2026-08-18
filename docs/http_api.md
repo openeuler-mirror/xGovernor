@@ -37,6 +37,23 @@
 | `/api/v1/sessions/close`                               | POST | SessionCloseRequest       | 200 SessionControlResponse   |
 
 
+### 功能一览
+
+
+| 路由                                                     | 方法   | 用途                             |
+| ------------------------------------------------------ | ---- | ------------------------------ |
+| `/api/v1/health`                                       | GET  | 存活探测                           |
+| `/api/v1/sessions/open`                                | POST | 打开会话（携带 `runtime_id` 时为幂等重附着）  |
+| `/api/v1/sessions/turns`                               | POST | 提交 turn → 回执携带服务端签发的 `turn_id` |
+| `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | 单个 turn 的 SSE 事件流              |
+| `/api/v1/sessions/interactions`                        | POST | 应答 runtime 发起的交互               |
+| `/api/v1/sessions/cancel`                              | POST | 取消活跃（或指定）turn                  |
+| `/api/v1/sessions/fork`                                | POST | fork 会话（能力门控）                  |
+| `/api/v1/sessions/heartbeat`                           | POST | 维持租约心跳                         |
+| `/api/v1/sessions/detach`                              | POST | 释放租约、保留会话                      |
+| `/api/v1/sessions/close`                               | POST | 关闭会话（销毁沙箱）                     |
+
+
 
 
 ## 3. 会话控制面
@@ -192,3 +209,4 @@
 - 新增字段一律 `#[serde(default)]`；请求侧未知字段拒绝、响应侧未知能力按缺席处理——客户端可以落后于服务端，反之需同步窗口。
 - 协议 crate 的任何 JSON 形态变更都会触发其 schema/边界测试 diff，按 wire 变更评审。
 - 操作面（exec / 文件读写 / checkpoint / checkout / pause / resume）的 DTO 已在 session-protocol 定义但**尚未路由**，接线后并入本文 §2。
+
