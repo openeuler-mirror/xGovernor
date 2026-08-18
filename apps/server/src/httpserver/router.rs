@@ -1,5 +1,5 @@
 use super::auth::{require_role, security_layer, TokenTable};
-use super::session::{ SessionHttpState, session_router};
+use super::session::{session_router, SessionHttpState};
 use axum::{
     error_handling::HandleErrorLayer, http::StatusCode, routing::get, BoxError, Json, Router,
 };
@@ -96,12 +96,7 @@ impl<S> Layer<S> for SharedConcurrencyLimitLayer {
 /// composition with small, fast values instead of the real
 /// [`MAX_REQUEST_BODY_BYTES`]/[`REQUEST_TIMEOUT`]/[`MAX_CONCURRENT_REQUESTS`]
 /// constants. [`apply_transport_defenses`] is the production entry point.
-fn guard_with(
-    router: Router,
-    body_limit: usize,
-    timeout: Duration,
-    concurrency: usize,
-) -> Router {
+fn guard_with(router: Router, body_limit: usize, timeout: Duration, concurrency: usize) -> Router {
     // SharedConcurrencyLimitLayer and RequestBodyLimitLayer are applied as
     // their own separate `.layer()` calls (rather than folded into the
     // ServiceBuilder stack below) because neither ever produces an error —
@@ -451,8 +446,7 @@ mod tests {
             tokio::time::sleep(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
         }
 
-        let router =
-            apply_transport_defenses(Router::new().route("/slow", get(slow_handler)));
+        let router = apply_transport_defenses(Router::new().route("/slow", get(slow_handler)));
         let response = router
             .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
             .await

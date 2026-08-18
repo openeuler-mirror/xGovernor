@@ -119,19 +119,19 @@ async fn sweep_expired_streams(streams: &Mutex<HashMap<String, HashMap<String, S
 
 pub fn session_router(state: Arc<SessionHttpState>) -> Router {
     Router::new()
-    .route("/api/v1/sessions/open", post(open_session))
-    .route("/api/v1/sessions/turns", post(submit_turn))
-    .route("/api/v1/sessions/interactions", post(answer_interaction))
-    .route("/api/v1/sessions/close", post(close_session))
-    .route("/api/v1/sessions/detach", post(detach_session))
-    .route("/api/v1/sessions/heartbeat", post(heartbeat_session))
-    .route("/api/v1/sessions/cancel", post(cancel_turn))
-    .route("/api/v1/sessions/fork", post(fork_session))
-    .route(
-        "/api/v1/sessions/:runtime_id/turns/:turn_id/events",
-        get(stream_turn_events),
-    )
-    .with_state(state)
+        .route("/api/v1/sessions/open", post(open_session))
+        .route("/api/v1/sessions/turns", post(submit_turn))
+        .route("/api/v1/sessions/interactions", post(answer_interaction))
+        .route("/api/v1/sessions/close", post(close_session))
+        .route("/api/v1/sessions/detach", post(detach_session))
+        .route("/api/v1/sessions/heartbeat", post(heartbeat_session))
+        .route("/api/v1/sessions/cancel", post(cancel_turn))
+        .route("/api/v1/sessions/fork", post(fork_session))
+        .route(
+            "/api/v1/sessions/:runtime_id/turns/:turn_id/events",
+            get(stream_turn_events),
+        )
+        .with_state(state)
 }
 
 async fn open_session(
@@ -960,10 +960,7 @@ mod tests {
             Arc::new(UnusedEnvironment),
             Arc::new(FixedTurnId),
         )));
-        let router = super::super::auth::security_layer(
-            session_router(state.clone()),
-            None,
-        );
+        let router = super::super::auth::security_layer(session_router(state.clone()), None);
         (router, state)
     }
 
@@ -1024,7 +1021,12 @@ mod tests {
             "the cap must reject registration once MAX_PENDING_STREAMS is reached"
         );
         assert_eq!(
-            streams.lock().await.values().map(|t| t.len()).sum::<usize>(),
+            streams
+                .lock()
+                .await
+                .values()
+                .map(|t| t.len())
+                .sum::<usize>(),
             MAX_PENDING_STREAMS,
             "the rejected registration must not have been inserted"
         );

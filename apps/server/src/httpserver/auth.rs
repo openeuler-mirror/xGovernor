@@ -249,7 +249,10 @@ async fn resolve_security_context(
             (ctx.quota.max_requests_per_minute, ctx.tenant_id(), &table)
         {
             if !table.check_rate_limit(tenant_id, max_per_minute) {
-                return (StatusCode::TOO_MANY_REQUESTS, "tenant request rate limit exceeded")
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "tenant request rate limit exceeded",
+                )
                     .into_response();
             }
         }

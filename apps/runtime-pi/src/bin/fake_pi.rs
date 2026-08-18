@@ -117,7 +117,10 @@ fn run_interaction_scenario(id: &str, rx: &mpsc::Receiver<serde_json::Value>) {
                     == Some("extension_ui_response")
                     && value.get("id").and_then(|v| v.as_str()) == Some(interaction_id.as_str());
                 if is_match {
-                    answer_value = value.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                    answer_value = value
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     received = true;
                     break;
                 }

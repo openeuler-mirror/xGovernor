@@ -55,8 +55,7 @@ The system is organized around explicit boundaries, each owned by a contract cra
 | `crates/core` | Domain + application layer: `SessionApplication`, session records with **opaque runtime state**, the `RuntimeAdapter` seam every agent runtime plugs into, lease table, orphan reaper, admission gates, wire projections. |
 | `crates/backend` | Provider implementations shared by adapters: local directory sandbox, E2B remote sandbox, SQLite provider-instance ledger. |
 | `crates/manager` | `InstanceManager`: unified provider-instance orchestration — per-owner quota + global ceiling, per-runtime_id create idempotency, attach-failure compensating delete, delete-failure pending-release retry queue, create-path semaphore admission with backoff, startup reconcile against the ledger. |
-| `apps/runtime-local` | A mock runtime adapter over a **real** local sandbox — proves the full plumbing without pretending to be an LLM. |
-| `apps/runtime-e2b` | A mock runtime adapter over a **real** E2B provider, including in-sandbox `git clone` for git workspaces. |
+| `apps/runtime-mock` | A mock runtime adapter over **real** local and E2B providers (dispatched by `ext.runtime_mock.backend_id`) — proves the full plumbing, including in-sandbox `git clone` for git workspaces, without pretending to be an LLM. |
 | `apps/runtime-pi` | The **real** pi runtime adapter: spawns `pi --mode rpc` per session, drives it over line-delimited JSON, and routes tool execution through the bridge into sandboxes (`local` / `e2b`). |
 | `apps/server` | The runnable daemon (`xgovernor-server`): two listeners (admin loopback + tenant), HTTP/SSE transport, SQLite session repository, assembly. |
 

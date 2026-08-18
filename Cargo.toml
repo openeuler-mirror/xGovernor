@@ -1,12 +1,11 @@
 [workspace]
 members = [
     "apps/server",
-    "apps/runtime-local",
-    "apps/runtime-e2b",
+    "apps/runtime-mock",
     "apps/runtime-pi",
-    "crates/provider-protocol",
-    "crates/session-protocol",
-    "crates/operation-protocol",
+    "crates/protocol/provider",
+    "crates/protocol/session",
+    "crates/protocol/operation",
     "crates/backend",
     "crates/core",
     "crates/manager",

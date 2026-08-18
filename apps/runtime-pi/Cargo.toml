@@ -13,9 +13,9 @@ tokio = { workspace = true, features = ["sync", "process", "io-util", "rt", "net
 axum.workspace = true
 base64.workspace = true
 uuid.workspace = true
-session-protocol = { path = "../../crates/session-protocol" }
-provider-protocol = { path = "../../crates/provider-protocol" }
-operation-protocol = { path = "../../crates/operation-protocol" }
+session-protocol = { path = "../../crates/protocol/session" }
+provider-protocol = { path = "../../crates/protocol/provider" }
+operation-protocol = { path = "../../crates/protocol/operation" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }

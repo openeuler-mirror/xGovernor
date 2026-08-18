@@ -2200,25 +2200,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "xgovernor-runtime-e2b"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "backend",
- "operation-protocol",
- "provider-protocol",
- "rusqlite",
- "serde",
- "serde_json",
- "session-protocol",
- "thiserror 1.0.69",
- "tokio",
- "xgovernor-core",
- "xgovernor-manager",
-]
-
-[[package]]
-name = "xgovernor-runtime-local"
+name = "xgovernor-runtime-mock"
 version = "0.1.0"
 dependencies = [
  "async-trait",

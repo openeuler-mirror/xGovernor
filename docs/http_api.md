@@ -11,7 +11,7 @@
 - **鉴权**：设置了 `XGOVERNOR_BEARER_TOKEN`（旧式单 admin token，兼容保留）或 `XGOVERNOR_TENANT_TOKENS_JSON`（`[{"token","tenant_id","principal"?}]` 数组，签发 tenant 身份）任一个时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。两者均未设置时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
 - **跨租户所有权**：非 admin 身份访问不属于自己租户的 `runtime_id` 时，一律返回 `not_found`（404）而非 403——存在性对无权限的调用方不可见（[tenancy_design.md](./tenancy_design.md) §3.2 "404 不泄露存在性信息"）。admin 身份不受此约束。
 - **未知字段**：请求 DTO 一律 `deny_unknown_fields`——多传字段是 400 错误，不是静默忽略。唯一例外是 `ext` 扩展袋内部。
-- **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 runtime adapter 消费（例如 `ext.runtime_local`、未来的 `ext.xiaoo`）。
+- **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 runtime adapter 消费（例如 `ext.runtime_mock`、`ext.runtime_pi`、未来的 `ext.xiaoo`）。
 - **lease 声明**：所有控制请求可携带 `lease` 对象：
 
 ```json
@@ -37,6 +37,23 @@
 | `/api/v1/sessions/close`                               | POST | SessionCloseRequest       | 200 SessionControlResponse   |
 
 
+### 功能一览
+
+
+| 路由                                                     | 方法   | 用途                             |
+| ------------------------------------------------------ | ---- | ------------------------------ |
+| `/api/v1/health`                                       | GET  | 存活探测                           |
+| `/api/v1/sessions/open`                                | POST | 打开会话（携带 `runtime_id` 时为幂等重附着）  |
+| `/api/v1/sessions/turns`                               | POST | 提交 turn → 回执携带服务端签发的 `turn_id` |
+| `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | 单个 turn 的 SSE 事件流              |
+| `/api/v1/sessions/interactions`                        | POST | 应答 runtime 发起的交互               |
+| `/api/v1/sessions/cancel`                              | POST | 取消活跃（或指定）turn                  |
+| `/api/v1/sessions/fork`                                | POST | fork 会话（能力门控）                  |
+| `/api/v1/sessions/heartbeat`                           | POST | 维持租约心跳                         |
+| `/api/v1/sessions/detach`                              | POST | 释放租约、保留会话                      |
+| `/api/v1/sessions/close`                               | POST | 关闭会话（销毁沙箱）                     |
+
+
 
 
 ## 3. 会话控制面
@@ -54,7 +71,7 @@
   "deployment": { "profile": null, "resource_class": null, "options": null },
   "requested_capabilities": { "sandbox": ["exec"], "runtime": [] },
   "llm": { "provider": "openai", "model": "gpt-x", "api_key": "sk-..." },
-  "ext": { "runtime_local": { "backend_id": "local", "owner_ref": "demo-owner" } },
+  "ext": { "runtime_mock": { "backend_id": "local" } },
   "lease": { "client_id": "tui-1" }
 }
 ```
@@ -70,7 +87,7 @@
 {
   "runtime_id": "runtime-…", "conversation_id": "demo", "sender_id": "me",
   "status": "idle", "created_at_ms": 0, "updated_at_ms": 0,
-  "runtime_kind": "local-mock",
+  "runtime_kind": "mock",
   "workspace": { "workspace_id": "…", "root": "/work/repo", "access": "read_write", "revision": null, "metadata": null },
   "isolation": { "boundary": "host", "workspace_access": "read_write", "network": "none", "effective_capabilities": ["exec"], "metadata": null },
   "effective_capabilities": { "sandbox": ["exec"], "runtime": [] },
@@ -192,3 +209,4 @@
 - 新增字段一律 `#[serde(default)]`；请求侧未知字段拒绝、响应侧未知能力按缺席处理——客户端可以落后于服务端，反之需同步窗口。
 - 协议 crate 的任何 JSON 形态变更都会触发其 schema/边界测试 diff，按 wire 变更评审。
 - 操作面（exec / 文件读写 / checkpoint / checkout / pause / resume）的 DTO 已在 session-protocol 定义但**尚未路由**，接线后并入本文 §2。
+

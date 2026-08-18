@@ -204,9 +204,11 @@ impl InstanceManager {
     }
 
     fn quota_state(&self) -> Result<std::sync::MutexGuard<'_, QuotaState>, ProviderControlError> {
-        self.quota.lock().map_err(|_| ProviderControlError::Transport {
-            message: "instance manager quota lock poisoned".to_string(),
-        })
+        self.quota
+            .lock()
+            .map_err(|_| ProviderControlError::Transport {
+                message: "instance manager quota lock poisoned".to_string(),
+            })
     }
 
     fn get_runtime_lock(&self, runtime_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -529,12 +531,15 @@ impl InstanceManager {
                     "stop_instance: delete failed; queued for background pending-release retry \
                      (registry entry retained for a possible caller-initiated retry too)"
                 );
-                self.pending_release.lock().unwrap().push_back(PendingRelease {
-                    runtime_id: runtime_id.to_string(),
-                    record,
-                    attempt: 0,
-                    next_retry_at: Instant::now() + self.config.retry.base_delay,
-                });
+                self.pending_release
+                    .lock()
+                    .unwrap()
+                    .push_back(PendingRelease {
+                        runtime_id: runtime_id.to_string(),
+                        record,
+                        attempt: 0,
+                        next_retry_at: Instant::now() + self.config.retry.base_delay,
+                    });
                 Err(error)
             }
         }
@@ -682,7 +687,6 @@ impl InstanceManager {
         })
     }
 
-
     pub async fn reconcile(&self) -> Result<ReconcileOutcome, ProviderControlError> {
         let active = self.ledger.list_active(&self.kind).await?;
 
@@ -719,7 +723,10 @@ impl InstanceManager {
             }
         }
 
-        Ok(ReconcileOutcome { confirmed, orphaned })
+        Ok(ReconcileOutcome {
+            confirmed,
+            orphaned,
+        })
     }
 
     async fn soft_delete_orphan(&self, entry: &ActiveLedgerEntry, reason: &str) {
@@ -734,7 +741,10 @@ impl InstanceManager {
         }
     }
 
-    pub async fn destroy_by_runtime_id(&self, runtime_id: &str) -> Result<(), ProviderControlError> {
+    pub async fn destroy_by_runtime_id(
+        &self,
+        runtime_id: &str,
+    ) -> Result<(), ProviderControlError> {
         match self.stop_instance(runtime_id).await {
             Ok(()) => return Ok(()),
             Err(ProviderControlError::NotFound { .. }) => {}
@@ -751,7 +761,10 @@ impl InstanceManager {
 
     async fn destroy_by_ledger_locked(&self, runtime_id: &str) -> Result<(), ProviderControlError> {
         let active = self.ledger.list_active(&self.kind).await?;
-        let Some(entry) = active.into_iter().find(|entry| entry.runtime_id == runtime_id) else {
+        let Some(entry) = active
+            .into_iter()
+            .find(|entry| entry.runtime_id == runtime_id)
+        else {
             // Nothing this manager's ledger believes is active under this
             // runtime_id — already gone (or never existed under this
             // backend), which is the success case here, not an error.
@@ -1135,7 +1148,11 @@ mod tests {
         let error = expect_err(start(&manager, "r3", "owner-a").await);
         assert!(matches!(
             error,
-            ProviderControlError::ResourceLimitExceeded { current: 2, max: 2, .. }
+            ProviderControlError::ResourceLimitExceeded {
+                current: 2,
+                max: 2,
+                ..
+            }
         ));
     }
 
@@ -1151,7 +1168,11 @@ mod tests {
         let error = expect_err(start(&manager, "r3", "owner-c").await);
         assert!(matches!(
             error,
-            ProviderControlError::ResourceLimitExceeded { current: 2, max: 2, .. }
+            ProviderControlError::ResourceLimitExceeded {
+                current: 2,
+                max: 2,
+                ..
+            }
         ));
     }
 
@@ -1161,7 +1182,11 @@ mod tests {
         start(&manager, "r1", ADMIN_OWNER_REF).await.unwrap();
         start(&manager, "r2", ADMIN_OWNER_REF).await.unwrap();
         start(&manager, "r3", ADMIN_OWNER_REF).await.unwrap();
-        assert_eq!(manager.active_count(ADMIN_OWNER_REF), 3, "still counted for diagnostics");
+        assert_eq!(
+            manager.active_count(ADMIN_OWNER_REF),
+            3,
+            "still counted for diagnostics"
+        );
         assert_eq!(manager.global_active_count(), 3);
 
         // A regular tenant at the same caps is still capped, proving this is
@@ -1275,7 +1300,11 @@ mod tests {
 
         let error = expect_err(start(&manager, "r1", "owner-a").await);
         assert!(matches!(error, ProviderControlError::Transport { .. }));
-        assert_eq!(manager.active_count("owner-a"), 0, "quota reservation must be rolled back");
+        assert_eq!(
+            manager.active_count("owner-a"),
+            0,
+            "quota reservation must be rolled back"
+        );
         assert_eq!(
             lifecycle.delete_calls.load(Ordering::SeqCst),
             1,
@@ -1330,7 +1359,9 @@ mod tests {
     #[tokio::test]
     async fn create_does_not_retry_non_retryable_errors() {
         let (manager, lifecycle, _ledger) = manager_with(10, 10);
-        lifecycle.fail_create_permanently.store(true, Ordering::SeqCst);
+        lifecycle
+            .fail_create_permanently
+            .store(true, Ordering::SeqCst);
 
         let error = expect_err(start(&manager, "r1", "owner-a").await);
         assert!(matches!(error, ProviderControlError::InvalidRequest { .. }));
@@ -1399,7 +1430,11 @@ mod tests {
         // this fresh InstanceManager's in-memory registry/quota knows
         // nothing about it yet.
         let instance = lifecycle.instance("fake-restart-survivor".to_string());
-        lifecycle.live_instances.lock().unwrap().push(instance.clone());
+        lifecycle
+            .live_instances
+            .lock()
+            .unwrap()
+            .push(instance.clone());
         ledger.rows.lock().unwrap().insert(
             "runtime-restart-1".to_string(),
             ActiveLedgerEntry {
@@ -1441,7 +1476,11 @@ mod tests {
         let ledger = Arc::new(FakeLedger::default());
 
         let instance = lifecycle.instance("fake-post-restart".to_string());
-        lifecycle.live_instances.lock().unwrap().push(instance.clone());
+        lifecycle
+            .live_instances
+            .lock()
+            .unwrap()
+            .push(instance.clone());
         ledger.rows.lock().unwrap().insert(
             "runtime-post-restart-1".to_string(),
             ActiveLedgerEntry {
@@ -1476,7 +1515,12 @@ mod tests {
             "the provider instance must actually be deleted, not silently skipped"
         );
         assert!(
-            ledger.rows.lock().unwrap().get("runtime-post-restart-1").is_none()
+            ledger
+                .rows
+                .lock()
+                .unwrap()
+                .get("runtime-post-restart-1")
+                .is_none()
                 || !lifecycle
                     .live_instances
                     .lock()
@@ -1528,7 +1572,10 @@ mod tests {
         assert!(outcome.confirmed.is_empty());
         assert_eq!(outcome.orphaned.len(), 1);
         assert_eq!(manager.active_count("owner-a"), 0);
-        assert!(ledger.rows.lock().unwrap().is_empty(), "orphan must be soft-deleted from the ledger");
+        assert!(
+            ledger.rows.lock().unwrap().is_empty(),
+            "orphan must be soft-deleted from the ledger"
+        );
     }
 
     /// End-to-end confidence check against a real provider (not a fake),
@@ -1551,8 +1598,7 @@ mod tests {
         let lifecycle: Arc<dyn ProviderLifecycle> = local.clone();
         let attach: Arc<dyn OperationAttach> = local;
         let ledger: Arc<dyn ProviderInstanceLedger> = Arc::new(
-            backend::SqliteProviderInstanceLedger::open_in_memory()
-                .expect("open in-memory ledger"),
+            backend::SqliteProviderInstanceLedger::open_in_memory().expect("open in-memory ledger"),
         );
         let manager = InstanceManager::new(
             lifecycle,
