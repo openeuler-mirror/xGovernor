@@ -44,7 +44,7 @@ export DEEPSEEK_API_KEY=sk-...
 | `XGOVERNOR_BIND_ADDR` | `127.0.0.1:8787` | admin 面监听地址（必须是回环地址） |
 | `XGOVERNOR_TENANT_BIND_ADDR` | *(必填，无默认)* | tenant 面监听地址 |
 | `XGOVERNOR_BEARER_TOKEN` | *(必填)* | admin 面 token |
-| `XGOVERNOR_TENANT_TOKENS_JSON` | *(必填)* | tenant 面 token 表：`[{"token":"...","tenant_id":"..."}]` |
+| `XGOVERNOR_TENANT_TOKENS_JSON` | *(必填)* | tenant 面 token 表，每个条目对应一个租户自己的 token：`[{"token":"...","tenant_id":"...","quota":{...}}]`（quota 可选） |
 | `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录 |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | 系统临时目录 | 会话工作区根目录 |
 | `E2B_API_KEY` | *(未设置)* | 设置后注册 `e2b` 远程沙箱后端 |
@@ -55,14 +55,16 @@ export DEEPSEEK_API_KEY=sk-...
 ```bash
 export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788
 export XGOVERNOR_BEARER_TOKEN=demo-admin-token
-export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'
+export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'  # 该 token 属于 demo-tenant 这个租户
 export DEEPSEEK_API_KEY=sk-...
 cargo run -p xgovernor-server
 ```
 
 ## 最小跑通一个 case
 
-以下请求都打 admin 面（`127.0.0.1:8787`，`Authorization: Bearer demo-admin-token`）。
+### admin 面（管理端）
+
+以下请求打 admin 监听地址（`127.0.0.1:8787`），用 `XGOVERNOR_BEARER_TOKEN` 配置的 admin token。
 
 **1. 打开一个 pi 会话**
 
@@ -98,6 +100,29 @@ curl -N localhost:8787/api/v1/sessions/<runtime_id>/turns/<turn_id>/events \
 ```
 
 看到 `turn_completed` 即跑通。更完整的走查（e2b 远程沙箱、多 agent 并行、`kill -9` 重启复原）见 [apps/runtime-pi/demo/easydemo.md](./apps/runtime-pi/demo/easydemo.md) 和 [apps/runtime-pi/demo/mult_agent_demo.md](./apps/runtime-pi/demo/mult_agent_demo.md)。
+
+### tenant 面（普通租户用自己的 token）
+
+普通租户请求打 **tenant 监听地址**（`127.0.0.1:8788`），用的是启动配置里 `XGOVERNOR_TENANT_TOKENS_JSON` 中**该租户自己的 token**（`demo-tenant-token`），不是 admin token。
+
+租户会话有准入约束，与 admin 不同：
+
+- 工作区必须是 **git 仓库**（`kind: "git"`，仅 https URL，且 URL 不能内嵌用户名密码）；`daemon_default` / `local` 在 tenant 面会被拒。注意目前只支持**公开** https 仓库——沙箱不注入任何凭据，私有仓库无法 clone。
+- provider 必须是**沙箱化**的，即 `backend_id: "e2b"`（需配置 `E2B_API_KEY`）；`local` 不是沙箱，tenant 面不可用。
+- 同一套 API 路径，只换监听地址和 token。
+
+```bash
+curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' \
+  -H 'Authorization: Bearer demo-tenant-token' -d '{
+  "conversation_id": "demo",
+  "sender_id": "me",
+  "workspace": { "kind": "git", "url": "https://github.com/example/repo.git" },
+  "ext": { "runtime_pi": { "backend_id": "e2b" } }
+}'
+# 记下响应里的 runtime_id；沙箱内会先 git clone 该仓库再作为工作区
+```
+
+提交 turn 与订阅事件流和 admin 面完全一样（`POST /api/v1/sessions/turns`、`GET /api/v1/sessions/<runtime_id>/turns/<turn_id>/events`），只把监听地址换成 `8788`、token 换成该租户自己的。每个租户的 token 对应一个 `tenant_id`，会话按租户隔离（配额、访问互不可见）。
 
 ## 开发
 
