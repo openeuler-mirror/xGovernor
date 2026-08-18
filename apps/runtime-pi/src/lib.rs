@@ -224,11 +224,9 @@ impl PiPersistedState {
                 source: None,
             });
         }
-        serde_json::from_value(opaque.state.clone()).map_err(|error| {
-            SessionDomainError::Internal {
-                message: format!("PiRuntime persisted state failed to parse: {error}"),
-                source: None,
-            }
+        serde_json::from_value(opaque.state.clone()).map_err(|error| SessionDomainError::Internal {
+            message: format!("PiRuntime persisted state failed to parse: {error}"),
+            source: None,
         })
     }
 }
@@ -239,10 +237,11 @@ fn read_pi_runtime_ext(ext: &SessionExtensions) -> Result<PiRuntimeExt, SessionD
         .ok_or_else(|| SessionDomainError::InvalidRequest {
             message: format!("missing required '{EXT_NAMESPACE}' ext payload (backend_id)"),
         })?;
-    let parsed: PiRuntimeExt =
-        serde_json::from_value(value.clone()).map_err(|error| SessionDomainError::InvalidRequest {
+    let parsed: PiRuntimeExt = serde_json::from_value(value.clone()).map_err(|error| {
+        SessionDomainError::InvalidRequest {
             message: format!("invalid '{EXT_NAMESPACE}' ext payload: {error}"),
-        })?;
+        }
+    })?;
     if parsed.backend_id.trim().is_empty() {
         return Err(SessionDomainError::InvalidRequest {
             message: format!("'{EXT_NAMESPACE}.backend_id' must not be empty"),
@@ -326,13 +325,11 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 .expect("GitWorkspaceMetadata serialization is infallible");
                 (E2B_WORKSPACE_ROOT.to_string(), reference.clone(), metadata)
             }
-            (workspace, backend_id) => {
-                return Err(SessionDomainError::InvalidRequest {
-                    message: format!(
-                        "workspace kind {workspace:?} is not supported by PI backend_id '{backend_id}'"
-                    ),
-                })
-            }
+            (workspace, backend_id) => return Err(SessionDomainError::InvalidRequest {
+                message: format!(
+                    "workspace kind {workspace:?} is not supported by PI backend_id '{backend_id}'"
+                ),
+            }),
         };
 
         let (boundary, network, capabilities) = match ext.backend_id.as_str() {
@@ -582,18 +579,16 @@ impl PiRuntime {
             .unwrap_or_else(|| DEFAULT_PI_EXECUTABLE.to_string());
         let extension_dir = resolve_extension_dir(&ext);
 
-        let manager = self
-            .managers
-            .get(&ext.backend_id)
-            .cloned()
-            .ok_or_else(|| SessionDomainError::InvalidRequest {
+        let manager = self.managers.get(&ext.backend_id).cloned().ok_or_else(|| {
+            SessionDomainError::InvalidRequest {
                 message: format!(
                     "no InstanceManager configured for backend_id '{}'; this PiRuntime only \
                      knows about: {:?}",
                     ext.backend_id,
                     self.managers.keys().collect::<Vec<_>>()
                 ),
-            })?;
+            }
+        })?;
 
         // E2B sandboxes created by PI sessions keep internet access, exactly
         // like `apps/runtime-mock`'s `MockRuntime::start` does
@@ -625,13 +620,14 @@ impl PiRuntime {
         // `clone_git_workspace`); materialize the clone inside the sandbox
         // before attaching the bridge, and roll the sandbox back if it fails.
         if request.workspace.metadata != Value::Null {
-            let git: GitWorkspaceMetadata = serde_json::from_value(request.workspace.metadata.clone())
-                .map_err(|error| SessionDomainError::InvalidRequest {
-                    message: format!("invalid workspace_metadata for git clone: {error}"),
+            let git: GitWorkspaceMetadata =
+                serde_json::from_value(request.workspace.metadata.clone()).map_err(|error| {
+                    SessionDomainError::InvalidRequest {
+                        message: format!("invalid workspace_metadata for git clone: {error}"),
+                    }
                 })?;
             let clone_target = backend.paths().workspace_root().clone();
-            if let Err(error) = clone_git_workspace(backend.as_ref(), &git, &clone_target.0).await
-            {
+            if let Err(error) = clone_git_workspace(backend.as_ref(), &git, &clone_target.0).await {
                 let _ = manager.stop_instance(&request.runtime_id).await;
                 return Err(error);
             }
@@ -708,8 +704,9 @@ impl PiRuntime {
         // repopulated at startup (F7) — never provisions. `NotFound` here is
         // exactly §1.4's "sandbox already dead" signal (e2b lease expired,
         // or `reconcile()` itself decided the ledger row was orphaned).
-        let backend = manager.backend_for(&request.runtime_id).map_err(|error| {
-            match error {
+        let backend = manager
+            .backend_for(&request.runtime_id)
+            .map_err(|error| match error {
                 ProviderControlError::NotFound { .. } => SessionDomainError::Unavailable {
                     message: format!(
                         "pi_sandbox_gone: sandbox for runtime '{}' is no longer tracked by its \
@@ -719,8 +716,7 @@ impl PiRuntime {
                     ),
                 },
                 other => map_provider_error(other),
-            }
-        })?;
+            })?;
 
         let executable = state
             .executable
@@ -733,9 +729,11 @@ impl PiRuntime {
             .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string());
 
         let session_dir = PathBuf::from(&state.pi_session_dir);
-        let resume_session_file = session_file::latest_complete_turn_file(&session_dir)
-            .map_err(|error| SessionDomainError::Unavailable {
-                message: format!("pi_session_state_lost: {error}"),
+        let resume_session_file =
+            session_file::latest_complete_turn_file(&session_dir).map_err(|error| {
+                SessionDomainError::Unavailable {
+                    message: format!("pi_session_state_lost: {error}"),
+                }
             })?;
 
         Ok(PreparedStart {
@@ -834,7 +832,10 @@ fn extract_usage(message: &Value) -> SessionUsage {
 
 async fn handle_response(instance: &PiInstance, message: &Value) {
     let command = message.get("command").and_then(Value::as_str).unwrap_or("");
-    let success = message.get("success").and_then(Value::as_bool).unwrap_or(true);
+    let success = message
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     // Only the `prompt` command's rejection matters here: it means the turn
     // `submit_turn` thought it had accepted never actually started, so the
     // caller needs a terminal `Failed` event rather than silence. `abort`'s
@@ -875,15 +876,15 @@ async fn handle_message_update(instance: &PiInstance, message: &Value) {
     // `text_end`/`thinking_start`/`thinking_end` carry no per-chunk text
     // (the `_end` variants repeat the full content, which the deltas already
     // covered), so only the two `*_delta` types are mapped.
-    let Some(assistant_event) = message.get("assistantMessageEvent") else { return };
+    let Some(assistant_event) = message.get("assistantMessageEvent") else {
+        return;
+    };
     let delta_type = assistant_event
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("");
     let text = match delta_type {
-        "text_delta" | "thinking_delta" => {
-            assistant_event.get("delta").and_then(Value::as_str)
-        }
+        "text_delta" | "thinking_delta" => assistant_event.get("delta").and_then(Value::as_str),
         // `toolcall_delta` (incremental tool-call argument streaming) has no
         // `OutputDelta` equivalent in the normalized vocabulary; the
         // completed call is instead surfaced via `tool_execution_start`/
@@ -945,7 +946,10 @@ async fn handle_tool_execution_end(instance: &PiInstance, message: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("tool")
         .to_string();
-    let is_error = message.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let is_error = message
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let status = if is_error {
         SessionToolActivityStatus::Failed
     } else {
@@ -969,7 +973,9 @@ async fn handle_tool_execution_end(instance: &PiInstance, message: &Value) {
 }
 
 async fn handle_extension_ui_request(instance: &PiInstance, message: &Value) {
-    let Some(id) = message.get("id").and_then(Value::as_str) else { return };
+    let Some(id) = message.get("id").and_then(Value::as_str) else {
+        return;
+    };
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return;
     };
@@ -1047,7 +1053,8 @@ async fn handle_extension_ui_request(instance: &PiInstance, message: &Value) {
         // this adapter submitted. Nothing to do but drop it.
         return;
     };
-    turn.pending_interactions.insert(id.to_string(), method.to_string());
+    turn.pending_interactions
+        .insert(id.to_string(), method.to_string());
     let _ = turn
         .tx
         .send(RuntimeEvent::InteractionRequested {
@@ -1091,7 +1098,10 @@ async fn handle_agent_settled(instance: &PiInstance, message: &Value) {
     } else {
         SessionTurnOutcome::Complete
     };
-    let _ = turn.tx.send(RuntimeEvent::Completed { outcome, usage }).await;
+    let _ = turn
+        .tx
+        .send(RuntimeEvent::Completed { outcome, usage })
+        .await;
 }
 
 async fn handle_pi_message(instance: &PiInstance, message: Value) {
@@ -1207,8 +1217,11 @@ impl RuntimeAdapter for PiRuntime {
 
         let workspace_root = backend.paths().workspace_root().clone();
         let bridge_token = Uuid::new_v4().to_string();
-        self.bridge
-            .register(bridge_token.clone(), Arc::clone(&backend), workspace_root.clone());
+        self.bridge.register(
+            bridge_token.clone(),
+            Arc::clone(&backend),
+            workspace_root.clone(),
+        );
 
         let mut command = Command::new(&executable);
         command
@@ -1431,11 +1444,11 @@ impl RuntimeAdapter for PiRuntime {
 
         if should_send {
             let command = json!({ "type": "abort" });
-            write_command(&instance, &command)
-                .await
-                .map_err(|error| SessionDomainError::Unavailable {
+            write_command(&instance, &command).await.map_err(|error| {
+                SessionDomainError::Unavailable {
                     message: format!("failed to send abort to pi process: {error}"),
-                })?;
+                }
+            })?;
         }
         Ok(())
     }
@@ -1447,7 +1460,10 @@ impl RuntimeAdapter for PiRuntime {
     /// this is a governor-internal reuse of the state-quarantine slot, not a
     /// declaration of the (unrelated) checkpoint `StateExport` capability;
     /// `capabilities()` above is deliberately unchanged.
-    async fn export_state(&self, runtime_id: &str) -> Result<OpaqueRuntimeState, SessionDomainError> {
+    async fn export_state(
+        &self,
+        runtime_id: &str,
+    ) -> Result<OpaqueRuntimeState, SessionDomainError> {
         let instance = self.instance_for(runtime_id).await?;
         Ok(instance.persisted_state.clone().into_opaque())
     }
@@ -1494,24 +1510,18 @@ mod tests {
             deployment: Default::default(),
             requested_capabilities: Default::default(),
             llm: None,
-            ext: [(
-                EXT_NAMESPACE.to_string(),
-                json!({ "backend_id": "e2b" }),
-            )]
-            .into_iter()
-            .collect(),
+            ext: [(EXT_NAMESPACE.to_string(), json!({ "backend_id": "e2b" }))]
+                .into_iter()
+                .collect(),
             lease: Default::default(),
         }
     }
 
     fn local_open_request(workspace: session_protocol::WorkspaceSpec) -> SessionOpenRequest {
         let mut request = open_request(workspace);
-        request.ext = [(
-            EXT_NAMESPACE.to_string(),
-            json!({ "backend_id": "local" }),
-        )]
-        .into_iter()
-        .collect();
+        request.ext = [(EXT_NAMESPACE.to_string(), json!({ "backend_id": "local" }))]
+            .into_iter()
+            .collect();
         request
     }
 
@@ -1537,7 +1547,11 @@ mod tests {
             .expect("tenant + git + e2b must be admitted");
         assert_eq!(normalized.isolation.boundary, IsolationBoundary::Remote);
         assert_eq!(normalized.workspace.root, E2B_WORKSPACE_ROOT);
-        let metadata = normalized.workspace.metadata.as_object().expect("git metadata");
+        let metadata = normalized
+            .workspace
+            .metadata
+            .as_object()
+            .expect("git metadata");
         assert_eq!(metadata["url"], "https://example.com/org/repo.git");
     }
 
@@ -1585,8 +1599,7 @@ mod tests {
         assert_eq!(normalized.isolation.boundary, IsolationBoundary::Remote);
         assert_eq!(normalized.workspace.root, E2B_WORKSPACE_ROOT);
         assert_eq!(
-            normalized.isolation.metadata["tool_backend_id"],
-            "e2b",
+            normalized.isolation.metadata["tool_backend_id"], "e2b",
             "isolation metadata must name the selected tool backend"
         );
     }
@@ -1602,8 +1615,7 @@ mod tests {
             .expect("admin + local must be admitted");
         assert_eq!(normalized.isolation.boundary, IsolationBoundary::Host);
         assert_eq!(
-            normalized.workspace.root,
-            "/tmp/xgovernor-default",
+            normalized.workspace.root, "/tmp/xgovernor-default",
             "local daemon_default keeps the daemon's default workspace root"
         );
     }
@@ -1612,12 +1624,9 @@ mod tests {
     async fn unconfigured_backend_is_rejected_at_open() {
         let normalizer = PiSessionEnvironment::new("/tmp/xgovernor-default", ["local".to_string()]);
         let mut request = open_request(session_protocol::WorkspaceSpec::DaemonDefault);
-        request.ext = [(
-            EXT_NAMESPACE.to_string(),
-            json!({ "backend_id": "e2b" }),
-        )]
-        .into_iter()
-        .collect();
+        request.ext = [(EXT_NAMESPACE.to_string(), json!({ "backend_id": "e2b" }))]
+            .into_iter()
+            .collect();
         let result = normalizer
             .normalize(&SecurityContext::admin("admin-1"), &request)
             .await;

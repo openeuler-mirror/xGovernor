@@ -351,12 +351,12 @@ impl RuntimeAdapter for MockRuntime {
             .map_err(map_provider_error)?;
 
         if request.workspace.metadata != Value::Null {
-            let git: GitWorkspaceMetadata = serde_json::from_value(
-                request.workspace.metadata.clone(),
-            )
-            .map_err(|error| SessionDomainError::InvalidRequest {
-                message: format!("invalid workspace_metadata for git clone: {error}"),
-            })?;
+            let git: GitWorkspaceMetadata =
+                serde_json::from_value(request.workspace.metadata.clone()).map_err(|error| {
+                    SessionDomainError::InvalidRequest {
+                        message: format!("invalid workspace_metadata for git clone: {error}"),
+                    }
+                })?;
 
             if let Err(error) =
                 clone_git_workspace(backend.as_ref(), &git, &request.workspace.root).await

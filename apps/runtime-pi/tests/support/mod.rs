@@ -65,7 +65,9 @@ pub fn build_managers() -> HashMap<String, StdArc<InstanceManager>> {
         ProviderKind(LOCAL_BACKEND_ID.to_string()),
         InstanceManagerConfig::new(20, 1024),
     ));
-    [(LOCAL_BACKEND_ID.to_string(), manager)].into_iter().collect()
+    [(LOCAL_BACKEND_ID.to_string(), manager)]
+        .into_iter()
+        .collect()
 }
 
 pub fn new_pi_runtime() -> PiRuntime {

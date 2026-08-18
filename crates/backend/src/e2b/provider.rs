@@ -425,7 +425,8 @@ impl E2bProvider {
     async fn reattach_from_persisted_instance(
         &self,
         instance: &ProviderInstance,
-    ) -> Result<(Arc<E2bBackendState>, Arc<dyn OperationBackend>, Value), ProviderControlError> {
+    ) -> Result<(Arc<E2bBackendState>, Arc<dyn OperationBackend>, Value), ProviderControlError>
+    {
         let provider_options_value = instance
             .metadata
             .as_object()
@@ -2376,7 +2377,7 @@ mod tests {
         );
         assert_eq!(unknown.state, ProviderLifecycleState::Unknown);
     }
-    
+
     #[tokio::test]
     #[ignore = "requires E2B_API_KEY and creates real E2B sandboxes"]
     async fn live_list_instances_and_reconcile_against_remote_platform() {

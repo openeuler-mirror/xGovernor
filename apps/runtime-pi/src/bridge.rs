@@ -33,7 +33,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 /// What `Bridge::register` associates with a per-session bearer token: the
 /// real backend to proxy operations to, and that session's workspace root
@@ -80,11 +81,22 @@ impl Bridge {
     /// per `start()` call, so a collision would only happen if a caller
     /// reused one, which is a caller bug — not this method's concern to
     /// detect).
-    pub fn register(&self, token: String, backend: Arc<dyn OperationBackend>, workspace_root: BackendPath) {
+    pub fn register(
+        &self,
+        token: String,
+        backend: Arc<dyn OperationBackend>,
+        workspace_root: BackendPath,
+    ) {
         self.sessions
             .write()
             .expect("Bridge sessions lock poisoned")
-            .insert(token, SessionEntry { backend, workspace_root });
+            .insert(
+                token,
+                SessionEntry {
+                    backend,
+                    workspace_root,
+                },
+            );
     }
 
     /// Removes a session's registration. No-op if `token` is unknown (e.g.
@@ -129,7 +141,10 @@ struct AuthedSession {
 impl FromRequestParts<Arc<Bridge>> for AuthedSession {
     type Rejection = Response;
 
-    async fn from_request_parts(parts: &mut Parts, state: &Arc<Bridge>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<Bridge>,
+    ) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -209,7 +224,11 @@ fn operation_error_response(error: OperationError) -> Response {
     let kind = error_kind(&error);
     let status = status_for_kind(kind);
     let message = error.to_string();
-    (status, Json(json!({ "error": { "kind": kind, "message": message } }))).into_response()
+    (
+        status,
+        Json(json!({ "error": { "kind": kind, "message": message } })),
+    )
+        .into_response()
 }
 
 // ---- POST /v1/workspace-root ----
@@ -510,6 +529,7 @@ async fn grep_handler(
 mod tests {
     use super::*;
     use operation_protocol::capability::exec::ExecResult;
+    use operation_protocol::capability::export::ExportFileRequest;
     use operation_protocol::capability::filesystem::{
         TempPathKind, TempPathRequest, WriteBytesOutcome,
     };
@@ -518,7 +538,6 @@ mod tests {
         OperationExec, OperationExport, OperationFileSystem, OperationPathResolver, OperationSearch,
     };
     use operation_protocol::{OperationBackendCapabilities, PathStat};
-    use operation_protocol::capability::export::ExportFileRequest;
     use std::sync::Mutex as StdMutex;
 
     /// Minimal in-memory `OperationBackend` test double: enough to exercise
@@ -580,10 +599,7 @@ mod tests {
             }
         }
 
-        async fn read_bytes(
-            &self,
-            request: ReadBytesRequest,
-        ) -> Result<Vec<u8>, OperationError> {
+        async fn read_bytes(&self, request: ReadBytesRequest) -> Result<Vec<u8>, OperationError> {
             self.files
                 .lock()
                 .unwrap()
@@ -616,10 +632,7 @@ mod tests {
             Ok(())
         }
 
-        async fn temp_path(
-            &self,
-            request: TempPathRequest,
-        ) -> Result<BackendPath, OperationError> {
+        async fn temp_path(&self, request: TempPathRequest) -> Result<BackendPath, OperationError> {
             let _ = request;
             match request.kind {
                 TempPathKind::File => Ok(BackendPath("/tmp/fake-file".to_string())),
@@ -639,13 +652,14 @@ mod tests {
                 .collect())
         }
 
-        async fn grep(&self, request: GrepRequest) -> Result<operation_protocol::capability::search::GrepResult, OperationError> {
+        async fn grep(
+            &self,
+            request: GrepRequest,
+        ) -> Result<operation_protocol::capability::search::GrepResult, OperationError> {
             let files = self.files.lock().unwrap();
             let entries = files
                 .iter()
-                .filter(|(_, content)| {
-                    String::from_utf8_lossy(content).contains(&request.query)
-                })
+                .filter(|(_, content)| String::from_utf8_lossy(content).contains(&request.query))
                 .map(|(path, _)| path.clone())
                 .collect();
             Ok(operation_protocol::capability::search::GrepResult { entries })
@@ -717,7 +731,11 @@ mod tests {
         let bridge = Bridge::spawn().expect("bridge must spawn");
         let backend: Arc<dyn OperationBackend> = Arc::new(FakeBackend::new("/workspace"));
         let token = "test-token".to_string();
-        bridge.register(token.clone(), backend, BackendPath("/workspace".to_string()));
+        bridge.register(
+            token.clone(),
+            backend,
+            BackendPath("/workspace".to_string()),
+        );
         (bridge, token)
     }
 
@@ -789,7 +807,9 @@ mod tests {
             .unwrap();
         assert_eq!(read_response.status(), 200);
         let body: serde_json::Value = read_response.json().await.unwrap();
-        let content = B64.decode(body["content_base64"].as_str().unwrap()).unwrap();
+        let content = B64
+            .decode(body["content_base64"].as_str().unwrap())
+            .unwrap();
         assert_eq!(content, b"hello world");
     }
 

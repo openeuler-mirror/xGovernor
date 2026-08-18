@@ -95,7 +95,11 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
     {
         let runtime_a =
             PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-        let app_a = support::application_with_runtime(runtime_a, repository.clone(), workspace_root.clone());
+        let app_a = support::application_with_runtime(
+            runtime_a,
+            repository.clone(),
+            workspace_root.clone(),
+        );
         app_a
             .open(&ctx, open_request())
             .await
@@ -141,7 +145,9 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
         .await
         .expect("submit_turn must transparently restore the session and succeed");
 
-    let mut events = submission.events.expect("resumed turn carries an event stream");
+    let mut events = submission
+        .events
+        .expect("resumed turn carries an event stream");
     let mut saw_output = false;
     let mut saw_completed = false;
     while let Some(event) = events.recv().await {
@@ -160,7 +166,10 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
             _ => {}
         }
     }
-    assert!(saw_output, "the resumed pi process must still process turns normally");
+    assert!(
+        saw_output,
+        "the resumed pi process must still process turns normally"
+    );
     assert!(saw_completed);
 
     // The newly spawned (second) fake_pi process must have received an
@@ -214,7 +223,11 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
     {
         let runtime_a =
             PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-        let app_a = support::application_with_runtime(runtime_a, repository.clone(), workspace_root.clone());
+        let app_a = support::application_with_runtime(
+            runtime_a,
+            repository.clone(),
+            workspace_root.clone(),
+        );
         app_a
             .open(&ctx, open_request())
             .await
@@ -301,7 +314,11 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
     {
         let runtime_a =
             PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-        let app_a = support::application_with_runtime(runtime_a, repository.clone(), workspace_root.clone());
+        let app_a = support::application_with_runtime(
+            runtime_a,
+            repository.clone(),
+            workspace_root.clone(),
+        );
         app_a
             .open(&ctx, open_request())
             .await
@@ -328,10 +345,11 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
     let response = app_b
         .close(&ctx, "runtime-1", Default::default())
         .await
-        .expect(
-            "close must succeed via the state-based cleanup special case, without spawning pi",
-        );
-    assert_eq!(response.status, session_protocol::SessionLifecycleStatus::Closed);
+        .expect("close must succeed via the state-based cleanup special case, without spawning pi");
+    assert_eq!(
+        response.status,
+        session_protocol::SessionLifecycleStatus::Closed
+    );
 
     assert!(
         !Path::new(&session_dir).exists(),

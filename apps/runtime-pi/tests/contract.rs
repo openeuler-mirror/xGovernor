@@ -20,11 +20,11 @@
 
 mod support;
 
+use serde_json::{json, Value};
 use session_protocol::{
     SessionExtensions, SessionInteractionAnswer, SessionOpenRequest, SessionToolActivityPhase,
     SessionToolActivityStatus, SessionTurnOutcome, SessionTurnRequest,
 };
-use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use support::{
     application, fake_pi_path, new_pi_runtime, no_entry, pi_runtime_ext, started_runtime,
@@ -76,7 +76,11 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
         "PiRuntime::export_state must produce a non-null state blob"
     );
     assert_eq!(
-        record.runtime.state.get("backend_id").and_then(Value::as_str),
+        record
+            .runtime
+            .state
+            .get("backend_id")
+            .and_then(Value::as_str),
         Some(LOCAL_BACKEND_ID),
         "persisted state must carry the backend_id start() provisioned against"
     );
@@ -137,8 +141,14 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
             _ => {}
         }
     }
-    assert!(saw_output, "expected the echoed text to flow through OutputDelta");
-    assert!(saw_tool_activity, "expected a tool activity to flow through");
+    assert!(
+        saw_output,
+        "expected the echoed text to flow through OutputDelta"
+    );
+    assert!(
+        saw_tool_activity,
+        "expected a tool activity to flow through"
+    );
     assert!(saw_completed, "expected a terminal turn_completed event");
 
     // Confirm the spawned `fake_pi` process actually received
@@ -205,7 +215,10 @@ async fn submit_turn_returns_without_waiting_for_the_turn_to_finish() {
     );
 
     while let Some(event) = events.recv().await {
-        if matches!(event, RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }) {
+        if matches!(
+            event,
+            RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
+        ) {
             break;
         }
     }

@@ -38,7 +38,11 @@ impl std::fmt::Display for SessionFileError {
                 write!(f, "no .jsonl session files found in {}", dir.display())
             }
             Self::Io { path, message } => {
-                write!(f, "failed to read session file {}: {message}", path.display())
+                write!(
+                    f,
+                    "failed to read session file {}: {message}",
+                    path.display()
+                )
             }
             Self::Empty(path) => write!(f, "session file {} is empty", path.display()),
             Self::LastLineNotJson { path, message } => write!(
@@ -65,7 +69,9 @@ impl std::fmt::Display for SessionFileError {
 /// [`SessionFileError`] describing exactly what did not hold.
 pub(crate) fn latest_complete_turn_file(session_dir: &Path) -> Result<PathBuf, SessionFileError> {
     if !session_dir.is_dir() {
-        return Err(SessionFileError::DirectoryMissing(session_dir.to_path_buf()));
+        return Err(SessionFileError::DirectoryMissing(
+            session_dir.to_path_buf(),
+        ));
     }
 
     let entries = std::fs::read_dir(session_dir).map_err(|error| SessionFileError::Io {
@@ -216,7 +222,9 @@ mod tests {
         write_jsonl(
             dir.path(),
             "session.jsonl",
-            &[r#"{"type":"message","message":{"role":"assistant","content":"partial","stopReason":"pending"}}"#],
+            &[
+                r#"{"type":"message","message":{"role":"assistant","content":"partial","stopReason":"pending"}}"#,
+            ],
         );
         let error = latest_complete_turn_file(dir.path()).unwrap_err();
         assert!(matches!(
@@ -231,13 +239,17 @@ mod tests {
         write_jsonl(
             dir.path(),
             "older.jsonl",
-            &[r#"{"type":"message","message":{"role":"assistant","content":"old","stopReason":"end_turn"}}"#],
+            &[
+                r#"{"type":"message","message":{"role":"assistant","content":"old","stopReason":"end_turn"}}"#,
+            ],
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
         let newer = write_jsonl(
             dir.path(),
             "newer.jsonl",
-            &[r#"{"type":"message","message":{"role":"assistant","content":"new","stopReason":"end_turn"}}"#],
+            &[
+                r#"{"type":"message","message":{"role":"assistant","content":"new","stopReason":"end_turn"}}"#,
+            ],
         );
         let found = latest_complete_turn_file(dir.path()).unwrap();
         assert_eq!(found, newer);

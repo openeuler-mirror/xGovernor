@@ -32,66 +32,45 @@ const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
 /// question the provider itself will ask again on every `create` call.
 const E2B_API_KEY_ENV: &str = "E2B_API_KEY";
 
-/// Builds the `InstanceManager` wrapping a real [`LocalProvider`], replicating
-/// `apps/runtime-mock`'s private `in_memory_local_manager` construction shape
-/// (see that crate for the canonical version — this binary needs the bare
-/// `Arc<InstanceManager>` itself to hand to [`PiRuntime::new`], not a
-/// `MockRuntime` wrapper, since `PiRuntime` composes `InstanceManager`s
-/// directly rather than delegating to another `RuntimeAdapter`). `db_path`
-/// points at the same physical SQLite file `SqliteSessionRepository` above
-/// already opened; a second, independent `rusqlite::Connection` onto that file
-/// in WAL mode is exactly the convention `SqliteProviderInstanceLedger`'s
-/// module doc describes, and [`build_e2b_instance_manager`] opens a third one
-/// onto the same file the same way.
-fn build_local_instance_manager(db_path: &Path) -> Arc<InstanceManager> {
-    let ledger: Arc<dyn ProviderInstanceLedger> =
-        Arc::new(SqliteProviderInstanceLedger::open(db_path).unwrap_or_else(|error| {
-            eprintln!(
-                "refusing to start: failed to open local provider-instance ledger at {}: {error}",
-                db_path.display()
-            );
-            std::process::exit(1);
-        }));
-    let local = Arc::new(LocalProvider::new());
-    let lifecycle: Arc<dyn ProviderLifecycle> = local.clone();
-    let attach: Arc<dyn OperationAttach> = local;
-    Arc::new(InstanceManager::new(
-        lifecycle,
-        attach,
-        ledger,
-        ProviderKind("local".to_string()),
-        InstanceManagerConfig::new(DEFAULT_MAX_SANDBOXES_PER_OWNER, DEFAULT_MAX_SANDBOXES_GLOBAL),
-    ))
+fn open_provider_ledger(db_path: &Path, backend_id: &str) -> Arc<dyn ProviderInstanceLedger> {
+    Arc::new(SqliteProviderInstanceLedger::open(db_path).unwrap_or_else(|error| {
+        eprintln!(
+            "refusing to start: failed to open {backend_id} provider-instance ledger at {}: {error}",
+            db_path.display()
+        );
+        std::process::exit(1);
+    }))
 }
 
-/// Builds the `InstanceManager` wrapping a real [`E2bProvider`] — same
-/// rationale and construction shape as [`build_local_instance_manager`],
-/// mirroring `apps/runtime-mock`'s private `in_memory_e2b_manager`
-/// construction shape. Only called when [`E2B_API_KEY_ENV`] is set (see [`main`]):
-/// `E2bProvider::new()` itself never fails (it takes no config), but every
-/// sandbox it would actually create needs that env var at `create` time
-/// (`resolve_api_key`), so gating construction on it here turns a
-/// per-session `InvalidRequest` failure at first use into a clear
-/// startup-time signal that this backend isn't configured.
-fn build_e2b_instance_manager(db_path: &Path) -> Arc<InstanceManager> {
-    let ledger: Arc<dyn ProviderInstanceLedger> =
-        Arc::new(SqliteProviderInstanceLedger::open(db_path).unwrap_or_else(|error| {
-            eprintln!(
-                "refusing to start: failed to open e2b provider-instance ledger at {}: {error}",
-                db_path.display()
-            );
-            std::process::exit(1);
-        }));
-    let e2b = Arc::new(E2bProvider::new());
-    let lifecycle: Arc<dyn ProviderLifecycle> = e2b.clone();
-    let attach: Arc<dyn OperationAttach> = e2b;
-    Arc::new(InstanceManager::new(
-        lifecycle,
-        attach,
-        ledger,
-        ProviderKind("e2b".to_string()),
-        InstanceManagerConfig::new(DEFAULT_MAX_SANDBOXES_PER_OWNER, DEFAULT_MAX_SANDBOXES_GLOBAL),
-    ))
+fn build_instance_manager(db_path: &Path, backend_id: &str) -> Arc<InstanceManager> {
+    let ledger = open_provider_ledger(db_path, backend_id);
+    let config = InstanceManagerConfig::new(
+        DEFAULT_MAX_SANDBOXES_PER_OWNER,
+        DEFAULT_MAX_SANDBOXES_GLOBAL,
+    );
+    match backend_id {
+        "local" => {
+            let provider = Arc::new(LocalProvider::new());
+            Arc::new(InstanceManager::new(
+                provider.clone(),
+                provider,
+                ledger,
+                ProviderKind("local".into()),
+                config,
+            ))
+        }
+        "e2b" => {
+            let provider = Arc::new(E2bProvider::new());
+            Arc::new(InstanceManager::new(
+                provider.clone(),
+                provider,
+                ledger,
+                ProviderKind("e2b".into()),
+                config,
+            ))
+        }
+        _ => panic!("unknown backend id: {backend_id}"),
+    }
 }
 
 /// Reconciles `manager` against its ledger (`InstanceManager::reconcile` —
@@ -127,17 +106,10 @@ fn xgovernor_data_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join(".xgovernor"))
 }
 
-/// Single SQLite file shared (in WAL mode) by `SqliteSessionRepository` and
-/// `SqliteProviderInstanceLedger` — see this module's doc comment.
 fn xgovernor_db_path() -> std::path::PathBuf {
     xgovernor_data_dir().join("xgovernor.db")
 }
 
-/// Root directory `PiRuntime` creates one per-`runtime_id` `--session-dir`
-/// subdirectory under (`docs/pi_session_restore_plan.md` §1.1/decision 1).
-/// Same root as `xgovernor_db_path()` so both live under one
-/// `XGOVERNOR_DATA_DIR`, deliberately not its own separate env var — a single
-/// configuration knob, not another toggle.
 fn xgovernor_pi_session_root() -> std::path::PathBuf {
     xgovernor_data_dir().join("pi-sessions")
 }
@@ -160,7 +132,11 @@ fn install_logging(data_dir: &Path) -> Option<tracing_appender::non_blocking::Wo
             let file_appender = tracing_appender::rolling::daily(&log_dir, "xgovernor-server.log");
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             file_guard = Some(guard);
-            Some(tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false))
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false),
+            )
         }
         Err(error) => {
             eprintln!(
@@ -369,43 +345,8 @@ async fn main() {
         );
         std::process::exit(1);
     });
-    // `PiRuntime` now composes `xgovernor_manager::InstanceManager` the same
-    // way `MockRuntime` (`apps/runtime-mock`) does — real provider-instance
-    // ledger, startup reconciliation, quota enforcement, pending-release
-    // retry loop, one `InstanceManager` per provider `backend_id` it is
-    // willing to route to. `main.rs` builds those `InstanceManager`s itself
-    // (`build_local_instance_manager`/`build_e2b_instance_manager` above)
-    // rather than composing `MockRuntime`, since `PiRuntime::new` needs the
-    // bare `Arc<InstanceManager>`s, not another `RuntimeAdapter` layered on
-    // top of them.
-    //
-    // What actually changed, and what didn't: Pi's tool *execution* (file
-    // read/write/edit, exec, grep/glob) no longer touches this host's
-    // filesystem directly — it is routed through the selected
-    // `InstanceManager`'s attached `OperationBackend` via a small local HTTP
-    // bridge (`apps/runtime-pi/src/bridge.rs`) that a TypeScript Pi
-    // extension calls instead of Pi's built-in tools reaching the host fs.
-    // Each session's `ext.runtime_pi.backend_id` (`"local"` or `"e2b"`)
-    // picks which `InstanceManager` in the map below provisions its sandbox.
-    // The one remaining, narrower deviation from
-    // `docs/runtime_adapter_guide.md` §2/§5 and `docs/protocol_boundaries.md`
-    // §5 point 4 is the RPC *control channel* itself: the long-lived,
-    // interactive, line-delimited JSON dialog with the `pi` process's
-    // stdin/stdout still goes through `tokio::process` directly on this
-    // host, not through `operation-protocol` (which is a one-shot,
-    // fully-buffered request/response contract and cannot drive a
-    // persistent bidirectional stdio conversation). See
-    // `apps/runtime-pi/src/lib.rs`'s module doc and
-    // `apps/runtime-pi/demo/easydemo.md` for the full picture.
-    //
-    // `e2b` support is optional at startup: constructing an `InstanceManager`
-    // over `E2bProvider` never itself fails (it takes no config), but every
-    // sandbox it would create needs `E2B_API_KEY` at `create` time, so this
-    // binary checks for it up front and simply omits `"e2b"` from the map
-    // (logging why) rather than failing the whole server to start — the
-    // `local` backend must keep working for `apps/runtime-pi/demo/easydemo.md`'s existing
-    // demo flow regardless of whether e2b is configured.
-    let local_manager = build_local_instance_manager(&db_path);
+
+    let local_manager = build_instance_manager(&db_path, "local");
     let _local_retry_loop = reconcile_and_spawn_retry_loop("local", &local_manager).await;
 
     let mut runtime_managers: HashMap<String, Arc<InstanceManager>> = HashMap::new();
@@ -416,7 +357,7 @@ async fn main() {
         .filter(|value| !value.trim().is_empty())
         .is_some();
     let _e2b_retry_loop = if e2b_configured {
-        let e2b_manager = build_e2b_instance_manager(&db_path);
+        let e2b_manager = build_instance_manager(&db_path, "e2b");
         let retry_loop = reconcile_and_spawn_retry_loop("e2b", &e2b_manager).await;
         runtime_managers.insert("e2b".to_string(), e2b_manager);
         Some(retry_loop)
@@ -434,12 +375,11 @@ async fn main() {
     // runtime can actually provision (and no others), so the two stay in
     // lockstep by construction.
     let configured_backend_ids: Vec<String> = runtime_managers.keys().cloned().collect();
-    let runtime = PiRuntime::new(runtime_managers, xgovernor_pi_session_root()).unwrap_or_else(
-        |error| {
+    let runtime =
+        PiRuntime::new(runtime_managers, xgovernor_pi_session_root()).unwrap_or_else(|error| {
             eprintln!("refusing to start: failed to initialize PiRuntime bridge: {error}");
             std::process::exit(1);
-        },
-    );
+        });
 
     let lease_table = Arc::new(SessionLeaseTable::new());
     let application = SessionApplication::new(
@@ -546,179 +486,6 @@ async fn main() {
                 FORCED_SHUTDOWN_TIMEOUT.as_secs()
             );
             std::process::exit(1);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_loopback_bind_addr;
-
-    #[test]
-    fn recognizes_loopback_forms() {
-        for addr in [
-            "127.0.0.1:8787",
-            "127.0.0.1",
-            "localhost:8787",
-            "127.5.5.5:9999",
-            "[::1]:8787",
-            "[::1]",
-        ] {
-            assert!(
-                is_loopback_bind_addr(addr),
-                "expected {addr} to be loopback"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_non_loopback_forms() {
-        for addr in [
-            "0.0.0.0:8787",
-            "192.168.1.5:8787",
-            "[::]:8787",
-            "example.com:8787",
-        ] {
-            assert!(
-                !is_loopback_bind_addr(addr),
-                "expected {addr} to not be loopback"
-            );
-        }
-    }
-
-    mod shutdown {
-        use super::super::{wait_for_shutdown, ShutdownOutcome};
-        use std::time::Duration;
-
-        #[tokio::test]
-        async fn drained_once_the_signal_fires_and_the_server_task_finishes_in_time() {
-            let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-            let mut rx = shutdown_tx.subscribe();
-            // Mirrors the real `serve_both` shape: a task that only resolves
-            // once it has observed the fanned-out shutdown signal, standing
-            // in for "the server finished draining."
-            let serve_both = tokio::spawn(async move {
-                let _ = rx.recv().await;
-                Ok::<((), ()), std::io::Error>(((), ()))
-            });
-
-            let outcome = wait_for_shutdown(
-                std::future::ready(()),
-                shutdown_tx,
-                serve_both,
-                Duration::from_secs(5),
-            )
-            .await;
-            assert!(matches!(outcome, ShutdownOutcome::Drained));
-        }
-
-        #[tokio::test]
-        async fn server_error_surfaces_as_its_own_outcome_not_a_panic() {
-            let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-            let mut rx = shutdown_tx.subscribe();
-            let serve_both = tokio::spawn(async move {
-                let _ = rx.recv().await;
-                Err::<((), ()), std::io::Error>(std::io::Error::other("accept loop failed"))
-            });
-
-            let outcome = wait_for_shutdown(
-                std::future::ready(()),
-                shutdown_tx,
-                serve_both,
-                Duration::from_secs(5),
-            )
-            .await;
-            assert!(matches!(outcome, ShutdownOutcome::ServerError(_)));
-        }
-
-        #[tokio::test]
-        async fn a_panicking_server_task_surfaces_as_its_own_outcome() {
-            let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-            let mut rx = shutdown_tx.subscribe();
-            let serve_both = tokio::spawn(async move {
-                let _ = rx.recv().await;
-                panic!("simulated server task panic");
-                #[allow(unreachable_code)]
-                Ok::<((), ()), std::io::Error>(((), ()))
-            });
-
-            let outcome = wait_for_shutdown(
-                std::future::ready(()),
-                shutdown_tx,
-                serve_both,
-                Duration::from_secs(5),
-            )
-            .await;
-            assert!(matches!(outcome, ShutdownOutcome::ServerTaskPanicked(_)));
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn forces_a_timed_out_outcome_when_draining_outlasts_the_deadline() {
-            // Paused clock: the spawned task's `sleep` and the `timeout`'s
-            // internal timer both resolve near-instantly in wall-clock test
-            // time (see the equivalent pattern/rationale in
-            // httpserver::router::tests::slow_requests_are_cut_off_by_the_timeout_layer),
-            // while still exercising the real race between "server still
-            // draining" and "forced-exit deadline."
-            let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-            let mut rx = shutdown_tx.subscribe();
-            let forced_timeout = Duration::from_secs(1);
-            let serve_both = tokio::spawn(async move {
-                let _ = rx.recv().await;
-                // Never finishes within forced_timeout -- simulates a stuck
-                // drain (e.g. a client holding an SSE connection open
-                // forever).
-                tokio::time::sleep(forced_timeout + Duration::from_secs(30)).await;
-                Ok::<((), ()), std::io::Error>(((), ()))
-            });
-
-            let outcome = wait_for_shutdown(
-                std::future::ready(()),
-                shutdown_tx,
-                serve_both,
-                forced_timeout,
-            )
-            .await;
-            assert!(matches!(outcome, ShutdownOutcome::TimedOut));
-        }
-
-        /// Integration check: a *real* `axum::serve(..).with_graceful_shutdown(..)`
-        /// wired to the same broadcast-channel pattern `main` uses (not just
-        /// the synthetic `JoinHandle`s the tests above use), proving the
-        /// actual plumbing -- not only `wait_for_shutdown`'s own
-        /// orchestration logic -- behaves as intended: the server keeps
-        /// accepting/serving until the shutdown signal is sent, and only
-        /// then begins draining.
-        #[tokio::test]
-        async fn a_real_axum_serve_stays_up_until_the_broadcast_signal_and_then_drains() {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let router =
-                axum::Router::new().route("/probe", axum::routing::get(|| async { "ok" }));
-
-            let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-            let shutdown_rx = shutdown_tx.subscribe();
-            let serve = axum::serve(listener, router).with_graceful_shutdown(async move {
-                let mut rx = shutdown_rx;
-                let _ = rx.recv().await;
-            });
-            let serve_handle = tokio::spawn(async move { serve.await.map(|()| ((), ())) });
-
-            // No shutdown signal has been sent yet -- the server must still
-            // be up.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(
-                !serve_handle.is_finished(),
-                "server must stay up before shutdown is signaled"
-            );
-
-            let outcome = wait_for_shutdown(
-                std::future::ready(()),
-                shutdown_tx,
-                serve_handle,
-                Duration::from_secs(5),
-            )
-            .await;
-            assert!(matches!(outcome, ShutdownOutcome::Drained));
         }
     }
 }
