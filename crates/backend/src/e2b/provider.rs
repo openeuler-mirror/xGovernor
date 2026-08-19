@@ -611,12 +611,11 @@ impl E2bProvider {
         })
     }
 
-    /// Delete a snapshot that has no live instance backing it (or whose
-    /// owning instance the caller does not know/care about), resolving
-    /// credentials from whichever registry record currently references it.
-    /// Per task history, this is deliberately scoped to snapshots reachable
-    /// through the current in-memory registry — no persisted/cross-process
-    /// snapshot tracking.
+    /// Delete a snapshot that has no live instance backing it. When the
+    /// current process still has a registry record, reuse its connection
+    /// options; after a daemon restart, fall back to the normal E2B
+    /// environment/default resolution so a checkpoint persisted in SQLite
+    /// remains user-deletable.
     async fn delete_snapshot_only(
         &self,
         backend_id: BackendId,
@@ -625,7 +624,7 @@ impl E2bProvider {
     ) -> Result<ProviderDeleteOutcome, ProviderControlError> {
         let provider_options = {
             let registry = self.lock_registry()?;
-            registry
+            let found = registry
                 .values()
                 .find(|record| {
                     record
@@ -634,13 +633,18 @@ impl E2bProvider {
                         .as_ref()
                         .is_some_and(|snapshot| snapshot.snapshot_id == snapshot_id)
                 })
-                .map(|record| record.provider_options.clone())
-        };
-
-        let Some(provider_options) = provider_options else {
-            return Err(ProviderControlError::NotFound {
-                resource_ref: snapshot_id.0.clone(),
-            });
+                .map(|record| record.provider_options.clone());
+            if found.is_none()
+                && std::env::var("E2B_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_none()
+            {
+                return Err(ProviderControlError::NotFound {
+                    resource_ref: snapshot_id.0.clone(),
+                });
+            }
+            found.unwrap_or(Value::Null)
         };
 
         let options = parse_options(&provider_options)?;

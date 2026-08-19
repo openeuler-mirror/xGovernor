@@ -449,6 +449,23 @@ impl InstanceManager {
             .await
     }
 
+    pub async fn delete_snapshot(
+        &self,
+        backend_id: BackendId,
+        snapshot_id: provider_protocol::ProviderSnapshotId,
+    ) -> Result<(), ProviderControlError> {
+        self.lifecycle
+            .delete(ProviderDeleteRequest {
+                backend_id,
+                instance_id: None,
+                snapshot_id: Some(snapshot_id),
+                reason: ProviderLifecycleReason::UserRequested,
+                correlation: Value::Null,
+            })
+            .await
+            .map(|_| ())
+    }
+
     pub async fn load_instance_from_snapshot(
         &self,
         runtime_id: String,

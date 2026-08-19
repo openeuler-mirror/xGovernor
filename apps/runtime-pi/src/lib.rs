@@ -1523,6 +1523,36 @@ impl RuntimeAdapter for PiRuntime {
         Ok(())
     }
 
+    async fn delete_checkpoint(
+        &self,
+        runtime_state: OpaqueRuntimeState,
+        provider_snapshot_id: String,
+    ) -> Result<(), SessionDomainError> {
+        let state = PiPersistedState::from_opaque(&runtime_state)?;
+        let manager = self.managers.get(&state.backend_id).ok_or_else(|| {
+            SessionDomainError::InvalidRequest {
+                message: format!("unknown backend_id '{}'", state.backend_id),
+            }
+        })?;
+        manager
+            .delete_snapshot(
+                BackendId(state.backend_id),
+                provider_protocol::ProviderSnapshotId(provider_snapshot_id),
+            )
+            .await
+            .map_err(map_provider_error)?;
+        match tokio::fs::remove_dir_all(&state.pi_session_dir).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SessionDomainError::Unavailable {
+                message: format!(
+                    "provider snapshot was deleted but checkpoint archive '{}' could not be removed: {error}",
+                    state.pi_session_dir
+                ),
+            }),
+        }
+    }
+
     async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
         self.instance_for(runtime_id).await.map(|_| ())
     }

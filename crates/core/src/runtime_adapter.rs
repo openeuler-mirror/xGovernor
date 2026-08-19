@@ -170,6 +170,17 @@ pub trait RuntimeAdapter: Send + Sync {
         })
     }
 
+    async fn delete_checkpoint(
+        &self,
+        _runtime_state: OpaqueRuntimeState,
+        _provider_snapshot_id: String,
+    ) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::UnsupportedCapability {
+            family: crate::CapabilityFamily::Runtime,
+            capability: "checkpoint_delete".into(),
+        })
+    }
+
     async fn export_state(
         &self,
         _runtime_id: &str,

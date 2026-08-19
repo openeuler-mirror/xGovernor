@@ -1,7 +1,7 @@
 use backend::e2b::E2bProvider;
 use backend::local::LocalProvider;
-use backend::{OperationAttach, ProviderInstanceLedger, SqliteProviderInstanceLedger};
-use provider_protocol::{ProviderKind, ProviderLifecycle};
+use backend::{ProviderInstanceLedger, SqliteProviderInstanceLedger};
+use provider_protocol::ProviderKind;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -505,6 +505,13 @@ async fn main() {
         Arc::new(SystemClockAndUuidIds),
     )
     .with_lease_table(lease_table.clone());
+    application
+        .restore_tenant_session_counts()
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("refusing to start: failed to restore tenant session quotas: {error}");
+            std::process::exit(1);
+        });
 
     // Component C (docs/session_orchestration_skeleton.md): force-close any
     // session whose lease has carried no live heartbeat for over 2h, so a

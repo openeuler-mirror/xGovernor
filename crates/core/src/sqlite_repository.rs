@@ -36,6 +36,7 @@ use crate::domain::{
 };
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -337,6 +338,62 @@ impl SessionRepository for SqliteSessionRepository {
         result.map_err(|e| internal_error(format!("sqlite checkpoint get failed: {e}")))
     }
 
+    async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<bool, SessionDomainError> {
+        let conn = self.conn.clone();
+        let checkpoint_id = checkpoint_id.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let conn = conn
+                .lock()
+                .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            conn.execute(
+                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+                params![checkpoint_id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            internal_error(format!("sqlite checkpoint delete task panicked: {error}"))
+        })?;
+        result.map_err(|error| internal_error(format!("sqlite checkpoint delete failed: {error}")))
+    }
+
+    async fn active_session_counts_by_tenant(
+        &self,
+    ) -> Result<HashMap<String, usize>, SessionDomainError> {
+        let conn = self.conn.clone();
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<HashMap<String, usize>, String> {
+                let conn = conn
+                    .lock()
+                    .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT tenant_id, COUNT(*) FROM sessions \
+                 WHERE tenant_id IS NOT NULL AND status IN ('opening','idle','running','paused') \
+                 GROUP BY tenant_id",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                let mut counts = HashMap::new();
+                for row in rows {
+                    let (tenant_id, count) = row.map_err(|error| error.to_string())?;
+                    counts.insert(tenant_id, count.max(0) as usize);
+                }
+                Ok(counts)
+            })
+            .await
+            .map_err(|error| {
+                internal_error(format!("sqlite quota restore task panicked: {error}"))
+            })?;
+        result.map_err(|error| internal_error(format!("sqlite quota restore failed: {error}")))
+    }
+
     /// Two indexed queries (COUNT then SELECT...LIMIT) inside one
     /// `spawn_blocking` closure sharing the same locked connection — a read
     /// endpoint, so the extra round trip over a single combined query is a
@@ -497,6 +554,9 @@ mod tests {
             repo.get_checkpoint("checkpoint-1").await.unwrap(),
             Some(checkpoint)
         );
+        assert!(repo.delete_checkpoint("checkpoint-1").await.unwrap());
+        assert_eq!(repo.get_checkpoint("checkpoint-1").await.unwrap(), None);
+        assert!(!repo.delete_checkpoint("checkpoint-1").await.unwrap());
     }
 
     #[tokio::test]
@@ -541,5 +601,31 @@ mod tests {
             .expect("get must succeed")
             .expect("record must have survived reopening the file");
         assert_eq!(loaded.runtime_id, "runtime-1");
+    }
+
+    #[tokio::test]
+    async fn active_session_counts_by_tenant_ignore_closed_failed_and_admin_rows() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        let mut active = sample_record("active");
+        active.tenant_id = Some("tenant-a".into());
+        repo.save(active).await.unwrap();
+        let mut paused = sample_record("paused");
+        paused.status = SessionStatus::Paused;
+        paused.tenant_id = Some("tenant-a".into());
+        repo.save(paused).await.unwrap();
+        let mut closed = sample_record("closed");
+        closed.status = SessionStatus::Closed;
+        closed.tenant_id = Some("tenant-a".into());
+        repo.save(closed).await.unwrap();
+        let mut failed = sample_record("failed");
+        failed.status = SessionStatus::Failed;
+        failed.tenant_id = Some("tenant-a".into());
+        repo.save(failed).await.unwrap();
+        let admin = sample_record("admin");
+        repo.save(admin).await.unwrap();
+
+        let counts = repo.active_session_counts_by_tenant().await.unwrap();
+        assert_eq!(counts.get("tenant-a"), Some(&2));
+        assert!(!counts.contains_key("admin"));
     }
 }
