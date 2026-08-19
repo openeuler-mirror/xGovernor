@@ -171,6 +171,7 @@ fn project_runtime_capability(capability: RuntimeCapability) -> SessionRuntimeCa
         RuntimeCapability::Interaction => SessionRuntimeCapability::Interaction,
         RuntimeCapability::Steering => SessionRuntimeCapability::Steering,
         RuntimeCapability::Fork => SessionRuntimeCapability::Fork,
+        RuntimeCapability::Checkpoint => SessionRuntimeCapability::Checkpoint,
         RuntimeCapability::StateExport => SessionRuntimeCapability::StateExport,
         RuntimeCapability::ModelOverride => SessionRuntimeCapability::ModelOverride,
         RuntimeCapability::ReasoningControl => SessionRuntimeCapability::ReasoningControl,

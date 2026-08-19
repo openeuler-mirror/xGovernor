@@ -85,11 +85,11 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{
-    enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
-    NormalizedSessionEnvironment, OpaqueRuntimeState, RuntimeAdapter, RuntimeEvent,
-    RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput, RuntimeStartRequest,
-    RuntimeTurnInput, SandboxCapability, SecurityContext, SessionDomainError,
-    SessionEnvironmentNormalizer, WorkspaceAccess, WorkspaceFacts,
+    enforce_workspace_axiom, CheckpointPayload, IsolationBoundary, IsolationFacts,
+    NetworkIsolation, NormalizedSessionEnvironment, OpaqueRuntimeState, RuntimeAdapter,
+    RuntimeEvent, RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput,
+    RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput, SandboxCapability, SecurityContext,
+    SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess, WorkspaceFacts,
 };
 use xgovernor_manager::InstanceManager;
 
@@ -356,6 +356,7 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                     SandboxCapability::Exec,
                     SandboxCapability::FileRead,
                     SandboxCapability::FileWrite,
+                    SandboxCapability::Snapshot,
                     SandboxCapability::Network,
                 ]
                 .into_iter()
@@ -505,6 +506,7 @@ struct PiInstance {
     /// a restart — see [`PiPersistedState`]. Immutable snapshot taken at
     /// `start()` time; `export_state()` just clones and re-wraps it.
     persisted_state: PiPersistedState,
+    activity: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// `RuntimeAdapter` backed by real `pi --mode rpc` subprocesses, one per
@@ -749,6 +751,52 @@ impl PiRuntime {
             destroy_sandbox_on_spawn_failure: false,
         })
     }
+}
+
+fn copy_dir<'a>(
+    src: &'a PathBuf,
+    dst: &'a PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SessionDomainError>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let mut entries =
+            tokio::fs::read_dir(src)
+                .await
+                .map_err(|e| SessionDomainError::Unavailable {
+                    message: format!("failed to read session directory: {e}"),
+                })?;
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|e| SessionDomainError::Unavailable {
+                    message: e.to_string(),
+                })?
+        {
+            let target = dst.join(entry.file_name());
+            let ty = entry
+                .file_type()
+                .await
+                .map_err(|e| SessionDomainError::Unavailable {
+                    message: e.to_string(),
+                })?;
+            if ty.is_dir() {
+                tokio::fs::create_dir_all(&target).await.map_err(|e| {
+                    SessionDomainError::Unavailable {
+                        message: e.to_string(),
+                    }
+                })?;
+                copy_dir(&entry.path(), &target).await?;
+            } else {
+                tokio::fs::copy(entry.path(), target).await.map_err(|e| {
+                    SessionDomainError::Unavailable {
+                        message: e.to_string(),
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Everything `start()` needs to spawn `pi` and register the resulting
@@ -1186,7 +1234,11 @@ impl RuntimeAdapter for PiRuntime {
     }
 
     fn capabilities(&self) -> BTreeSet<SessionRuntimeCapability> {
-        BTreeSet::from([SessionRuntimeCapability::Interaction])
+        let mut capabilities = BTreeSet::from([SessionRuntimeCapability::Interaction]);
+        if self.managers.contains_key(E2B_BACKEND_ID) {
+            capabilities.insert(SessionRuntimeCapability::Checkpoint);
+        }
+        capabilities
     }
 
     async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
@@ -1219,10 +1271,12 @@ impl RuntimeAdapter for PiRuntime {
 
         let workspace_root = backend.paths().workspace_root().clone();
         let bridge_token = Uuid::new_v4().to_string();
+        let activity = Arc::new(tokio::sync::RwLock::new(()));
         self.bridge.register(
             bridge_token.clone(),
             Arc::clone(&backend),
             workspace_root.clone(),
+            Arc::clone(&activity),
         );
 
         let mut command = Command::new(&executable);
@@ -1279,6 +1333,7 @@ impl RuntimeAdapter for PiRuntime {
             bridge_token,
             manager,
             persisted_state,
+            activity,
         });
 
         tokio::spawn(read_events(Arc::clone(&instance), stdout));
@@ -1319,6 +1374,142 @@ impl RuntimeAdapter for PiRuntime {
             .stop_instance(runtime_id)
             .await
             .map_err(map_provider_error)
+    }
+
+    async fn checkpoint(&self, runtime_id: &str) -> Result<CheckpointPayload, SessionDomainError> {
+        let instance = self.instance_for(runtime_id).await?;
+        let _freeze = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            instance.activity.write(),
+        )
+        .await
+        .map_err(|_| SessionDomainError::Unavailable {
+            message: "checkpoint freeze timed out".into(),
+        })?;
+        let snapshot = instance
+            .manager
+            .checkpoint_instance(runtime_id)
+            .await
+            .map_err(map_provider_error)?;
+        let checkpoint_id = format!("checkpoint-{}", Uuid::new_v4());
+        let archive_root = self
+            .pi_session_root
+            .parent()
+            .unwrap_or(&self.pi_session_root)
+            .join("pi-checkpoints");
+        let archive = archive_root.join(&checkpoint_id);
+        tokio::fs::create_dir_all(&archive)
+            .await
+            .map_err(|e| SessionDomainError::Unavailable {
+                message: format!("failed to create checkpoint archive: {e}"),
+            })?;
+        copy_dir(
+            &PathBuf::from(&instance.persisted_state.pi_session_dir),
+            &archive,
+        )
+        .await?;
+        let mut state = instance.persisted_state.clone();
+        state.pi_session_dir = archive.to_string_lossy().into_owned();
+        Ok(CheckpointPayload {
+            checkpoint_id,
+            runtime_state: state.into_opaque(),
+            provider_snapshot_id: snapshot.snapshot_id.0,
+        })
+    }
+
+    async fn load_from_checkpoint(
+        &self,
+        request: RuntimeLoadRequest,
+    ) -> Result<(), SessionDomainError> {
+        let state = PiPersistedState::from_opaque(&request.runtime_state)?;
+        let manager = self
+            .managers
+            .get(&state.backend_id)
+            .cloned()
+            .ok_or_else(|| SessionDomainError::InvalidRequest {
+                message: format!("unknown backend_id '{}'", state.backend_id),
+            })?;
+        let provider_options = if state.backend_id == E2B_BACKEND_ID {
+            json!({"workspace_root": E2B_WORKSPACE_ROOT, "allow_internet_access": true})
+        } else {
+            json!({"workspace_root": E2B_WORKSPACE_ROOT})
+        };
+        let backend = manager
+            .load_instance_from_snapshot(
+                request.new_runtime_id.clone(),
+                BackendId(state.backend_id.clone()),
+                request.owner_ref,
+                provider_protocol::ProviderSnapshotId(request.provider_snapshot_id),
+                provider_options,
+            )
+            .await
+            .map_err(map_provider_error)?;
+        let session_dir = self.pi_session_root.join(&request.new_runtime_id);
+        tokio::fs::create_dir_all(&session_dir).await.map_err(|e| {
+            SessionDomainError::Unavailable {
+                message: e.to_string(),
+            }
+        })?;
+        copy_dir(&PathBuf::from(&state.pi_session_dir), &session_dir).await?;
+        let executable = state
+            .executable
+            .clone()
+            .or_else(|| std::env::var(PI_EXECUTABLE_ENV).ok())
+            .unwrap_or_else(|| DEFAULT_PI_EXECUTABLE.to_string());
+        let extension_dir = state
+            .extension_dir
+            .clone()
+            .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string());
+        let token = Uuid::new_v4().to_string();
+        let activity = Arc::new(tokio::sync::RwLock::new(()));
+        self.bridge.register(
+            token.clone(),
+            Arc::clone(&backend),
+            backend.paths().workspace_root().clone(),
+            Arc::clone(&activity),
+        );
+        let mut command = Command::new(executable);
+        command
+            .arg("--mode")
+            .arg("rpc")
+            .arg("-e")
+            .arg(extension_dir)
+            .arg("--session-dir")
+            .arg(&session_dir)
+            .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
+            .env("XGOVERNOR_BRIDGE_TOKEN", &token)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Ok(file) = session_file::latest_complete_turn_file(&session_dir) {
+            command.arg("--session").arg(file);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| SessionDomainError::Unavailable {
+                message: e.to_string(),
+            })?;
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let instance = Arc::new(PiInstance {
+            stdin: Mutex::new(stdin),
+            child: Mutex::new(child),
+            current_turn: Mutex::new(None),
+            bridge_token: token,
+            manager,
+            persisted_state: PiPersistedState {
+                pi_session_dir: session_dir.to_string_lossy().into_owned(),
+                ..state
+            },
+            activity,
+        });
+        tokio::spawn(read_events(Arc::clone(&instance), stdout));
+        self.instances
+            .write()
+            .await
+            .insert(request.new_runtime_id, instance);
+        Ok(())
     }
 
     async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {

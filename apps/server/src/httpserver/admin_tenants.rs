@@ -292,4 +292,3 @@ async fn delete_tenant_impl(
         tenant_id: tenant_id.to_string(),
     })
 }
-

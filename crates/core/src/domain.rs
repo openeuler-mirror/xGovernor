@@ -33,12 +33,28 @@ pub enum RuntimeCapability {
     Steering,
     // session fork
     Fork,
+    Checkpoint,
     // Loop state information export
     StateExport,
     // model change
     ModelOverride,
     // reasoning level capabilities
     ReasoningControl,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub checkpoint_id: String,
+    pub source_runtime_id: String,
+    pub provider_snapshot_id: String,
+    pub runtime_state: OpaqueRuntimeState,
+    pub workspace: WorkspaceFacts,
+    pub isolation: IsolationFacts,
+    pub capabilities: EffectiveCapabilities,
+    pub owner_ref: String,
+    pub tenant_id: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

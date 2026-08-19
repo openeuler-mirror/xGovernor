@@ -2,15 +2,15 @@ use crate::{
     project_runtime_event, project_session, project_session_summary, CheckpointLineage,
     EffectiveCapabilities, IsolationBoundary, IsolationFacts, LeaseCheckFailure,
     OpaqueRuntimeState, RuntimeAdapter, RuntimeCapability, RuntimeEntryContext,
-    RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput, SecurityContext,
-    SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord, SessionStatus,
-    WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
+    RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput,
+    SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord,
+    SessionStatus, WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
 };
 use session_protocol::{
-    SessionControlResponse, SessionEvent, SessionForkRequest, SessionHeartbeatResponse,
-    SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionListResponse,
-    SessionOpenRequest, SessionOpenResponse, SessionSubmitReceipt, SessionTurnRequest,
-    TenantQuotaSnapshot,
+    SessionCheckpointRequest, SessionCheckpointResult, SessionControlResponse, SessionEvent,
+    SessionForkRequest, SessionHeartbeatResponse, SessionInteractionRequest, SessionLeaseClaim,
+    SessionLifecycleStatus, SessionListResponse, SessionLoadRequest, SessionOpenRequest,
+    SessionOpenResponse, SessionSubmitReceipt, SessionTurnRequest, TenantQuotaSnapshot,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -812,6 +812,128 @@ impl SessionApplication {
         result
     }
 
+    pub async fn checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointRequest,
+    ) -> Result<SessionCheckpointResult, SessionDomainError> {
+        let record = self.require_session(ctx, &request.runtime_id).await?;
+        if !record
+            .capabilities
+            .runtime
+            .contains(&RuntimeCapability::Checkpoint)
+            || !record
+                .capabilities
+                .sandbox
+                .contains(&crate::SandboxCapability::Snapshot)
+        {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability: "checkpoint".into(),
+            });
+        }
+        let payload = self.runtime.checkpoint(&request.runtime_id).await?;
+        let checkpoint_id = payload.checkpoint_id.clone();
+        let created_at_ms = self.clock.now_ms();
+        self.records
+            .save_checkpoint(crate::CheckpointRecord {
+                checkpoint_id: checkpoint_id.clone(),
+                source_runtime_id: request.runtime_id.clone(),
+                provider_snapshot_id: payload.provider_snapshot_id,
+                runtime_state: payload.runtime_state,
+                workspace: record.workspace,
+                isolation: record.isolation,
+                capabilities: record.capabilities,
+                owner_ref: ctx.owner_ref(),
+                tenant_id: record.tenant_id,
+                created_by: Some(ctx.principal.clone()),
+                created_at_ms,
+            })
+            .await?;
+        Ok(SessionCheckpointResult {
+            checkpoint_id,
+            runtime_id: request.runtime_id,
+            checkpoint_scope: session_protocol::SessionCheckpointScope::Full,
+            created_at_ms,
+        })
+    }
+
+    pub async fn load_checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionLoadRequest,
+    ) -> Result<SessionOpenResponse, SessionDomainError> {
+        let runtime_id = request
+            .runtime_id
+            .unwrap_or_else(|| self.runtime_ids.next_runtime_id());
+        let _deployment = request.deployment.clone();
+        let _requested_capabilities = request.requested_capabilities.clone();
+        let checkpoint = self
+            .records
+            .get_checkpoint(&request.checkpoint_id)
+            .await?
+            .filter(|record| ctx.owns(record.tenant_id.as_deref()))
+            .ok_or_else(|| SessionDomainError::NotFound {
+                runtime_id: request.checkpoint_id.clone(),
+            })?;
+        let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
+        if let (Some(tenant_id), Some(limit)) = (&tenant_id_for_quota, ctx.quota.max_sessions) {
+            self.reserve_tenant_session(tenant_id, limit)
+                .map_err(|limit| SessionDomainError::QuotaExceeded {
+                    scope: "sessions".into(),
+                    limit,
+                })?;
+        }
+        if let Err(error) = self
+            .runtime
+            .load_from_checkpoint(RuntimeLoadRequest {
+                new_runtime_id: runtime_id.clone(),
+                owner_ref: ctx.owner_ref(),
+                provider_snapshot_id: checkpoint.provider_snapshot_id.clone(),
+                runtime_state: checkpoint.runtime_state.clone(),
+                llm: request.llm,
+            })
+            .await
+        {
+            if let Some(id) = &tenant_id_for_quota {
+                self.release_tenant_session(id);
+            }
+            return Err(error);
+        }
+        let now = self.clock.now_ms();
+        let record = SessionRecord {
+            runtime_id: runtime_id.clone(),
+            conversation_id: request
+                .conversation_id
+                .unwrap_or_else(|| checkpoint.source_runtime_id.clone()),
+            sender_id: request.sender_id.unwrap_or_else(|| ctx.principal.clone()),
+            status: SessionStatus::Idle,
+            created_at_ms: now,
+            updated_at_ms: now,
+            workspace: checkpoint.workspace,
+            isolation: checkpoint.isolation,
+            capabilities: checkpoint.capabilities,
+            runtime: checkpoint.runtime_state,
+            llm: None,
+            lease: None,
+            lineage: Some(CheckpointLineage {
+                parent_runtime_id: None,
+                source_checkpoint_id: Some(request.checkpoint_id),
+            }),
+            last_error: None,
+            tenant_id: ctx.tenant_id().map(str::to_string),
+            created_by: ctx.principal.clone(),
+        };
+        if let Err(error) = self.records.save(record.clone()).await {
+            let _ = self.runtime.stop(&runtime_id).await;
+            if let Some(id) = &tenant_id_for_quota {
+                self.release_tenant_session(id);
+            }
+            return Err(error);
+        }
+        Ok(project_session(&record))
+    }
+
     async fn fork_impl(
         &self,
         ctx: &SecurityContext,
@@ -1109,6 +1231,24 @@ pub trait SessionRepository: Send + Sync {
         tenant_id: Option<&str>,
         limit: usize,
     ) -> Result<SessionListPage, SessionDomainError>;
+    async fn save_checkpoint(
+        &self,
+        _record: crate::CheckpointRecord,
+    ) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
+    async fn get_checkpoint(
+        &self,
+        _checkpoint_id: &str,
+    ) -> Result<Option<crate::CheckpointRecord>, SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
 }
 
 pub trait TurnIdGenerator: Send + Sync {
@@ -1209,6 +1349,7 @@ fn domain_runtime_capability(
         session_protocol::SessionRuntimeCapability::Interaction => RuntimeCapability::Interaction,
         session_protocol::SessionRuntimeCapability::Steering => RuntimeCapability::Steering,
         session_protocol::SessionRuntimeCapability::Fork => RuntimeCapability::Fork,
+        session_protocol::SessionRuntimeCapability::Checkpoint => RuntimeCapability::Checkpoint,
         session_protocol::SessionRuntimeCapability::StateExport => RuntimeCapability::StateExport,
         session_protocol::SessionRuntimeCapability::ModelOverride => {
             RuntimeCapability::ModelOverride

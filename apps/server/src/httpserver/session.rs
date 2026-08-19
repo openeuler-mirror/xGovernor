@@ -7,9 +7,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use session_protocol::{
-    SessionCancelRequest, SessionCloseRequest, SessionDetachRequest, SessionEvent,
-    SessionForkRequest, SessionHeartbeatRequest, SessionInteractionRequest, SessionOpenRequest,
-    SessionTurnRequest, SessionWireError,
+    SessionCancelRequest, SessionCheckpointRequest, SessionCloseRequest, SessionDetachRequest,
+    SessionEvent, SessionForkRequest, SessionHeartbeatRequest, SessionInteractionRequest,
+    SessionLoadRequest, SessionOpenRequest, SessionTurnRequest, SessionWireError,
 };
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -131,6 +131,8 @@ pub fn session_router(state: Arc<SessionHttpState>) -> Router {
         .route("/api/v1/sessions/heartbeat", post(heartbeat_session))
         .route("/api/v1/sessions/cancel", post(cancel_turn))
         .route("/api/v1/sessions/fork", post(fork_session))
+        .route("/api/v1/sessions/checkpoint", post(checkpoint_session))
+        .route("/api/v1/sessions/load", post(load_checkpoint))
         .route(
             "/api/v1/sessions/:runtime_id/turns/:turn_id/events",
             get(stream_turn_events),
@@ -267,6 +269,28 @@ async fn fork_session(
     Json(request): Json<SessionForkRequest>,
 ) -> Response {
     match state.application.fork(&ctx, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn checkpoint_session(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Json(request): Json<SessionCheckpointRequest>,
+) -> Response {
+    match state.application.checkpoint(&ctx, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn load_checkpoint(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Json(request): Json<SessionLoadRequest>,
+) -> Response {
+    match state.application.load_checkpoint(&ctx, request).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => session_error(project_session_error(error)),
     }

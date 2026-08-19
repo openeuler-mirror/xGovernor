@@ -162,13 +162,12 @@ pub(crate) fn write_tenants_file_atomically(
         TenantConfigError::Write(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file =
-        tempfile::NamedTempFile::new_in(dir).map_err(TenantConfigError::Write)?;
+    let mut temp_file = tempfile::NamedTempFile::new_in(dir).map_err(TenantConfigError::Write)?;
     std::io::Write::write_all(&mut temp_file, contents.as_bytes())
         .map_err(TenantConfigError::Write)?;
-    temp_file.persist(path).map_err(|error| {
-        TenantConfigError::Write(error.error)
-    })?;
+    temp_file
+        .persist(path)
+        .map_err(|error| TenantConfigError::Write(error.error))?;
     Ok(())
 }
 

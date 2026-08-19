@@ -56,6 +56,25 @@ macro_rules! session_control_request {
 session_control_request!(SessionCloseRequest);
 session_control_request!(SessionDetachRequest);
 session_control_request!(SessionHeartbeatRequest);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLoadRequest {
+    pub checkpoint_id: String,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub requested_capabilities: SessionCapabilityRequest,
+    #[serde(default)]
+    pub deployment: DeploymentProfile,
+    #[serde(default)]
+    pub lease: SessionLeaseClaim,
+    #[serde(default)]
+    pub llm: Option<LlmOverrideRequest>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

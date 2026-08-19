@@ -539,12 +539,7 @@ async fn main() {
 
     let tenant_state = SessionHttpState::new(application);
     let _tenant_stream_sweeper = tenant_state.spawn_stream_sweeper();
-    let tenant_router = create_router(
-        tenant_state,
-        token_table.clone(),
-        Some(Role::Tenant),
-        None,
-    );
+    let tenant_router = create_router(tenant_state, token_table.clone(), Some(Role::Tenant), None);
 
     // SIGHUP-triggered tenants.toml hot reload — only wired up when the
     // server actually started with a real token table (see

@@ -93,7 +93,21 @@ impl SqliteSessionRepository {
                 tenant_id TEXT,
                 created_by TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);",
+            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                source_runtime_id TEXT NOT NULL,
+                provider_snapshot_id TEXT NOT NULL,
+                runtime_json TEXT NOT NULL,
+                workspace_json TEXT NOT NULL,
+                isolation_json TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                owner_ref TEXT NOT NULL,
+                tenant_id TEXT,
+                created_by TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_tenant_runtime ON checkpoints(tenant_id, source_runtime_id);",
         )
     }
 }
@@ -293,6 +307,36 @@ impl SessionRepository for SqliteSessionRepository {
         result.map_err(|error| internal_error(format!("sqlite save failed: {error}")))
     }
 
+    async fn save_checkpoint(
+        &self,
+        record: crate::CheckpointRecord,
+    ) -> Result<(), SessionDomainError> {
+        let conn = self.conn.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let runtime_json = json_encode(&record.runtime_state)?; let workspace_json = json_encode(&record.workspace)?; let isolation_json = json_encode(&record.isolation)?; let capabilities_json = json_encode(&record.capabilities)?;
+            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            conn.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; Ok(())
+        }).await.map_err(|e| internal_error(format!("sqlite checkpoint save task panicked: {e}")))?;
+        result.map_err(|e| internal_error(format!("sqlite checkpoint save failed: {e}")))
+    }
+
+    async fn get_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<crate::CheckpointRecord>, SessionDomainError> {
+        let conn = self.conn.clone();
+        let checkpoint_id = checkpoint_id.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<Option<crate::CheckpointRecord>, String> {
+            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            let mut stmt = conn.prepare("SELECT checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms FROM checkpoints WHERE checkpoint_id=?1").map_err(|e| e.to_string())?;
+            let mut rows = stmt.query(params![checkpoint_id]).map_err(|e| e.to_string())?;
+            let Some(row) = rows.next().map_err(|e| e.to_string())? else { return Ok(None); };
+            let decode = |idx: usize| -> Result<String, String> { row.get(idx).map_err(|e| e.to_string()) };
+            Ok(Some(crate::CheckpointRecord { checkpoint_id: decode(0)?, source_runtime_id: decode(1)?, provider_snapshot_id: decode(2)?, runtime_state: json_decode(&decode(3)?)?, workspace: json_decode(&decode(4)?)?, isolation: json_decode(&decode(5)?)?, capabilities: json_decode(&decode(6)?)?, owner_ref: decode(7)?, tenant_id: row.get(8).map_err(|e| e.to_string())?, created_by: row.get(9).map_err(|e| e.to_string())?, created_at_ms: row.get::<_, i64>(10).map_err(|e| e.to_string())? as u64 }))
+        }).await.map_err(|e| internal_error(format!("sqlite checkpoint get task panicked: {e}")))?;
+        result.map_err(|e| internal_error(format!("sqlite checkpoint get failed: {e}")))
+    }
+
     /// Two indexed queries (COUNT then SELECT...LIMIT) inside one
     /// `spawn_blocking` closure sharing the same locked connection — a read
     /// endpoint, so the extra round trip over a single combined query is a
@@ -429,6 +473,30 @@ mod tests {
         let repo = SqliteSessionRepository::open_in_memory().expect("open in-memory db");
         let loaded = repo.get("does-not-exist").await.expect("get must succeed");
         assert_eq!(loaded, None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_round_trips() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        let session = sample_record("runtime-source");
+        let checkpoint = crate::CheckpointRecord {
+            checkpoint_id: "checkpoint-1".into(),
+            source_runtime_id: session.runtime_id.clone(),
+            provider_snapshot_id: "snapshot-1".into(),
+            runtime_state: session.runtime.clone(),
+            workspace: session.workspace.clone(),
+            isolation: session.isolation.clone(),
+            capabilities: session.capabilities.clone(),
+            owner_ref: "tenant/tenant-1".into(),
+            tenant_id: session.tenant_id.clone(),
+            created_by: Some(session.created_by.clone()),
+            created_at_ms: 42,
+        };
+        repo.save_checkpoint(checkpoint.clone()).await.unwrap();
+        assert_eq!(
+            repo.get_checkpoint("checkpoint-1").await.unwrap(),
+            Some(checkpoint)
+        );
     }
 
     #[tokio::test]

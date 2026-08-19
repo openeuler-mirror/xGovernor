@@ -29,11 +29,11 @@ use crate::OperationAttach;
 use async_trait::async_trait;
 use operation_protocol::{BackendPath, OperationBackend};
 use provider_protocol::{
-    BackendId, Provider, ProviderCapabilities, ProviderCapability, ProviderControlError,
-    ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest, ProviderEndpoint,
-    ProviderInspectRequest, ProviderInstance, ProviderInstanceId, ProviderInstanceStatus,
-    ProviderKind, ProviderLifecycle, ProviderLifecycleOperation, ProviderLifecycleState,
-    ProviderLifecycleStateMachine, ProviderLoadRequest, ProviderLoadSource,
+    BackendId, Provider, ProviderCapabilities, ProviderCapability, ProviderCheckpointRequest,
+    ProviderControlError, ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest,
+    ProviderEndpoint, ProviderInspectRequest, ProviderInstance, ProviderInstanceId,
+    ProviderInstanceStatus, ProviderKind, ProviderLifecycle, ProviderLifecycleOperation,
+    ProviderLifecycleState, ProviderLifecycleStateMachine, ProviderLoadRequest, ProviderLoadSource,
     ProviderOperationCapabilities, ProviderPauseRequest, ProviderResourceAllocation,
     ProviderResourceLimits, ProviderSnapshot, ProviderSnapshotId,
 };
@@ -979,6 +979,48 @@ impl ProviderLifecycle for E2bProvider {
             record.instance.updated_at_ms = now_ms();
         }
         Ok(snapshot)
+    }
+
+    async fn checkpoint(
+        &self,
+        request: ProviderCheckpointRequest,
+    ) -> Result<ProviderSnapshot, ProviderControlError> {
+        let instance_id = request.instance_id.0.clone();
+        let (sandbox_id, api_base, api_key) = {
+            let registry = self.lock_registry()?;
+            let record = registry.get(instance_id.as_str()).ok_or_else(|| {
+                ProviderControlError::NotFound {
+                    resource_ref: instance_id.clone(),
+                }
+            })?;
+            let live = record
+                .live
+                .as_ref()
+                .ok_or_else(|| ProviderControlError::Conflict {
+                    message: format!("instance {instance_id} has no live sandbox to checkpoint"),
+                })?;
+            (
+                live.state.sandbox_id.clone(),
+                live.state.api_base.clone(),
+                live.state.api_key.clone(),
+            )
+        };
+        let http = new_e2b_http_client()?;
+        let snapshot_result = create_snapshot(
+            &http,
+            api_base.as_str(),
+            api_key.as_str(),
+            sandbox_id.as_str(),
+        )
+        .await?;
+        Ok(ProviderSnapshot {
+            snapshot_id: ProviderSnapshotId(snapshot_result.snapshot_id),
+            provider: self.kind.clone(),
+            source_instance_id: Some(request.instance_id),
+            serialized_handle: None,
+            metadata: json!({ "sandbox_id": sandbox_id, "names": snapshot_result.names }),
+            created_at_ms: now_ms(),
+        })
     }
 
     async fn delete(
