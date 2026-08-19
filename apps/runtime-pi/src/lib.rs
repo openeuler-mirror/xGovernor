@@ -1462,10 +1462,11 @@ impl RuntimeAdapter for PiRuntime {
             .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string());
         let token = Uuid::new_v4().to_string();
         let activity = Arc::new(tokio::sync::RwLock::new(()));
+        let workspace_root = backend.paths().workspace_root().clone();
         self.bridge.register(
             token.clone(),
             Arc::clone(&backend),
-            backend.paths().workspace_root().clone(),
+            workspace_root.clone(),
             Arc::clone(&activity),
         );
         let mut command = Command::new(executable);
@@ -1478,6 +1479,7 @@ impl RuntimeAdapter for PiRuntime {
             .arg(&session_dir)
             .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
             .env("XGOVERNOR_BRIDGE_TOKEN", &token)
+            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1485,13 +1487,19 @@ impl RuntimeAdapter for PiRuntime {
         if let Ok(file) = session_file::latest_complete_turn_file(&session_dir) {
             command.arg("--session").arg(file);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|e| SessionDomainError::Unavailable {
-                message: e.to_string(),
-            })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.bridge.unregister(&token);
+                let _ = manager.stop_instance(&request.new_runtime_id).await;
+                return Err(SessionDomainError::Unavailable {
+                    message: format!("failed to spawn pi from checkpoint: {error}"),
+                });
+            }
+        };
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take();
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -1505,6 +1513,9 @@ impl RuntimeAdapter for PiRuntime {
             activity,
         });
         tokio::spawn(read_events(Arc::clone(&instance), stdout));
+        if let Some(stderr) = stderr {
+            tokio::spawn(log_stderr(request.new_runtime_id.clone(), stderr));
+        }
         self.instances
             .write()
             .await
