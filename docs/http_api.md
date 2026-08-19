@@ -36,6 +36,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | SessionHeartbeatRequest   | 200 SessionHeartbeatResponse |
 | `/api/v1/sessions/detach`                              | POST | SessionDetachRequest      | 200 SessionControlResponse   |
 | `/api/v1/sessions/close`                               | POST | SessionCloseRequest       | 200 SessionControlResponse   |
+| `/api/v1/sessions/checkpoint`                         | POST | SessionCheckpointRequest  | 200 SessionCheckpointResult  |
+| `/api/v1/sessions/checkpoint/delete`                  | POST | SessionCheckpointDeleteRequest | 200 SessionCheckpointDeleteResult |
+| `/api/v1/sessions/load`                               | POST | SessionLoadRequest        | 200 SessionOpenResponse      |
 | `/api/v1/admin/tenants`                                | POST | TenantCreateRequest       | 201 TenantCreateResponse     |
 | `/api/v1/admin/tenants/{tenant_id}`                    | PATCH| TenantPatchRequest        | 200 TenantPatchResponse      |
 | `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | —                        | 200 TenantDeleteResponse     |
@@ -57,6 +60,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | 维持租约心跳                         |
 | `/api/v1/sessions/detach`                              | POST | 释放租约、保留会话                      |
 | `/api/v1/sessions/close`                               | POST | 关闭会话（销毁沙箱）                     |
+| `/api/v1/sessions/checkpoint`                         | POST | 创建持久化 checkpoint（沙箱快照 + runtime 状态） |
+| `/api/v1/sessions/checkpoint/delete`                  | POST | 用户主动删除 checkpoint 及其归档资源      |
+| `/api/v1/sessions/load`                               | POST | 从 checkpoint 创建新会话                 |
 | `/api/v1/admin/tenants`                                | POST | 新建租户（生成 token，仅明文返回一次）         |
 | `/api/v1/admin/tenants/{tenant_id}`                    | PATCH | 修改租户配额（部分字段更新）                 |
 | `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | 删除租户（存在活跃会话则拒绝）               |
@@ -88,7 +94,7 @@
 
 - `sessions` 只含**活跃**会话（`opening | idle | running | paused`），从不包含 `failed`/`closed`；按 `updated_at_ms` 降序排列。
 - v1 无真正分页：`sessions` 最多返回服务端固定上限（当前 100）条最近更新的记录；`has_more` 为 true 表示调用方真实活跃会话数超过了这个上限。
-- `quota.active_sessions` 是调用方可见范围内的**真实计数**（来自 SQLite 查询，不是准入路径 `open()` 用的内存计数器——两者已知在 daemon 重启后可能短暂不一致，这里刻意不复用准入路径的计数，见 [tenancy_design.md](./tenancy_design.md) §4 附注），不受 `sessions` 截断影响。
+- `quota.active_sessions` 是调用方可见范围内的**真实计数**（来自 SQLite 查询），不受 `sessions` 截断影响。session 准入计数在 daemon 启动时也从同一 SQLite 聚合恢复；恢复失败时服务拒绝启动，避免重启绕过 `max_sessions`。
 - `quota.max_sessions` / `max_requests_per_minute` 直接取自调用方自身的配额配置；admin 身份没有配额上限，两个字段为 `null`。
 - 不返回历史/已关闭会话，也不暴露审计日志——这两者是 v1 明确排除的范围（[tenancy_design.md](./tenancy_design.md) §4）。
 
@@ -155,6 +161,24 @@
 ```
 
 省略的字段继承父会话。成功返回新会话的 `SessionOpenResponse`；runtime 不支持时 422 `unsupported_capability`。
+
+### checkpoint / load / checkpoint delete
+
+`POST /api/v1/sessions/checkpoint` 创建一个 checkpoint。完整 checkpoint 同时包含 provider 快照和 runtime opaque state，成功响应携带 `checkpoint_id`。checkpoint 本身不占用 active session 配额。
+
+`POST /api/v1/sessions/load` 根据 `checkpoint_id` 创建一个新的 session；load 按 open/fork 规则计入租户 `max_sessions`，provider load 前同时检查 sandbox 配额，失败会回滚已预占的配额和已创建资源。
+
+```json
+{ "checkpoint_id": "checkpoint-…", "conversation_id": null, "sender_id": null, "llm": null }
+```
+
+`POST /api/v1/sessions/checkpoint/delete` 由用户主动决定清理时机：
+
+```json
+{ "checkpoint_id": "checkpoint-…", "lease": {} }
+```
+
+删除会清理 provider snapshot、runtime 归档目录以及 SQLite checkpoint 记录。tenant 只能删除自己的 checkpoint，admin 可删除任意 checkpoint；无权限与不存在统一返回 404。provider 或归档清理失败时保留 SQLite 记录，便于重试。当前不运行自动 GC，也不会因 session close 自动删除 checkpoint；重复删除已不存在的记录返回 404。
 
 ### 租户管理（管控面，admin-only）
 
@@ -283,4 +307,3 @@
 - 新增字段一律 `#[serde(default)]`；请求侧未知字段拒绝、响应侧未知能力按缺席处理——客户端可以落后于服务端，反之需同步窗口。
 - 协议 crate 的任何 JSON 形态变更都会触发其 schema/边界测试 diff，按 wire 变更评审。
 - 操作面（exec / 文件读写 / checkpoint / checkout / pause / resume）的 DTO 已在 session-protocol 定义但**尚未路由**，接线后并入本文 §2。
-

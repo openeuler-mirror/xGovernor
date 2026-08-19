@@ -218,6 +218,7 @@ SSE 事件词汇之外的 runtime 专有事件，以带命名空间标签的**�
 | 职责 | 说明 |
 |---|---|
 | 会话域模型 | 会话记录、workspace/lease/checkpoint 谱系等持久化结构；**永不直接上线**，出网必经 wire 投影 |
+| checkpoint 生命周期 | checkpoint 元数据持久化在 SQLite；load 创建的新 session 按租户 session 配额与 provider sandbox 配额进行准入。checkpoint 删除是用户主动 API：先清理 provider snapshot/runtime 归档，成功后删除元数据；失败保留记录以便重试，当前不做自动 GC |
 | runtime 状态检疫 | 会话记录中**不出现任何具体 runtime 的类型化状态**，只持有 `runtime_kind` + 版本化的 opaque `runtime_state: Value`，由对应 adapter 编解码。**坑位的实际用法（2026-08-17 落地，见 [pi_session_restore_plan.md](./pi_session_restore_plan.md)）**：`apps/runtime-pi` 把 daemon 重启后重新拉起会话所需的一切（`backend_id`、per-session 状态目录、可执行文件/扩展覆盖、workspace 元数据）编进 blob，`open` 成功后经 `export_state` 自动写入；重启后「SQLite 有行、adapter 无实例」时 application 层经 `ensure_runtime_attached` 用 `start(state=Some(blob))` 惰性复原——opaque 检疫使这成为 runtime 私有机制，core 只经手 blob，与 §4 的检疫规则一致 |
 | wire ↔ 域投影 | 域记录 → `SessionOpenResponse`；域错误 → `SessionWireError`；runtime 事件 → 归一化 SSE 事件。全部投影集中于 adapter，传输层只做编解码与路由 |
 | 环境归一化 | open 入口统一执行 workspace / deployment / capability 的归一化与校验，产出环境声明面的"服务端事实" |
