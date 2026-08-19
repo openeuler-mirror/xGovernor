@@ -16,8 +16,8 @@ pub mod turn_cancellation;
 
 pub use application::{
     enforce_workspace_axiom, Clock, NormalizedSessionEnvironment, RuntimeIdGenerator,
-    SessionApplication, SessionEnvironmentNormalizer, SessionRepository, SessionSubmission,
-    TurnIdGenerator,
+    SessionApplication, SessionEnvironmentNormalizer, SessionListPage, SessionRepository,
+    SessionSubmission, TurnIdGenerator,
 };
 pub use domain::*;
 pub use memory_automation::{
@@ -26,7 +26,7 @@ pub use memory_automation::{
     TurnMemoryContext,
 };
 pub use orphan_reaper::spawn_orphan_reaper;
-pub use projection::{project_session, project_session_error};
+pub use projection::{project_session, project_session_error, project_session_summary};
 pub use prompt_utils::{
     compose_subagent_delegation_rules, generate_skills_dirs_table, SubagentRoleRecord,
 };

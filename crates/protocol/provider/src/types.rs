@@ -159,6 +159,15 @@ pub struct ProviderPauseRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderCheckpointRequest {
+    pub backend_id: BackendId,
+    pub instance_id: ProviderInstanceId,
+    pub reason: ProviderLifecycleReason,
+    #[serde(default)]
+    pub correlation: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderDeleteRequest {
     pub backend_id: BackendId,
     #[serde(default)]

@@ -99,19 +99,37 @@ cargo run -p xgovernor-server
 |---|---|---|
 | `XGOVERNOR_BIND_ADDR` | `127.0.0.1:8787` | Admin listener (must be loopback) |
 | `XGOVERNOR_TENANT_BIND_ADDR` | *(required, no default)* | Tenant listener (may be public) |
-| `XGOVERNOR_BEARER_TOKEN` | *(required)* | Token for the admin surface |
-| `XGOVERNOR_TENANT_TOKENS_JSON` | *(required)* | `[{"token": "...", "tenant_id": "...", "quota": {...}}]` for the tenant surface |
-| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | Directory holding the SQLite database |
+| `XGOVERNOR_TENANTS_CONFIG_PATH` | `$XGOVERNOR_DATA_DIR/tenants.toml` | Declarative token/identity policy file (see below); missing at the *default* path means dev mode (every request resolves to implicit admin), missing at an explicitly-set path is a fail-closed startup error |
+| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | Directory holding the SQLite database (and, by default, `tenants.toml`) |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | OS temp dir | Workspace root for `workspace: daemon_default` |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
 | `DEEPSEEK_API_KEY` *(and friends)* | *(unset)* | LLM keys passed through to the pi child process |
+
+Credentials and roles live in a `tenants.toml` file (`docs/tenancy_design.md` §4), loaded at startup and hot-reloaded on `SIGHUP` — no restart needed to rotate tokens or add a tenant:
+
+```toml
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+# principal, max_sessions, max_requests_per_minute are all optional
+```
 
 Minimal working configuration and a full single-session walkthrough are in [apps/runtime-pi/demo/easydemo.md](./apps/runtime-pi/demo/easydemo.md) (§2–§9). The one-line shape of it:
 
 ```bash
 export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788
-export XGOVERNOR_BEARER_TOKEN=demo-admin-token
-export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'
+mkdir -p "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}"
+cat > "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}/tenants.toml" <<'EOF'
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+EOF
 export E2B_API_KEY=e2b_... DEEPSEEK_API_KEY=sk-...
 cargo run -p xgovernor-server
 ```

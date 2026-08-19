@@ -4,11 +4,11 @@ use crate::OperationAttach;
 use async_trait::async_trait;
 use operation_protocol::OperationBackend;
 use provider_protocol::{
-    Provider, ProviderCapabilities, ProviderControlError, ProviderCreateRequest,
-    ProviderDeleteOutcome, ProviderDeleteRequest, ProviderEndpoint, ProviderInspectRequest,
-    ProviderInstance, ProviderInstanceStatus, ProviderKind, ProviderLifecycle,
-    ProviderLifecycleOperation, ProviderLifecycleStateMachine, ProviderLoadRequest,
-    ProviderLoadSource, ProviderOperationCapabilities, ProviderPauseRequest,
+    Provider, ProviderCapabilities, ProviderCheckpointRequest, ProviderControlError,
+    ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest, ProviderEndpoint,
+    ProviderInspectRequest, ProviderInstance, ProviderInstanceStatus, ProviderKind,
+    ProviderLifecycle, ProviderLifecycleOperation, ProviderLifecycleStateMachine,
+    ProviderLoadRequest, ProviderLoadSource, ProviderOperationCapabilities, ProviderPauseRequest,
     ProviderResourceAllocation, ProviderSnapshot, ProviderSnapshotId,
 };
 use serde::Deserialize;
@@ -258,6 +258,16 @@ impl ProviderLifecycle for LocalProvider {
         };
         record.instance.snapshot = Some(snapshot.clone());
         Ok(snapshot)
+    }
+
+    async fn checkpoint(
+        &self,
+        _request: ProviderCheckpointRequest,
+    ) -> Result<ProviderSnapshot, ProviderControlError> {
+        Err(ProviderControlError::UnsupportedCapability {
+            provider: self.kind.clone(),
+            capability: "checkpoint".to_string(),
+        })
     }
 
     async fn delete(

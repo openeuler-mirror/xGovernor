@@ -43,19 +43,39 @@ export DEEPSEEK_API_KEY=sk-...
 |---|---|---|
 | `XGOVERNOR_BIND_ADDR` | `127.0.0.1:8787` | admin 面监听地址（必须是回环地址） |
 | `XGOVERNOR_TENANT_BIND_ADDR` | *(必填，无默认)* | tenant 面监听地址 |
-| `XGOVERNOR_BEARER_TOKEN` | *(必填)* | admin 面 token |
-| `XGOVERNOR_TENANT_TOKENS_JSON` | *(必填)* | tenant 面 token 表，每个条目对应一个租户自己的 token：`[{"token":"...","tenant_id":"...","quota":{...}}]`（quota 可选） |
-| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录 |
+| `XGOVERNOR_TENANTS_CONFIG_PATH` | `$XGOVERNOR_DATA_DIR/tenants.toml` | 声明式凭证/身份策略文件（见下）；**默认路径**缺失 = dev 模式（每个请求隐式获得 admin 身份）；**显式设置**的路径缺失则 fail-closed 拒绝启动 |
+| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录（默认也是 `tenants.toml` 所在目录） |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | 系统临时目录 | 会话工作区根目录 |
 | `E2B_API_KEY` | *(未设置)* | 设置后注册 `e2b` 远程沙箱后端 |
 | `DEEPSEEK_API_KEY` 等 | *(未设置)* | 透传给 pi 子进程的 LLM key |
+
+凭证与角色配置在 `tenants.toml` 文件里（`docs/tenancy_design.md` §4），启动时加载，支持 `SIGHUP` 热重载——轮换 token 或新增租户不需要重启：
+
+```toml
+[admin]
+tokens = ["demo-admin-token"]   # admin token，可配多个用于轮换
+
+[[tenant]]
+tenant_id = "demo-tenant"        # 必填，全局唯一
+tokens = ["demo-tenant-token"]   # 必填，至少一个；全局唯一
+principal = "demo-ops"           # 可选，默认 "tenant"
+max_sessions = 20                # 可选，默认不限
+max_requests_per_minute = 120    # 可选，默认不限
+```
 
 最小启动配置：
 
 ```bash
 export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788
-export XGOVERNOR_BEARER_TOKEN=demo-admin-token
-export XGOVERNOR_TENANT_TOKENS_JSON='[{"token":"demo-tenant-token","tenant_id":"demo-tenant"}]'  # 该 token 属于 demo-tenant 这个租户
+mkdir -p "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}"
+cat > "${XGOVERNOR_DATA_DIR:-$HOME/.xgovernor}/tenants.toml" <<'EOF'
+[admin]
+tokens = ["demo-admin-token"]
+
+[[tenant]]
+tenant_id = "demo-tenant"
+tokens = ["demo-tenant-token"]
+EOF
 export DEEPSEEK_API_KEY=sk-...
 cargo run -p xgovernor-server
 ```
@@ -64,7 +84,7 @@ cargo run -p xgovernor-server
 
 ### admin 面（管理端）
 
-以下请求打 admin 监听地址（`127.0.0.1:8787`），用 `XGOVERNOR_BEARER_TOKEN` 配置的 admin token。
+以下请求打 admin 监听地址（`127.0.0.1:8787`），用 `tenants.toml` 里 `[admin]` 节配置的 admin token。
 
 **1. 打开一个 pi 会话**
 
@@ -103,7 +123,7 @@ curl -N localhost:8787/api/v1/sessions/<runtime_id>/turns/<turn_id>/events \
 
 ### tenant 面（普通租户用自己的 token）
 
-普通租户请求打 **tenant 监听地址**（`127.0.0.1:8788`），用的是启动配置里 `XGOVERNOR_TENANT_TOKENS_JSON` 中**该租户自己的 token**（`demo-tenant-token`），不是 admin token。
+普通租户请求打 **tenant 监听地址**（`127.0.0.1:8788`），用的是 `tenants.toml` 里**该租户自己的 token**（`demo-tenant-token`），不是 admin token。
 
 租户会话有准入约束，与 admin 不同：
 
@@ -123,6 +143,40 @@ curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' 
 ```
 
 提交 turn 与订阅事件流和 admin 面完全一样（`POST /api/v1/sessions/turns`、`GET /api/v1/sessions/<runtime_id>/turns/<turn_id>/events`），只把监听地址换成 `8788`、token 换成该租户自己的。每个租户的 token 对应一个 `tenant_id`，会话按租户隔离（配额、访问互不可见）。
+
+### 新增一个租户
+
+没有运行时管理 API——新增租户就是改配置文件 + 热重载：
+
+1. **编辑 `tenants.toml`**（默认 `~/.xgovernor/tenants.toml`），加一个 `[[tenant]]` 块：
+
+   ```toml
+   [[tenant]]
+   tenant_id = "acme"                        # 必填，不能与其他租户重复
+   tokens = ["acme-token-1", "acme-token-2"] # 必填，至少一个；全局唯一（不能与任何 admin token 重复）
+   principal = "acme-ops"                    # 可选，默认 "tenant"
+   max_sessions = 20                         # 可选，默认不限
+   max_requests_per_minute = 120             # 可选，默认不限
+   ```
+
+   一个租户可以配多个 token（轮换用）；同一个 token 只能属于一个身份。
+
+2. **热重载，无需重启**：
+
+   ```bash
+   kill -HUP <xgovernor-server pid>
+   ```
+
+   服务重读文件并整体替换 token 表，两个监听面同时生效。重载失败（TOML 解析错误、token / tenant_id 重复、空 tokens 列表）时**保留旧配置**并打错误日志；Windows 或 dev 模式启动的服务没有热重载，需重启。
+
+3. **验证新租户**：
+
+   ```bash
+   curl -s localhost:8788/api/v1/health -H 'Authorization: Bearer acme-token-1'
+   # → 200 生效；401 说明 token 未被识别
+   ```
+
+删除租户 = 删掉对应的 `[[tenant]]` 块再热重载（注意整体替换语义：确认新文件完整再触发重载）。
 
 ## 开发
 

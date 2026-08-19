@@ -9,6 +9,7 @@ mod error;
 mod event;
 mod interaction;
 mod operation;
+mod tenant_admin;
 
 pub use control::*;
 pub use environment::*;
@@ -16,6 +17,7 @@ pub use error::*;
 pub use event::*;
 pub use interaction::*;
 pub use operation::*;
+pub use tenant_admin::*;
 
 use serde_json::Value;
 use std::collections::BTreeMap;

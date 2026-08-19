@@ -2,7 +2,8 @@ use crate::domain::*;
 use session_protocol::{
     IsolationState, ResolvedLlmDescriptor, SessionCapabilities, SessionCapabilityFamily,
     SessionLifecycleStatus, SessionOpenResponse, SessionRuntimeCapability,
-    SessionSandboxCapability, SessionWireError, WorkspaceAccessMode, WorkspaceState,
+    SessionSandboxCapability, SessionSummary, SessionWireError, WorkspaceAccessMode,
+    WorkspaceState,
 };
 
 pub fn project_session(record: &SessionRecord) -> SessionOpenResponse {
@@ -68,6 +69,20 @@ pub fn project_session(record: &SessionRecord) -> SessionOpenResponse {
             api_base: llm.api_base.clone(),
             credential_source: llm.credential_source.clone(),
         }),
+    }
+}
+
+/// Narrow projection for `GET /api/v1/sessions` — deliberately skips
+/// workspace/isolation/capabilities (see [`SessionSummary`]'s doc comment).
+pub fn project_session_summary(record: &SessionRecord) -> SessionSummary {
+    SessionSummary {
+        runtime_id: record.runtime_id.clone(),
+        conversation_id: record.conversation_id.clone(),
+        sender_id: record.sender_id.clone(),
+        status: project_status(record.status),
+        runtime_kind: record.runtime.runtime_kind.clone(),
+        created_at_ms: record.created_at_ms,
+        updated_at_ms: record.updated_at_ms,
     }
 }
 
@@ -156,6 +171,7 @@ fn project_runtime_capability(capability: RuntimeCapability) -> SessionRuntimeCa
         RuntimeCapability::Interaction => SessionRuntimeCapability::Interaction,
         RuntimeCapability::Steering => SessionRuntimeCapability::Steering,
         RuntimeCapability::Fork => SessionRuntimeCapability::Fork,
+        RuntimeCapability::Checkpoint => SessionRuntimeCapability::Checkpoint,
         RuntimeCapability::StateExport => SessionRuntimeCapability::StateExport,
         RuntimeCapability::ModelOverride => SessionRuntimeCapability::ModelOverride,
         RuntimeCapability::ReasoningControl => SessionRuntimeCapability::ReasoningControl,

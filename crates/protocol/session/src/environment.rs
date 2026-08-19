@@ -24,6 +24,7 @@ pub enum SessionRuntimeCapability {
     Interaction,
     Steering,
     Fork,
+    Checkpoint,
     StateExport,
     ModelOverride,
     ReasoningControl,

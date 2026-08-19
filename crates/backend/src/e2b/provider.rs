@@ -29,11 +29,11 @@ use crate::OperationAttach;
 use async_trait::async_trait;
 use operation_protocol::{BackendPath, OperationBackend};
 use provider_protocol::{
-    BackendId, Provider, ProviderCapabilities, ProviderCapability, ProviderControlError,
-    ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest, ProviderEndpoint,
-    ProviderInspectRequest, ProviderInstance, ProviderInstanceId, ProviderInstanceStatus,
-    ProviderKind, ProviderLifecycle, ProviderLifecycleOperation, ProviderLifecycleState,
-    ProviderLifecycleStateMachine, ProviderLoadRequest, ProviderLoadSource,
+    BackendId, Provider, ProviderCapabilities, ProviderCapability, ProviderCheckpointRequest,
+    ProviderControlError, ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest,
+    ProviderEndpoint, ProviderInspectRequest, ProviderInstance, ProviderInstanceId,
+    ProviderInstanceStatus, ProviderKind, ProviderLifecycle, ProviderLifecycleOperation,
+    ProviderLifecycleState, ProviderLifecycleStateMachine, ProviderLoadRequest, ProviderLoadSource,
     ProviderOperationCapabilities, ProviderPauseRequest, ProviderResourceAllocation,
     ProviderResourceLimits, ProviderSnapshot, ProviderSnapshotId,
 };
@@ -611,12 +611,11 @@ impl E2bProvider {
         })
     }
 
-    /// Delete a snapshot that has no live instance backing it (or whose
-    /// owning instance the caller does not know/care about), resolving
-    /// credentials from whichever registry record currently references it.
-    /// Per task history, this is deliberately scoped to snapshots reachable
-    /// through the current in-memory registry — no persisted/cross-process
-    /// snapshot tracking.
+    /// Delete a snapshot that has no live instance backing it. When the
+    /// current process still has a registry record, reuse its connection
+    /// options; after a daemon restart, fall back to the normal E2B
+    /// environment/default resolution so a checkpoint persisted in SQLite
+    /// remains user-deletable.
     async fn delete_snapshot_only(
         &self,
         backend_id: BackendId,
@@ -625,7 +624,7 @@ impl E2bProvider {
     ) -> Result<ProviderDeleteOutcome, ProviderControlError> {
         let provider_options = {
             let registry = self.lock_registry()?;
-            registry
+            let found = registry
                 .values()
                 .find(|record| {
                     record
@@ -634,13 +633,18 @@ impl E2bProvider {
                         .as_ref()
                         .is_some_and(|snapshot| snapshot.snapshot_id == snapshot_id)
                 })
-                .map(|record| record.provider_options.clone())
-        };
-
-        let Some(provider_options) = provider_options else {
-            return Err(ProviderControlError::NotFound {
-                resource_ref: snapshot_id.0.clone(),
-            });
+                .map(|record| record.provider_options.clone());
+            if found.is_none()
+                && std::env::var("E2B_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_none()
+            {
+                return Err(ProviderControlError::NotFound {
+                    resource_ref: snapshot_id.0.clone(),
+                });
+            }
+            found.unwrap_or(Value::Null)
         };
 
         let options = parse_options(&provider_options)?;
@@ -979,6 +983,48 @@ impl ProviderLifecycle for E2bProvider {
             record.instance.updated_at_ms = now_ms();
         }
         Ok(snapshot)
+    }
+
+    async fn checkpoint(
+        &self,
+        request: ProviderCheckpointRequest,
+    ) -> Result<ProviderSnapshot, ProviderControlError> {
+        let instance_id = request.instance_id.0.clone();
+        let (sandbox_id, api_base, api_key) = {
+            let registry = self.lock_registry()?;
+            let record = registry.get(instance_id.as_str()).ok_or_else(|| {
+                ProviderControlError::NotFound {
+                    resource_ref: instance_id.clone(),
+                }
+            })?;
+            let live = record
+                .live
+                .as_ref()
+                .ok_or_else(|| ProviderControlError::Conflict {
+                    message: format!("instance {instance_id} has no live sandbox to checkpoint"),
+                })?;
+            (
+                live.state.sandbox_id.clone(),
+                live.state.api_base.clone(),
+                live.state.api_key.clone(),
+            )
+        };
+        let http = new_e2b_http_client()?;
+        let snapshot_result = create_snapshot(
+            &http,
+            api_base.as_str(),
+            api_key.as_str(),
+            sandbox_id.as_str(),
+        )
+        .await?;
+        Ok(ProviderSnapshot {
+            snapshot_id: ProviderSnapshotId(snapshot_result.snapshot_id),
+            provider: self.kind.clone(),
+            source_instance_id: Some(request.instance_id),
+            serialized_handle: None,
+            metadata: json!({ "sandbox_id": sandbox_id, "names": snapshot_result.names }),
+            created_at_ms: now_ms(),
+        })
     }
 
     async fn delete(

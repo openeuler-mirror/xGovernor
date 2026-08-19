@@ -19,8 +19,8 @@ use tempfile::TempDir;
 use xgovernor_core::{
     Clock, IsolationBoundary, IsolationFacts, NetworkIsolation, NormalizedSessionEnvironment,
     RuntimeAdapter, RuntimeEntryContext, RuntimeIdGenerator, RuntimeStartRequest, SecurityContext,
-    SessionApplication, SessionDomainError, SessionEnvironmentNormalizer, SessionRecord,
-    SessionRepository, TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
+    SessionApplication, SessionDomainError, SessionEnvironmentNormalizer, SessionListPage,
+    SessionRecord, SessionRepository, TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, EXT_NAMESPACE};
@@ -106,6 +106,16 @@ impl SessionRepository for MemoryRepository {
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
         *self.0.lock().unwrap() = Some(record);
         Ok(())
+    }
+    async fn list_active(
+        &self,
+        _tenant_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        Ok(SessionListPage {
+            sessions: Vec::new(),
+            total_active: 0,
+        })
     }
 }
 

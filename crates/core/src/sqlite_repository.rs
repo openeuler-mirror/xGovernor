@@ -29,13 +29,14 @@
 //! WAL mode is enabled on open, matching this codebase's single-writer
 //! control-plane posture (`docs/tenancy_design.md` line 4: "单写者控制面").
 
-use crate::application::SessionRepository;
+use crate::application::{SessionListPage, SessionRepository};
 use crate::domain::{
     CheckpointLineage, EffectiveCapabilities, IsolationFacts, OpaqueRuntimeState, ResolvedLlm,
     SessionDomainError, SessionLease, SessionRecord, SessionStatus, WorkspaceFacts,
 };
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -93,7 +94,21 @@ impl SqliteSessionRepository {
                 tenant_id TEXT,
                 created_by TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);",
+            CREATE INDEX IF NOT EXISTS idx_sessions_tenant_id ON sessions(tenant_id);
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                source_runtime_id TEXT NOT NULL,
+                provider_snapshot_id TEXT NOT NULL,
+                runtime_json TEXT NOT NULL,
+                workspace_json TEXT NOT NULL,
+                isolation_json TEXT NOT NULL,
+                capabilities_json TEXT NOT NULL,
+                owner_ref TEXT NOT NULL,
+                tenant_id TEXT,
+                created_by TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_tenant_runtime ON checkpoints(tenant_id, source_runtime_id);",
         )
     }
 }
@@ -292,6 +307,150 @@ impl SessionRepository for SqliteSessionRepository {
 
         result.map_err(|error| internal_error(format!("sqlite save failed: {error}")))
     }
+
+    async fn save_checkpoint(
+        &self,
+        record: crate::CheckpointRecord,
+    ) -> Result<(), SessionDomainError> {
+        let conn = self.conn.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let runtime_json = json_encode(&record.runtime_state)?; let workspace_json = json_encode(&record.workspace)?; let isolation_json = json_encode(&record.isolation)?; let capabilities_json = json_encode(&record.capabilities)?;
+            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            conn.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; Ok(())
+        }).await.map_err(|e| internal_error(format!("sqlite checkpoint save task panicked: {e}")))?;
+        result.map_err(|e| internal_error(format!("sqlite checkpoint save failed: {e}")))
+    }
+
+    async fn get_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<crate::CheckpointRecord>, SessionDomainError> {
+        let conn = self.conn.clone();
+        let checkpoint_id = checkpoint_id.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<Option<crate::CheckpointRecord>, String> {
+            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            let mut stmt = conn.prepare("SELECT checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms FROM checkpoints WHERE checkpoint_id=?1").map_err(|e| e.to_string())?;
+            let mut rows = stmt.query(params![checkpoint_id]).map_err(|e| e.to_string())?;
+            let Some(row) = rows.next().map_err(|e| e.to_string())? else { return Ok(None); };
+            let decode = |idx: usize| -> Result<String, String> { row.get(idx).map_err(|e| e.to_string()) };
+            Ok(Some(crate::CheckpointRecord { checkpoint_id: decode(0)?, source_runtime_id: decode(1)?, provider_snapshot_id: decode(2)?, runtime_state: json_decode(&decode(3)?)?, workspace: json_decode(&decode(4)?)?, isolation: json_decode(&decode(5)?)?, capabilities: json_decode(&decode(6)?)?, owner_ref: decode(7)?, tenant_id: row.get(8).map_err(|e| e.to_string())?, created_by: row.get(9).map_err(|e| e.to_string())?, created_at_ms: row.get::<_, i64>(10).map_err(|e| e.to_string())? as u64 }))
+        }).await.map_err(|e| internal_error(format!("sqlite checkpoint get task panicked: {e}")))?;
+        result.map_err(|e| internal_error(format!("sqlite checkpoint get failed: {e}")))
+    }
+
+    async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<bool, SessionDomainError> {
+        let conn = self.conn.clone();
+        let checkpoint_id = checkpoint_id.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let conn = conn
+                .lock()
+                .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            conn.execute(
+                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+                params![checkpoint_id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            internal_error(format!("sqlite checkpoint delete task panicked: {error}"))
+        })?;
+        result.map_err(|error| internal_error(format!("sqlite checkpoint delete failed: {error}")))
+    }
+
+    async fn active_session_counts_by_tenant(
+        &self,
+    ) -> Result<HashMap<String, usize>, SessionDomainError> {
+        let conn = self.conn.clone();
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<HashMap<String, usize>, String> {
+                let conn = conn
+                    .lock()
+                    .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT tenant_id, COUNT(*) FROM sessions \
+                 WHERE tenant_id IS NOT NULL AND status IN ('opening','idle','running','paused') \
+                 GROUP BY tenant_id",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                let mut counts = HashMap::new();
+                for row in rows {
+                    let (tenant_id, count) = row.map_err(|error| error.to_string())?;
+                    counts.insert(tenant_id, count.max(0) as usize);
+                }
+                Ok(counts)
+            })
+            .await
+            .map_err(|error| {
+                internal_error(format!("sqlite quota restore task panicked: {error}"))
+            })?;
+        result.map_err(|error| internal_error(format!("sqlite quota restore failed: {error}")))
+    }
+
+    /// Two indexed queries (COUNT then SELECT...LIMIT) inside one
+    /// `spawn_blocking` closure sharing the same locked connection — a read
+    /// endpoint, so the extra round trip over a single combined query is a
+    /// non-issue, and it keeps the "true total" and "capped page" logic each
+    /// expressed as an ordinary SQL query rather than fetched-then-truncated
+    /// in Rust (which would require pulling every matching row over just to
+    /// count them).
+    async fn list_active(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        let conn = self.conn.clone();
+        let tenant_id = tenant_id.map(str::to_string);
+        let limit = limit as i64;
+        let result = tokio::task::spawn_blocking(move || -> Result<SessionListPage, String> {
+            const ACTIVE_STATUSES: &str = "status IN ('opening','idle','running','paused')";
+            let conn = conn
+                .lock()
+                .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+
+            let total_active: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions \
+                         WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL)"
+                    ),
+                    params![tenant_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT * FROM sessions \
+                     WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL) \
+                     ORDER BY updated_at_ms DESC LIMIT ?2"
+                ))
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![tenant_id, limit], row_to_record)
+                .map_err(|error| error.to_string())?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                sessions.push(row.map_err(|error| error.to_string())??);
+            }
+
+            Ok(SessionListPage {
+                sessions,
+                total_active: total_active.max(0) as u32,
+            })
+        })
+        .await
+        .map_err(|error| internal_error(format!("sqlite list_active task panicked: {error}")))?;
+
+        result.map_err(|error| internal_error(format!("sqlite list_active failed: {error}")))
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +533,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_round_trips() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        let session = sample_record("runtime-source");
+        let checkpoint = crate::CheckpointRecord {
+            checkpoint_id: "checkpoint-1".into(),
+            source_runtime_id: session.runtime_id.clone(),
+            provider_snapshot_id: "snapshot-1".into(),
+            runtime_state: session.runtime.clone(),
+            workspace: session.workspace.clone(),
+            isolation: session.isolation.clone(),
+            capabilities: session.capabilities.clone(),
+            owner_ref: "tenant/tenant-1".into(),
+            tenant_id: session.tenant_id.clone(),
+            created_by: Some(session.created_by.clone()),
+            created_at_ms: 42,
+        };
+        repo.save_checkpoint(checkpoint.clone()).await.unwrap();
+        assert_eq!(
+            repo.get_checkpoint("checkpoint-1").await.unwrap(),
+            Some(checkpoint)
+        );
+        assert!(repo.delete_checkpoint("checkpoint-1").await.unwrap());
+        assert_eq!(repo.get_checkpoint("checkpoint-1").await.unwrap(), None);
+        assert!(!repo.delete_checkpoint("checkpoint-1").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn save_twice_upserts_rather_than_conflicting() {
         let repo = SqliteSessionRepository::open_in_memory().expect("open in-memory db");
         let mut record = sample_record("runtime-1");
@@ -415,5 +601,31 @@ mod tests {
             .expect("get must succeed")
             .expect("record must have survived reopening the file");
         assert_eq!(loaded.runtime_id, "runtime-1");
+    }
+
+    #[tokio::test]
+    async fn active_session_counts_by_tenant_ignore_closed_failed_and_admin_rows() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        let mut active = sample_record("active");
+        active.tenant_id = Some("tenant-a".into());
+        repo.save(active).await.unwrap();
+        let mut paused = sample_record("paused");
+        paused.status = SessionStatus::Paused;
+        paused.tenant_id = Some("tenant-a".into());
+        repo.save(paused).await.unwrap();
+        let mut closed = sample_record("closed");
+        closed.status = SessionStatus::Closed;
+        closed.tenant_id = Some("tenant-a".into());
+        repo.save(closed).await.unwrap();
+        let mut failed = sample_record("failed");
+        failed.status = SessionStatus::Failed;
+        failed.tenant_id = Some("tenant-a".into());
+        repo.save(failed).await.unwrap();
+        let admin = sample_record("admin");
+        repo.save(admin).await.unwrap();
+
+        let counts = repo.active_session_counts_by_tenant().await.unwrap();
+        assert_eq!(counts.get("tenant-a"), Some(&2));
+        assert!(!counts.contains_key("admin"));
     }
 }

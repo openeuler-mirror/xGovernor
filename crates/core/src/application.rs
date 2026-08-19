@@ -1,14 +1,17 @@
 use crate::{
-    project_runtime_event, project_session, CheckpointLineage, EffectiveCapabilities,
-    IsolationBoundary, IsolationFacts, LeaseCheckFailure, OpaqueRuntimeState, RuntimeAdapter,
-    RuntimeCapability, RuntimeEntryContext, RuntimeInteractionInput, RuntimeStartRequest,
-    RuntimeTurnInput, SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable,
-    SessionRecord, SessionStatus, WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
+    project_runtime_event, project_session, project_session_summary, CheckpointLineage,
+    EffectiveCapabilities, IsolationBoundary, IsolationFacts, LeaseCheckFailure,
+    OpaqueRuntimeState, RuntimeAdapter, RuntimeCapability, RuntimeEntryContext,
+    RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput,
+    SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord,
+    SessionStatus, WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
 };
 use session_protocol::{
-    SessionControlResponse, SessionEvent, SessionForkRequest, SessionHeartbeatResponse,
-    SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionOpenRequest,
-    SessionOpenResponse, SessionSubmitReceipt, SessionTurnRequest,
+    SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointRequest,
+    SessionCheckpointResult, SessionControlResponse, SessionEvent, SessionForkRequest,
+    SessionHeartbeatResponse, SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus,
+    SessionListResponse, SessionLoadRequest, SessionOpenRequest, SessionOpenResponse,
+    SessionSubmitReceipt, SessionTurnRequest, TenantQuotaSnapshot,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -159,28 +162,43 @@ impl SessionApplication {
         self
     }
 
-    /// Reserve one session slot for `tenant_id` against `limit`. `Err(limit)`
-    /// when the tenant is already at capacity — the caller maps that to
-    /// `SessionDomainError::QuotaExceeded`. Check-then-increment happens
-    /// under one lock acquisition so two concurrent `open`s from the same
-    /// tenant can never both slip past a limit of 1.
-    fn reserve_tenant_session(&self, tenant_id: &str, limit: u32) -> Result<(), u32> {
+    /// Rebuild the in-memory admission counter from durable active session
+    /// rows. Assembly must call this before serving requests and fail closed
+    /// if it fails; otherwise a daemon restart would temporarily reset every
+    /// tenant's `max_sessions` usage to zero.
+    pub async fn restore_tenant_session_counts(&self) -> Result<(), SessionDomainError> {
+        let counts = self.records.active_session_counts_by_tenant().await?;
+        let mut current = self
+            .tenant_sessions
+            .lock()
+            .expect("tenant session counter lock poisoned");
+        *current = counts;
+        Ok(())
+    }
+
+    /// Track one more active session for `tenant_id`, rejecting it when an
+    /// optional limit is already reached. Counts are maintained even when
+    /// `limit` is `None`: tenant configuration can be hot-reloaded, and a
+    /// later close must never decrement some other restored session merely
+    /// because this session was opened while quota was unlimited.
+    fn reserve_tenant_session(&self, tenant_id: &str, limit: Option<u32>) -> Result<(), u32> {
         let mut counts = self
             .tenant_sessions
             .lock()
             .expect("tenant session counter lock poisoned");
         let current = counts.get(tenant_id).copied().unwrap_or(0);
-        if current >= limit as usize {
-            return Err(limit);
+        if let Some(limit) = limit {
+            if current >= limit as usize {
+                return Err(limit);
+            }
         }
         *counts.entry(tenant_id.to_string()).or_insert(0) += 1;
         Ok(())
     }
 
-    /// Release one session slot. Safe to call even when the tenant was never
-    /// reserved (e.g. `max_sessions` was unset when the session was opened,
-    /// or this is a rollback after a reservation that was never actually
-    /// taken) — a missing or already-zero entry is simply a no-op.
+    /// Release one tracked active-session slot. A missing or already-zero
+    /// entry is a no-op, which keeps rollback and legacy-record close paths
+    /// safe.
     fn release_tenant_session(&self, tenant_id: &str) {
         let mut counts = self
             .tenant_sessions
@@ -292,8 +310,8 @@ impl SessionApplication {
         }
 
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
-        if let (Some(tenant_id), Some(limit)) = (&tenant_id_for_quota, ctx.quota.max_sessions) {
-            self.reserve_tenant_session(tenant_id, limit)
+        if let Some(tenant_id) = &tenant_id_for_quota {
+            self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
                 .map_err(|limit| SessionDomainError::QuotaExceeded {
                     scope: "sessions".to_string(),
                     limit,
@@ -648,10 +666,9 @@ impl SessionApplication {
         }
         // Drop the closed session's active-turn slot and idempotency window.
         self.turn_gate.forget_session(runtime_id);
-        // `docs/tenancy_design.md` §7 step 4: release this tenant's session
-        // slot. Safe to call unconditionally when the tenant never reserved
-        // one (no `max_sessions` configured at open time) — `release_tenant_
-        // session` is a no-op in that case.
+        // `docs/tenancy_design.md` §7 step 4: release this tenant's tracked
+        // active-session slot. Tracking is unconditional for tenant
+        // sessions, even when the admission limit itself is unset.
         if let Some(tenant_id) = &tenant_id {
             self.release_tenant_session(tenant_id);
         }
@@ -810,6 +827,170 @@ impl SessionApplication {
         result
     }
 
+    pub async fn checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointRequest,
+    ) -> Result<SessionCheckpointResult, SessionDomainError> {
+        let record = self.require_session(ctx, &request.runtime_id).await?;
+        if !record
+            .capabilities
+            .runtime
+            .contains(&RuntimeCapability::Checkpoint)
+            || !record
+                .capabilities
+                .sandbox
+                .contains(&crate::SandboxCapability::Snapshot)
+        {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability: "checkpoint".into(),
+            });
+        }
+        let payload = self.runtime.checkpoint(&request.runtime_id).await?;
+        let checkpoint_id = payload.checkpoint_id.clone();
+        let created_at_ms = self.clock.now_ms();
+        self.records
+            .save_checkpoint(crate::CheckpointRecord {
+                checkpoint_id: checkpoint_id.clone(),
+                source_runtime_id: request.runtime_id.clone(),
+                provider_snapshot_id: payload.provider_snapshot_id,
+                runtime_state: payload.runtime_state,
+                workspace: record.workspace,
+                isolation: record.isolation,
+                capabilities: record.capabilities,
+                owner_ref: ctx.owner_ref(),
+                tenant_id: record.tenant_id,
+                created_by: Some(ctx.principal.clone()),
+                created_at_ms,
+            })
+            .await?;
+        Ok(SessionCheckpointResult {
+            checkpoint_id,
+            runtime_id: request.runtime_id,
+            checkpoint_scope: session_protocol::SessionCheckpointScope::Full,
+            created_at_ms,
+        })
+    }
+
+    pub async fn load_checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionLoadRequest,
+    ) -> Result<SessionOpenResponse, SessionDomainError> {
+        let runtime_id = request
+            .runtime_id
+            .unwrap_or_else(|| self.runtime_ids.next_runtime_id());
+        let _deployment = request.deployment.clone();
+        let _requested_capabilities = request.requested_capabilities.clone();
+        let checkpoint = self
+            .records
+            .get_checkpoint(&request.checkpoint_id)
+            .await?
+            .filter(|record| ctx.owns(record.tenant_id.as_deref()))
+            .ok_or_else(|| SessionDomainError::NotFound {
+                runtime_id: request.checkpoint_id.clone(),
+            })?;
+        let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
+        if let Some(tenant_id) = &tenant_id_for_quota {
+            self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
+                .map_err(|limit| SessionDomainError::QuotaExceeded {
+                    scope: "sessions".into(),
+                    limit,
+                })?;
+        }
+        if let Err(error) = self
+            .runtime
+            .load_from_checkpoint(RuntimeLoadRequest {
+                new_runtime_id: runtime_id.clone(),
+                owner_ref: ctx.owner_ref(),
+                provider_snapshot_id: checkpoint.provider_snapshot_id.clone(),
+                runtime_state: checkpoint.runtime_state.clone(),
+                llm: request.llm,
+            })
+            .await
+        {
+            if let Some(id) = &tenant_id_for_quota {
+                self.release_tenant_session(id);
+            }
+            return Err(error);
+        }
+        let now = self.clock.now_ms();
+        let record = SessionRecord {
+            runtime_id: runtime_id.clone(),
+            conversation_id: request
+                .conversation_id
+                .unwrap_or_else(|| checkpoint.source_runtime_id.clone()),
+            sender_id: request.sender_id.unwrap_or_else(|| ctx.principal.clone()),
+            status: SessionStatus::Idle,
+            created_at_ms: now,
+            updated_at_ms: now,
+            workspace: checkpoint.workspace,
+            isolation: checkpoint.isolation,
+            capabilities: checkpoint.capabilities,
+            runtime: checkpoint.runtime_state,
+            llm: None,
+            lease: None,
+            lineage: Some(CheckpointLineage {
+                parent_runtime_id: None,
+                source_checkpoint_id: Some(request.checkpoint_id),
+            }),
+            last_error: None,
+            tenant_id: ctx.tenant_id().map(str::to_string),
+            created_by: ctx.principal.clone(),
+        };
+        if let Err(error) = self.records.save(record.clone()).await {
+            let _ = self.runtime.stop(&runtime_id).await;
+            if let Some(id) = &tenant_id_for_quota {
+                self.release_tenant_session(id);
+            }
+            return Err(error);
+        }
+        Ok(project_session(&record))
+    }
+
+    pub async fn delete_checkpoint(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointDeleteRequest,
+    ) -> Result<SessionCheckpointDeleteResult, SessionDomainError> {
+        let checkpoint_id = request.checkpoint_id.clone();
+        let result = self.delete_checkpoint_impl(ctx, request).await;
+        audit_log(ctx, "checkpoint_delete", Some(&checkpoint_id), &result);
+        result
+    }
+
+    async fn delete_checkpoint_impl(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointDeleteRequest,
+    ) -> Result<SessionCheckpointDeleteResult, SessionDomainError> {
+        let checkpoint = self
+            .records
+            .get_checkpoint(&request.checkpoint_id)
+            .await?
+            .filter(|record| ctx.owns(record.tenant_id.as_deref()))
+            .ok_or_else(|| SessionDomainError::NotFound {
+                runtime_id: request.checkpoint_id.clone(),
+            })?;
+        // External resources first, metadata last. If provider/archive
+        // cleanup fails, keeping the SQLite row makes the operation
+        // discoverable and retryable rather than silently orphaning it.
+        self.runtime
+            .delete_checkpoint(
+                checkpoint.runtime_state.clone(),
+                checkpoint.provider_snapshot_id.clone(),
+            )
+            .await?;
+        self.records
+            .delete_checkpoint(&request.checkpoint_id)
+            .await?;
+        Ok(SessionCheckpointDeleteResult {
+            checkpoint_id: request.checkpoint_id,
+            deleted: true,
+        })
+    }
+
     async fn fork_impl(
         &self,
         ctx: &SecurityContext,
@@ -841,8 +1022,8 @@ impl SessionApplication {
         // owned by `ctx`'s tenant just like `open` does, so it counts against
         // the same `max_sessions` ceiling.
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
-        if let (Some(tenant_id), Some(limit)) = (&tenant_id_for_quota, ctx.quota.max_sessions) {
-            self.reserve_tenant_session(tenant_id, limit)
+        if let Some(tenant_id) = &tenant_id_for_quota {
+            self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
                 .map_err(|limit| SessionDomainError::QuotaExceeded {
                     scope: "sessions".to_string(),
                     limit,
@@ -1041,12 +1222,101 @@ impl SessionApplication {
     ) -> Result<(), SessionDomainError> {
         self.require_session(ctx, runtime_id).await.map(|_| ())
     }
+
+    /// Thin audit-logging wrapper around [`Self::list_sessions_impl`] — see
+    /// [`audit_log`]. Not tied to one `runtime_id`, so the audit line carries
+    /// `runtime_id = "-"`.
+    pub async fn list_sessions(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+    ) -> Result<SessionListResponse, SessionDomainError> {
+        let result = self.list_sessions_impl(ctx, limit).await;
+        audit_log(ctx, "list_sessions", None, &result);
+        result
+    }
+
+    /// v1 self-service query (`docs/tenancy_design.md` §4 closing line):
+    /// most-recent-N active sessions visible to `ctx` plus a quota snapshot.
+    /// Ownership scoping is the same `ctx.tenant_id()` passthrough used
+    /// elsewhere (`None` = admin's global view, `Some(id)` = that tenant's
+    /// own sessions only) — no separate admin-only branch.
+    async fn list_sessions_impl(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+    ) -> Result<SessionListResponse, SessionDomainError> {
+        let page = self.records.list_active(ctx.tenant_id(), limit).await?;
+        let has_more = page.total_active as usize > page.sessions.len();
+        Ok(SessionListResponse {
+            sessions: page.sessions.iter().map(project_session_summary).collect(),
+            has_more,
+            quota: TenantQuotaSnapshot {
+                max_sessions: ctx.quota.max_sessions,
+                active_sessions: page.total_active,
+                max_requests_per_minute: ctx.quota.max_requests_per_minute,
+            },
+        })
+    }
+
+    pub async fn tenant_has_active_sessions(
+        &self,
+        tenant_id: &str,
+    ) -> Result<bool, SessionDomainError> {
+        let page = self.records.list_active(Some(tenant_id), 1).await?;
+        Ok(page.total_active > 0)
+    }
+}
+
+/// Result of [`SessionRepository::list_active`]: `sessions` is capped at the
+/// caller-supplied `limit` (most-recently-updated first), `total_active` is
+/// the true count matching the filter, uncapped — callers derive `has_more`
+/// from the two (`total_active > sessions.len()`) and can report an accurate
+/// quota-usage number even when the list itself is truncated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionListPage {
+    pub sessions: Vec<SessionRecord>,
+    pub total_active: u32,
 }
 
 #[async_trait::async_trait]
 pub trait SessionRepository: Send + Sync {
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError>;
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError>;
+    async fn list_active(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError>;
+    async fn save_checkpoint(
+        &self,
+        _record: crate::CheckpointRecord,
+    ) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
+    async fn get_checkpoint(
+        &self,
+        _checkpoint_id: &str,
+    ) -> Result<Option<crate::CheckpointRecord>, SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
+    async fn delete_checkpoint(&self, _checkpoint_id: &str) -> Result<bool, SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
+    async fn active_session_counts_by_tenant(
+        &self,
+    ) -> Result<HashMap<String, usize>, SessionDomainError> {
+        Ok(HashMap::new())
+    }
 }
 
 pub trait TurnIdGenerator: Send + Sync {
@@ -1147,6 +1417,7 @@ fn domain_runtime_capability(
         session_protocol::SessionRuntimeCapability::Interaction => RuntimeCapability::Interaction,
         session_protocol::SessionRuntimeCapability::Steering => RuntimeCapability::Steering,
         session_protocol::SessionRuntimeCapability::Fork => RuntimeCapability::Fork,
+        session_protocol::SessionRuntimeCapability::Checkpoint => RuntimeCapability::Checkpoint,
         session_protocol::SessionRuntimeCapability::StateExport => RuntimeCapability::StateExport,
         session_protocol::SessionRuntimeCapability::ModelOverride => {
             RuntimeCapability::ModelOverride
@@ -1280,6 +1551,39 @@ mod tests {
         SecurityContext::tenant("tenant-a", "test")
     }
 
+    /// Shared `list_active` logic for the in-memory test doubles below
+    /// ([`MemoryRepository`], [`MapRepository`]) so each one only has to
+    /// supply its records; the filter/sort/cap semantics stay in one place
+    /// rather than being duplicated per double.
+    fn select_active(
+        records: impl Iterator<Item = SessionRecord>,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> SessionListPage {
+        let mut matching: Vec<SessionRecord> = records
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    SessionStatus::Opening
+                        | SessionStatus::Idle
+                        | SessionStatus::Running
+                        | SessionStatus::Paused
+                )
+            })
+            .filter(|record| match tenant_id {
+                None => true,
+                Some(id) => record.tenant_id.as_deref() == Some(id),
+            })
+            .collect();
+        matching.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        let total_active = matching.len() as u32;
+        matching.truncate(limit);
+        SessionListPage {
+            sessions: matching,
+            total_active,
+        }
+    }
+
     struct EmptyRepository;
 
     #[async_trait]
@@ -1293,6 +1597,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -1458,6 +1773,18 @@ mod tests {
             *self.0.lock().await = Some(record);
             Ok(())
         }
+
+        async fn list_active(
+            &self,
+            tenant_id: Option<&str>,
+            limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(select_active(
+                self.0.lock().await.clone().into_iter(),
+                tenant_id,
+                limit,
+            ))
+        }
     }
 
     #[derive(Default)]
@@ -1465,6 +1792,7 @@ mod tests {
         started: Mutex<Option<RuntimeStartRequest>>,
         submitted: Mutex<Option<RuntimeTurnInput>>,
         stopped: Mutex<bool>,
+        checkpoint_delete_fails: bool,
     }
 
     #[async_trait]
@@ -1519,6 +1847,20 @@ mod tests {
             _turn_id: Option<&str>,
         ) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn delete_checkpoint(
+            &self,
+            _runtime_state: OpaqueRuntimeState,
+            _provider_snapshot_id: String,
+        ) -> Result<(), SessionDomainError> {
+            if self.checkpoint_delete_fails {
+                Err(SessionDomainError::Unavailable {
+                    message: "snapshot delete failed".into(),
+                })
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2691,6 +3033,38 @@ mod tests {
                 .insert(record.runtime_id.clone(), record);
             Ok(())
         }
+
+        async fn list_active(
+            &self,
+            tenant_id: Option<&str>,
+            limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(select_active(
+                self.0.lock().await.values().cloned(),
+                tenant_id,
+                limit,
+            ))
+        }
+
+        async fn active_session_counts_by_tenant(
+            &self,
+        ) -> Result<HashMap<String, usize>, SessionDomainError> {
+            let records = self.0.lock().await;
+            let mut counts = HashMap::new();
+            for record in records.values().filter(|record| {
+                record.tenant_id.is_some()
+                    && matches!(
+                        record.status,
+                        SessionStatus::Opening
+                            | SessionStatus::Idle
+                            | SessionStatus::Running
+                            | SessionStatus::Paused
+                    )
+            }) {
+                *counts.entry(record.tenant_id.clone().unwrap()).or_insert(0) += 1;
+            }
+            Ok(counts)
+        }
     }
 
     /// Fails `start` exactly once, then succeeds on every subsequent call —
@@ -2793,6 +3167,179 @@ mod tests {
             SessionDomainError::QuotaExceeded { scope, limit }
                 if scope == "sessions" && limit == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn restored_tenant_session_count_enforces_quota_after_restart() {
+        let repository = Arc::new(MapRepository::default());
+        repository
+            .0
+            .lock()
+            .await
+            .insert("existing".into(), tenant_test_record());
+        let application = SessionApplication::new(
+            Arc::new(CompletingRuntime::default()),
+            repository,
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(TestEnvironment),
+            Arc::new(FixedTurnId),
+        );
+        application.restore_tenant_session_counts().await.unwrap();
+
+        let error = application
+            .open(
+                &quota_tenant_ctx(1),
+                SessionOpenRequest {
+                    runtime_id: Some("new".into()),
+                    ..open_request(Default::default())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SessionDomainError::QuotaExceeded { scope, limit }
+                if scope == "sessions" && limit == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn unlimited_session_tracking_cannot_decrement_a_restored_sessions_slot() {
+        let repository = Arc::new(MapRepository::default());
+        repository
+            .0
+            .lock()
+            .await
+            .insert("runtime-1".into(), tenant_test_record());
+        let application = SessionApplication::new(
+            Arc::new(CompletingRuntime::default()),
+            repository,
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(TestEnvironment),
+            Arc::new(FixedTurnId),
+        );
+        application.restore_tenant_session_counts().await.unwrap();
+        application
+            .open(
+                &tenant_ctx(),
+                SessionOpenRequest {
+                    runtime_id: Some("unlimited".into()),
+                    ..open_request(Default::default())
+                },
+            )
+            .await
+            .unwrap();
+        application
+            .close(&tenant_ctx(), "unlimited", Default::default())
+            .await
+            .unwrap();
+
+        let error = application
+            .open(
+                &quota_tenant_ctx(1),
+                SessionOpenRequest {
+                    runtime_id: Some("limited".into()),
+                    ..open_request(Default::default())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SessionDomainError::QuotaExceeded { limit: 1, .. }
+        ));
+    }
+
+    fn test_checkpoint_record() -> crate::CheckpointRecord {
+        let record = tenant_test_record();
+        crate::CheckpointRecord {
+            checkpoint_id: "checkpoint-1".into(),
+            source_runtime_id: record.runtime_id,
+            provider_snapshot_id: "snapshot-1".into(),
+            runtime_state: record.runtime,
+            workspace: record.workspace,
+            isolation: record.isolation,
+            capabilities: record.capabilities,
+            owner_ref: "tenant/tenant-a".into(),
+            tenant_id: Some("tenant-a".into()),
+            created_by: Some("test".into()),
+            created_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_can_delete_own_checkpoint_and_metadata() {
+        let repository = Arc::new(crate::SqliteSessionRepository::open_in_memory().unwrap());
+        repository
+            .save_checkpoint(test_checkpoint_record())
+            .await
+            .unwrap();
+        let application = SessionApplication::new(
+            Arc::new(CompletingRuntime::default()),
+            repository.clone(),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(UnusedEnvironment),
+            Arc::new(FixedTurnId),
+        );
+
+        let result = application
+            .delete_checkpoint(
+                &tenant_ctx(),
+                SessionCheckpointDeleteRequest {
+                    checkpoint_id: "checkpoint-1".into(),
+                    lease: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.deleted);
+        assert_eq!(
+            repository.get_checkpoint("checkpoint-1").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_delete_failure_preserves_metadata_and_cross_tenant_is_hidden() {
+        let repository = Arc::new(crate::SqliteSessionRepository::open_in_memory().unwrap());
+        repository
+            .save_checkpoint(test_checkpoint_record())
+            .await
+            .unwrap();
+        let application = SessionApplication::new(
+            Arc::new(CompletingRuntime {
+                checkpoint_delete_fails: true,
+                ..Default::default()
+            }),
+            repository.clone(),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(UnusedEnvironment),
+            Arc::new(FixedTurnId),
+        );
+        let request = || SessionCheckpointDeleteRequest {
+            checkpoint_id: "checkpoint-1".into(),
+            lease: Default::default(),
+        };
+        let other = SecurityContext::tenant("tenant-b", "other");
+        assert!(matches!(
+            application.delete_checkpoint(&other, request()).await,
+            Err(SessionDomainError::NotFound { .. })
+        ));
+        assert!(matches!(
+            application
+                .delete_checkpoint(&tenant_ctx(), request())
+                .await,
+            Err(SessionDomainError::Unavailable { .. })
+        ));
+        assert!(repository
+            .get_checkpoint("checkpoint-1")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// An admin `ctx` has no `tenant_id`, so `open` never even reads this

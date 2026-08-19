@@ -155,8 +155,8 @@ mod tests {
         Clock, EffectiveCapabilities, IsolationBoundary, IsolationFacts, NetworkIsolation,
         NormalizedSessionEnvironment, OpaqueRuntimeState, RuntimeIdGenerator,
         RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-        SessionEnvironmentNormalizer, SessionRecord, SessionRepository, SessionStatus,
-        TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
+        SessionEnvironmentNormalizer, SessionListPage, SessionRecord, SessionRepository,
+        SessionStatus, TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
     };
     use async_trait::async_trait;
     use session_protocol::SessionOpenRequest;
@@ -219,6 +219,17 @@ mod tests {
                 .await
                 .insert(record.runtime_id.clone(), record);
             Ok(())
+        }
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            // Reaper tests never exercise the self-service list query.
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 

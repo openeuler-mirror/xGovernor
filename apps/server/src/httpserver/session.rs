@@ -7,8 +7,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use session_protocol::{
-    SessionCancelRequest, SessionCloseRequest, SessionDetachRequest, SessionEvent,
-    SessionForkRequest, SessionHeartbeatRequest, SessionInteractionRequest, SessionOpenRequest,
+    SessionCancelRequest, SessionCheckpointDeleteRequest, SessionCheckpointRequest,
+    SessionCloseRequest, SessionDetachRequest, SessionEvent, SessionForkRequest,
+    SessionHeartbeatRequest, SessionInteractionRequest, SessionLoadRequest, SessionOpenRequest,
     SessionTurnRequest, SessionWireError,
 };
 use std::collections::HashMap;
@@ -22,6 +23,10 @@ use xgovernor_core::{project_session_error, SecurityContext, SessionApplication}
 const STREAM_ENTRY_TTL: Duration = Duration::from_secs(30);
 const STREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_PENDING_STREAMS: usize = 1000;
+/// Cap on `GET /api/v1/sessions` — v1 has no real pagination
+/// (`docs/tenancy_design.md` §4 addendum): callers get the most-recent N
+/// active sessions, full stop.
+const DEFAULT_SESSION_LIST_LIMIT: usize = 100;
 
 /// One pending stream: the receiving half of a turn's forwarded eventx w
 /// channel, plus when it was registered (for TTL expiry).
@@ -127,10 +132,17 @@ pub fn session_router(state: Arc<SessionHttpState>) -> Router {
         .route("/api/v1/sessions/heartbeat", post(heartbeat_session))
         .route("/api/v1/sessions/cancel", post(cancel_turn))
         .route("/api/v1/sessions/fork", post(fork_session))
+        .route("/api/v1/sessions/checkpoint", post(checkpoint_session))
+        .route(
+            "/api/v1/sessions/checkpoint/delete",
+            post(delete_checkpoint),
+        )
+        .route("/api/v1/sessions/load", post(load_checkpoint))
         .route(
             "/api/v1/sessions/:runtime_id/turns/:turn_id/events",
             get(stream_turn_events),
         )
+        .route("/api/v1/sessions", get(list_sessions))
         .with_state(state)
 }
 
@@ -267,6 +279,53 @@ async fn fork_session(
     }
 }
 
+async fn checkpoint_session(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Json(request): Json<SessionCheckpointRequest>,
+) -> Response {
+    match state.application.checkpoint(&ctx, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn load_checkpoint(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Json(request): Json<SessionLoadRequest>,
+) -> Response {
+    match state.application.load_checkpoint(&ctx, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn delete_checkpoint(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Json(request): Json<SessionCheckpointDeleteRequest>,
+) -> Response {
+    match state.application.delete_checkpoint(&ctx, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn list_sessions(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+) -> Response {
+    match state
+        .application
+        .list_sessions(&ctx, DEFAULT_SESSION_LIST_LIMIT)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
 async fn stream_turn_events(
     State(state): State<Arc<SessionHttpState>>,
     Extension(ctx): Extension<SecurityContext>,
@@ -349,7 +408,7 @@ mod tests {
     use xgovernor_core::{
         Clock, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver,
         RuntimeIdGenerator, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-        SessionDomainError, SessionEnvironmentNormalizer, SessionRecord,
+        SessionDomainError, SessionEnvironmentNormalizer, SessionListPage, SessionRecord,
     };
 
     struct EmptyRepository;
@@ -365,6 +424,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -432,6 +502,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 
@@ -808,6 +889,17 @@ mod tests {
 
         async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+
+        async fn list_active(
+            &self,
+            _tenant_id: Option<&str>,
+            _limit: usize,
+        ) -> Result<SessionListPage, SessionDomainError> {
+            Ok(SessionListPage {
+                sessions: Vec::new(),
+                total_active: 0,
+            })
         }
     }
 

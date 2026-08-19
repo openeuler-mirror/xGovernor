@@ -39,6 +39,22 @@ pub struct RuntimeStartRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointPayload {
+    pub checkpoint_id: String,
+    pub runtime_state: OpaqueRuntimeState,
+    pub provider_snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeLoadRequest {
+    pub new_runtime_id: String,
+    pub owner_ref: String,
+    pub provider_snapshot_id: String,
+    pub runtime_state: OpaqueRuntimeState,
+    pub llm: Option<LlmOverrideRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeEntryContext {
     pub kind: Option<String>,
     pub instance_id: Option<String>,
@@ -136,6 +152,34 @@ pub trait RuntimeAdapter: Send + Sync {
         runtime_id: &str,
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError>;
+
+    async fn checkpoint(&self, _runtime_id: &str) -> Result<CheckpointPayload, SessionDomainError> {
+        Err(SessionDomainError::UnsupportedCapability {
+            family: crate::CapabilityFamily::Runtime,
+            capability: "checkpoint".into(),
+        })
+    }
+
+    async fn load_from_checkpoint(
+        &self,
+        _request: RuntimeLoadRequest,
+    ) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::UnsupportedCapability {
+            family: crate::CapabilityFamily::Runtime,
+            capability: "checkpoint".into(),
+        })
+    }
+
+    async fn delete_checkpoint(
+        &self,
+        _runtime_state: OpaqueRuntimeState,
+        _provider_snapshot_id: String,
+    ) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::UnsupportedCapability {
+            family: crate::CapabilityFamily::Runtime,
+            capability: "checkpoint_delete".into(),
+        })
+    }
 
     async fn export_state(
         &self,

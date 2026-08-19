@@ -56,6 +56,25 @@ macro_rules! session_control_request {
 session_control_request!(SessionCloseRequest);
 session_control_request!(SessionDetachRequest);
 session_control_request!(SessionHeartbeatRequest);
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLoadRequest {
+    pub checkpoint_id: String,
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub sender_id: Option<String>,
+    #[serde(default)]
+    pub requested_capabilities: SessionCapabilityRequest,
+    #[serde(default)]
+    pub deployment: DeploymentProfile,
+    #[serde(default)]
+    pub lease: SessionLeaseClaim,
+    #[serde(default)]
+    pub llm: Option<LlmOverrideRequest>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +133,49 @@ pub struct SessionOpenResponse {
     pub effective_capabilities: SessionCapabilities,
     #[serde(default)]
     pub llm: Option<ResolvedLlmDescriptor>,
+}
+
+/// Lightweight per-session projection for `GET /api/v1/sessions` — deliberately
+/// narrower than [`SessionOpenResponse`] (no workspace/isolation/capabilities
+/// detail). Callers who need the full projection for a specific session
+/// already have `runtime_id` from here and can re-attach via `sessions/open`
+/// (idempotent when `runtime_id` is set) to fetch it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub runtime_id: String,
+    pub conversation_id: String,
+    pub sender_id: String,
+    pub status: SessionLifecycleStatus,
+    pub runtime_kind: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Quota snapshot for the caller's own scope: an admin token sees the global
+/// count (no `max_sessions` ceiling), a tenant token sees its own tenant's
+/// count against its own ceiling (`docs/tenancy_design.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantQuotaSnapshot {
+    #[serde(default)]
+    pub max_sessions: Option<u32>,
+    pub active_sessions: u32,
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u32>,
+}
+
+/// Response for `GET /api/v1/sessions`. Deliberately not paginated (v1 scope,
+/// `docs/tenancy_design.md` §4): `sessions` holds up to some server-chosen
+/// cap of the most-recently-updated *active* sessions (never `failed`/
+/// `closed`) visible to the caller — admin sees every tenant, a tenant sees
+/// only its own. `has_more` is true when the caller's true active-session
+/// count exceeds what's returned; `quota.active_sessions` always reflects the
+/// true count, uncapped, so the quota snapshot stays accurate even when the
+/// list itself is truncated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<SessionSummary>,
+    pub has_more: bool,
+    pub quota: TenantQuotaSnapshot,
 }
 
 /// Response shared by close, cancel and detach control operations.

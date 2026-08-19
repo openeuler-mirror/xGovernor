@@ -8,7 +8,7 @@
 ## 1. 约定
 
 - Base path：`/api/v1`，请求与响应均为 JSON（`content-type: application/json`）。
-- **鉴权**：设置了 `XGOVERNOR_BEARER_TOKEN`（旧式单 admin token，兼容保留）或 `XGOVERNOR_TENANT_TOKENS_JSON`（`[{"token","tenant_id","principal"?}]` 数组，签发 tenant 身份）任一个时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。两者均未设置时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
+- **鉴权**：凭证与身份来自 `tenants.toml` 声明式策略文件（[tenancy_design.md](./tenancy_design.md) §4，默认路径 `$XGOVERNOR_DATA_DIR/tenants.toml`，可用 `XGOVERNOR_TENANTS_CONFIG_PATH` 覆盖，支持 `SIGHUP` 热重载）——`[admin]` 节的 `tokens` 签发 admin 身份，`[[tenant]]` 节的 `tokens` 签发对应 `tenant_id` 的 tenant 身份。配置了该文件（且非空）时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。**默认路径**下该文件不存在时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致；**显式**设置 `XGOVERNOR_TENANTS_CONFIG_PATH` 却指向不存在的文件，或文件存在但解析/校验失败，则 fail-closed 拒绝启动。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
 - **跨租户所有权**：非 admin 身份访问不属于自己租户的 `runtime_id` 时，一律返回 `not_found`（404）而非 403——存在性对无权限的调用方不可见（[tenancy_design.md](./tenancy_design.md) §3.2 "404 不泄露存在性信息"）。admin 身份不受此约束。
 - **未知字段**：请求 DTO 一律 `deny_unknown_fields`——多传字段是 400 错误，不是静默忽略。唯一例外是 `ext` 扩展袋内部。
 - **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 runtime adapter 消费（例如 `ext.runtime_mock`、`ext.runtime_pi`、未来的 `ext.xiaoo`）。
@@ -26,6 +26,7 @@
 | 路由                                                     | 方法   | 请求体                       | 成功响应                         |
 | ------------------------------------------------------ | ---- | ------------------------- | ---------------------------- |
 | `/api/v1/health`                                       | GET  | —                         | 200                          |
+| `/api/v1/sessions`                                     | GET  | —                         | 200 SessionListResponse      |
 | `/api/v1/sessions/open`                                | POST | SessionOpenRequest        | 200 SessionOpenResponse      |
 | `/api/v1/sessions/turns`                               | POST | SessionTurnRequest        | 202 SessionSubmitReceipt     |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | —                         | 200 SSE 流                    |
@@ -35,6 +36,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | SessionHeartbeatRequest   | 200 SessionHeartbeatResponse |
 | `/api/v1/sessions/detach`                              | POST | SessionDetachRequest      | 200 SessionControlResponse   |
 | `/api/v1/sessions/close`                               | POST | SessionCloseRequest       | 200 SessionControlResponse   |
+| `/api/v1/admin/tenants`                                | POST | TenantCreateRequest       | 201 TenantCreateResponse     |
+| `/api/v1/admin/tenants/{tenant_id}`                    | PATCH| TenantPatchRequest        | 200 TenantPatchResponse      |
+| `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | —                        | 200 TenantDeleteResponse     |
 
 
 ### 功能一览
@@ -43,6 +47,7 @@
 | 路由                                                     | 方法   | 用途                             |
 | ------------------------------------------------------ | ---- | ------------------------------ |
 | `/api/v1/health`                                       | GET  | 存活探测                           |
+| `/api/v1/sessions`                                     | GET  | 自助查询：调用方可见的活跃会话列表 + 配额快照       |
 | `/api/v1/sessions/open`                                | POST | 打开会话（携带 `runtime_id` 时为幂等重附着）  |
 | `/api/v1/sessions/turns`                               | POST | 提交 turn → 回执携带服务端签发的 `turn_id` |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | 单个 turn 的 SSE 事件流              |
@@ -52,6 +57,9 @@
 | `/api/v1/sessions/heartbeat`                           | POST | 维持租约心跳                         |
 | `/api/v1/sessions/detach`                              | POST | 释放租约、保留会话                      |
 | `/api/v1/sessions/close`                               | POST | 关闭会话（销毁沙箱）                     |
+| `/api/v1/admin/tenants`                                | POST | 新建租户（生成 token，仅明文返回一次）         |
+| `/api/v1/admin/tenants/{tenant_id}`                    | PATCH | 修改租户配额（部分字段更新）                 |
+| `/api/v1/admin/tenants/{tenant_id}`                    | DELETE | 删除租户（存在活跃会话则拒绝）               |
 
 
 
@@ -59,6 +67,30 @@
 ## 3. 会话控制面
 
 
+
+### 会话列表 / 配额自助查询
+
+`GET /api/v1/sessions`，无请求体。与其余路由同一条共享路由，按调用方身份自动过滤（[tenancy_design.md](./tenancy_design.md) §4）：tenant 身份只看到自己名下的活跃会话，admin 身份看到全部租户。
+
+```json
+{
+  "sessions": [
+    {
+      "runtime_id": "runtime-…", "conversation_id": "demo", "sender_id": "me",
+      "status": "idle", "runtime_kind": "mock",
+      "created_at_ms": 0, "updated_at_ms": 0
+    }
+  ],
+  "has_more": false,
+  "quota": { "max_sessions": 10, "active_sessions": 1, "max_requests_per_minute": null }
+}
+```
+
+- `sessions` 只含**活跃**会话（`opening | idle | running | paused`），从不包含 `failed`/`closed`；按 `updated_at_ms` 降序排列。
+- v1 无真正分页：`sessions` 最多返回服务端固定上限（当前 100）条最近更新的记录；`has_more` 为 true 表示调用方真实活跃会话数超过了这个上限。
+- `quota.active_sessions` 是调用方可见范围内的**真实计数**（来自 SQLite 查询，不是准入路径 `open()` 用的内存计数器——两者已知在 daemon 重启后可能短暂不一致，这里刻意不复用准入路径的计数，见 [tenancy_design.md](./tenancy_design.md) §4 附注），不受 `sessions` 截断影响。
+- `quota.max_sessions` / `max_requests_per_minute` 直接取自调用方自身的配额配置；admin 身份没有配额上限，两个字段为 `null`。
+- 不返回历史/已关闭会话，也不暴露审计日志——这两者是 v1 明确排除的范围（[tenancy_design.md](./tenancy_design.md) §4）。
 
 ### open
 
@@ -123,6 +155,47 @@
 ```
 
 省略的字段继承父会话。成功返回新会话的 `SessionOpenResponse`；runtime 不支持时 422 `unsupported_capability`。
+
+### 租户管理（管控面，admin-only）
+
+三条路由，仅 admin 身份可达（§3.1 的角色闸；tenant 身份访问一律 403）。且仅当服务端启动时加载了真实 `tenants.toml`（[tenancy_design.md](./tenancy_design.md) §4）才存在——dev 模式（无 `tenants.toml`，隐式 admin 全开）下这三条路由整体不挂载，请求直接 404，而不是任何 handler 内部判断"鉴权是否已配置"。持久化直接改写 `tenants.toml`（原子写：临时文件 + rename）并复用既有 `SIGHUP` 重载逻辑同一份代码路径热更新内存中的 `TokenTable`，不是另一张 SQLite 表。
+
+**`POST /api/v1/admin/tenants`** — 新建租户。
+
+```json
+{ "tenant_id": "acme", "principal": null, "max_sessions": 5, "max_requests_per_minute": null }
+```
+
+- `tenant_id` 必填、非空（去除首尾空白后仍为空则 400）；与已有 `[[tenant]]` 块的 `tenant_id` 冲突则 409。
+- `principal`、`max_sessions`、`max_requests_per_minute` 均可省略；`principal` 缺省为 `"tenant"`，配额字段缺省为 `null`（不设上限）——与 `tenants.toml` 文件本身的字段缺省语义一致。
+- token **由服务端生成**（`xgt_` 前缀 + 40 位随机字母数字，约 238 bit 熵），不接受客户端传入。
+
+响应 201 `TenantCreateResponse`：
+
+```json
+{ "tenant_id": "acme", "token": "xgt_...", "principal": "tenant", "max_sessions": 5, "max_requests_per_minute": null }
+```
+
+- `token` **仅在这一次响应中以明文返回**——之后任何接口（含未来可能出现的租户查询接口）都不会再回显它；遗失即只能删除重建该租户，当前没有单独的 token 轮换接口。
+
+**`PATCH /api/v1/admin/tenants/{tenant_id}`** — 修改租户配额，**部分字段更新语义**：请求体中缺席的字段保持原值不变；字段存在且为 `null` 表示清空为不设上限；字段存在且为数字表示设置该值。
+
+```json
+{ "max_sessions": 20 }
+```
+
+```json
+{ "max_sessions": null }
+```
+
+目标 `tenant_id` 不存在返回 404 `tenant_not_found`。响应 200 `TenantPatchResponse`，形态同 `TenantCreateResponse` 但不含 `token` 字段。
+
+**`DELETE /api/v1/admin/tenants/{tenant_id}`** — 删除租户。
+
+- 该租户存在**活跃会话**（`opening | idle | running | paused`）时拒绝，返回 409 `conflict`——不会强制关闭会话；需先关闭所有会话再删除。
+- 删除后若会导致 `tenants.toml` 中**零凭证**（既无 `[admin]` 也无其余 `[[tenant]]`），同样拒绝并返回 409——与 `SIGHUP` 重载路径"reload 产出空表永不应用"的不变式一致，这里是同一条不变式的主动前置检查。
+- 目标 `tenant_id` 不存在返回 404 `tenant_not_found`。
+- 成功返回 200 `TenantDeleteResponse`：`{ "tenant_id": "acme" }`。
 
 ## 4. 会话交互面
 
@@ -194,7 +267,8 @@
 | `invalid_request`        | 400  | 请求形态/字段非法（含未知字段、未支持的 workspace 种类）                                           |
 | `lease_required`         | 401  | 需要租约身份（如匿名 heartbeat）                                                        |
 | `not_found`              | 404  | 会话或 turn 流不存在                                                                |
-| `conflict`               | 409  | 会话状态冲突                                                                       |
+| `tenant_not_found`       | 404  | 管控面按 `tenant_id` 查找的租户不存在（与 `not_found` 分属不同标识符空间，见 §3 租户管理）                |
+| `conflict`               | 409  | 会话状态冲突，或管控面删除租户被拒绝（存在活跃会话 / 会清空全部凭证）                                        |
 | `lease_conflict`         | 409  | 他人活跃持有租约（附 holder_client_id / holder_pid / holder_hostname）                  |
 | `unsupported_capability` | 422  | 能力门控拒绝（附 family: sandbox/runtime 与 capability 名，capability 保持字符串以便客户端解码未来能力） |
 | `internal`               | 500  | 内部错误                                                                         |

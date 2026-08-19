@@ -42,6 +42,7 @@ const B64: base64::engine::general_purpose::GeneralPurpose =
 struct SessionEntry {
     backend: Arc<dyn OperationBackend>,
     workspace_root: BackendPath,
+    activity: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Shared local HTTP server proxying Pi's tool calls to a session's real
@@ -86,6 +87,7 @@ impl Bridge {
         token: String,
         backend: Arc<dyn OperationBackend>,
         workspace_root: BackendPath,
+        activity: Arc<tokio::sync::RwLock<()>>,
     ) {
         self.sessions
             .write()
@@ -95,6 +97,7 @@ impl Bridge {
                 SessionEntry {
                     backend,
                     workspace_root,
+                    activity,
                 },
             );
     }
@@ -135,6 +138,7 @@ fn router(bridge: Arc<Bridge>) -> Router {
 struct AuthedSession {
     backend: Arc<dyn OperationBackend>,
     workspace_root: BackendPath,
+    activity: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[async_trait]
@@ -162,6 +166,7 @@ impl FromRequestParts<Arc<Bridge>> for AuthedSession {
         Ok(AuthedSession {
             backend: Arc::clone(&entry.backend),
             workspace_root: BackendPath(entry.workspace_root.0.clone()),
+            activity: Arc::clone(&entry.activity),
         })
     }
 }
@@ -269,6 +274,7 @@ async fn stat_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
+    let _activity = session.activity.read().await;
     match session.backend.files().stat(&BackendPath(body.path)).await {
         Ok(stat) => Json(StatResponseBody {
             exists: stat.exists,
@@ -300,6 +306,7 @@ async fn read_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .files()
@@ -347,6 +354,7 @@ async fn write_handler(
         Ok(content) => content,
         Err(error) => return bad_request_response(format!("invalid content_base64: {error}")),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .files()
@@ -377,6 +385,7 @@ async fn mkdir_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .files()
@@ -413,6 +422,7 @@ async fn exec_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .exec()
@@ -456,6 +466,7 @@ async fn glob_handler(
         Ok(body) => body,
         Err(rejection) => return json_rejection_response(rejection),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .search()
@@ -508,6 +519,7 @@ async fn grep_handler(
         Ok(mode) => mode,
         Err(message) => return bad_request_response(message),
     };
+    let _activity = session.activity.read().await;
     match session
         .backend
         .search()
@@ -735,6 +747,7 @@ mod tests {
             token.clone(),
             backend,
             BackendPath("/workspace".to_string()),
+            Arc::new(tokio::sync::RwLock::new(())),
         );
         (bridge, token)
     }

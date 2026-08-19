@@ -1,7 +1,7 @@
 use crate::{
-    ProviderControlError, ProviderCreateRequest, ProviderDeleteOutcome, ProviderDeleteRequest,
-    ProviderInspectRequest, ProviderInstance, ProviderInstanceStatus, ProviderKind,
-    ProviderLoadRequest, ProviderPauseRequest, ProviderSnapshot,
+    ProviderCheckpointRequest, ProviderControlError, ProviderCreateRequest, ProviderDeleteOutcome,
+    ProviderDeleteRequest, ProviderInspectRequest, ProviderInstance, ProviderInstanceStatus,
+    ProviderKind, ProviderLoadRequest, ProviderPauseRequest, ProviderSnapshot,
 };
 use async_trait::async_trait;
 
@@ -26,6 +26,11 @@ pub trait ProviderLifecycle: Send + Sync {
     async fn pause(
         &self,
         request: ProviderPauseRequest,
+    ) -> Result<ProviderSnapshot, ProviderControlError>;
+
+    async fn checkpoint(
+        &self,
+        request: ProviderCheckpointRequest,
     ) -> Result<ProviderSnapshot, ProviderControlError>;
 
     async fn delete(
