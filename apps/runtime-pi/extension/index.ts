@@ -36,6 +36,29 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+interface XGovernorLlmConfig {
+	provider: string;
+	model: string;
+	apiBase?: string;
+	apiKey?: string;
+}
+
+function decodeLlmConfig(encoded: string): XGovernorLlmConfig {
+	const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
+	const padding = "=".repeat((4 - normalized.length % 4) % 4);
+	const parsed: unknown = JSON.parse(Buffer.from(normalized + padding, "base64").toString("utf8"));
+	if (!parsed || typeof parsed !== "object") throw new Error("LLM configuration must be an object");
+	const value = parsed as Record<string, unknown>;
+	if (typeof value.provider !== "string" || !value.provider.trim()) throw new Error("provider is required");
+	if (typeof value.model !== "string" || !value.model.trim()) throw new Error("model is required");
+	return {
+		provider: value.provider,
+		model: value.model,
+		apiBase: typeof value.apiBase === "string" && value.apiBase ? value.apiBase : undefined,
+		apiKey: typeof value.apiKey === "string" && value.apiKey ? value.apiKey : undefined,
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
@@ -535,6 +558,41 @@ export default function (pi: ExtensionAPI): void {
 	const env = readBridgeEnv();
 	const client = new BridgeClient(env.bridgeUrl, env.bridgeToken);
 	const workspaceRoot = env.workspaceRoot;
+
+	// Runtime-neutral model switching endpoint used by xGovernor between
+	// turns. A custom base URL is registered as OpenAI Chat Completions
+	// compatible because the current session wire DTO has no API-kind field.
+	pi.registerCommand("xgovernor-model", {
+		description: "Configure the provider/model selected by xGovernor",
+		async handler(args, ctx) {
+			const config = decodeLlmConfig(args.trim());
+			if (config.apiBase) {
+				pi.registerProvider(config.provider, {
+					baseUrl: config.apiBase,
+					apiKey: config.apiKey ?? "xgovernor-keyless",
+					api: "openai-completions",
+					models: [{
+						id: config.model,
+						name: config.model,
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 32_000,
+					}],
+				});
+			} else if (config.apiKey) {
+				// Preserve the built-in provider catalogue/API implementation and
+				// override only this child process's runtime credential.
+				pi.registerProvider(config.provider, { apiKey: config.apiKey });
+			}
+			const model = ctx.modelRegistry.find(config.provider, config.model);
+			if (!model) throw new Error(`Model not found: ${config.provider}/${config.model}`);
+			// Rust follows this setup command with Pi's native `set_model` RPC.
+			// Its correlated response is authoritative, so a rejected switch can
+			// never let the user prompt run against the previous model.
+		},
+	});
 
 	// Each *Operations object is built once at extension-load time -- unlike
 	// the Gondolin example, there is no lazy async backend-startup step here

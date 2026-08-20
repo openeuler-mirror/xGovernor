@@ -188,10 +188,10 @@ SSE 事件词汇之外的 runtime 专有事件，以带命名空间标签的**�
 
 ### 3.6 LLM 配置的双型设计
 
-- `LlmOverrideRequest`：wire 入参，可携带明文 api_key，生命周期止于请求处理，永不持久化。整体为能力门控字段（ModelOverride）。
+- `LlmOverrideRequest`：wire 入参，可携带 api_key。整体为能力门控字段（ModelOverride）；是否为了 session 恢复而持久化由具体 runtime adapter 决定（当前 Pi 会写入 session 隔离目录）。
 - `ResolvedLlmDescriptor`：解析后的描述（provider、model、api_base、key 来源标识），**类型上没有 api_key 字段**，用于持久化记录与响应；仅对宣告 ModelOverride 的 runtime 出现——governor 不对自管模型配置的 runtime 做越权承诺。
 
-"密钥不落盘、不回显"由类型系统保证，而非由调用方自觉清洗。
+"密钥不回显"由响应类型保证；落盘策略属于 runtime 的 session 恢复实现。
 
 ### 3.7 明确不拥有
 

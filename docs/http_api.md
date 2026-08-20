@@ -117,7 +117,8 @@
 - `runtime_id` 省略/为 null 时由服务端签发；携带已存在的 id 为**幂等重附着**（attach + 返回现有会话投影）。
 - `workspace.kind`：`daemon_default`（默认）/ `local_path` / `git` / `shared`。当前部署只实现前两种，其余返回 400。
 - `requested_capabilities` 从严校验：请求未知能力名是 400；请求了归一化结果/adapter 宣告之外的能力是 422。
-- `llm` 为请求期一次性配置（可含明文 api_key），永不持久化、永不回显。
+- `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 当前按 OpenAI Chat Completions-compatible endpoint 处理。
+- Pi 会把生效配置保存在该 session 的隔离目录中，以便 daemon 重启、checkpoint/load 后恢复；响应只投影 provider/model/base 与凭证来源，不回显 key。
 
 响应 `SessionOpenResponse`：
 

@@ -85,7 +85,7 @@ Honest gaps (see Roadmap): the pi child-process registry is in-process — a dae
 | pi | **≥ 0.84.2** | `npm install -g @earendil-works/pi-coding-agent`; the bridge extension (`apps/runtime-pi/extension`) declares `peerDependencies: ^0.84.2` and type-checks against exactly 0.84.2; the full pipeline is verified end-to-end on pi **0.84.2** |
 | Node.js | **≥ 22.19.0** | only needed to `npm install` / typecheck the TS bridge extension; the `pi` binary itself (Bun-compiled) loads and runs the extension |
 | E2B | no SDK dependency | the e2b provider is a self-contained reqwest client against the E2B REST API (`api.e2b.dev` + the sandbox's envd HTTP); requires `E2B_API_KEY` at runtime |
-| LLM | any provider pi supports | verified with DeepSeek (`DEEPSEEK_API_KEY`, auto-selects `deepseek-v4-pro`); other providers per pi's own `docs/providers.md` |
+| LLM | any provider/model pi supports | selected per session through `llm`; the daemon does not require a fixed LLM key at startup |
 
 Key Rust dependencies (workspace-pinned): tokio ≥ 1.35, axum 0.7, rusqlite 0.32 (bundled), reqwest 0.12 (rustls), serde/serde_json 1, uuid 1.6, tracing 0.1.
 
@@ -103,7 +103,6 @@ cargo run -p xgovernor-server
 | `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | Directory holding the SQLite database (and, by default, `tenants.toml`) |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | OS temp dir | Workspace root for `workspace: daemon_default` |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
-| `DEEPSEEK_API_KEY` *(and friends)* | *(unset)* | LLM keys passed through to the pi child process |
 
 Credentials and roles live in a `tenants.toml` file (`docs/tenancy_design.md` §4), loaded at startup and hot-reloaded on `SIGHUP` — no restart needed to rotate tokens or add a tenant:
 
@@ -130,7 +129,7 @@ tokens = ["demo-admin-token"]
 tenant_id = "demo-tenant"
 tokens = ["demo-tenant-token"]
 EOF
-export E2B_API_KEY=e2b_... DEEPSEEK_API_KEY=sk-...
+export E2B_API_KEY=e2b_...
 cargo run -p xgovernor-server
 ```
 
@@ -142,6 +141,7 @@ curl -s localhost:8787/api/v1/sessions/open -H 'content-type: application/json' 
   "conversation_id": "demo",
   "sender_id": "me",
   "workspace": { "kind": "daemon_default" },
+  "llm": { "provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-..." },
   "ext": { "runtime_pi": { "backend_id": "e2b" } }
 }'
 # → SessionOpenResponse: runtime_id, workspace/isolation facts (boundary=remote for e2b), capabilities

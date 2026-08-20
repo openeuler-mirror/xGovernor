@@ -44,10 +44,9 @@ local 则是本机目录。
 
 三个最容易卡住的点，全部实测踩过（细节见 §10 实跑记录）：
 
-1. **pi 需要一个 LLM 的 API key**。没有 key 时 pi 会接受 prompt，但立刻以 `No API key found for the selected model` 拒绝，
-  事件流里表现为 `turn_failed`（`pi_prompt_rejected`）。实测设置 `DEEPSEEK_API_KEY` 后 pi 自动识别并选中
-   `deepseek-v4-pro`（当环境里只有这一个 provider 配了 key 时）。其他 provider 见 pi 自带的 `docs/providers.md`
-   （`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY`/…），pi 会根据已配 key 选 provider。
+1. **每个 session 的 open 请求需要选择 LLM**。通过 `llm.provider`、`llm.model` 和 `llm.api_key` 传入；也可以用
+   `api_key_env` 引用 daemon 环境变量。xGovernor 启动时不绑定 DeepSeek 或任何固定模型。自定义 OpenAI-compatible
+   endpoint 额外传 `api_base`。
 2. **daemon 进程的 HOME 必须可写**：pi 会把 session 状态写进 `~/.pi/agent/sessions`，headless 容器/服务账户下要保证这一点，
   否则 pi 启动即崩（`EPERM: mkdir ~/.pi/agent/sessions/...`），server 侧表现为
    `failed to send prompt to pi process: Broken pipe`。可以用 `HOME=/可写路径` 启动 server 规避/验证。
@@ -92,7 +91,6 @@ export XGOVERNOR_TENANT_BIND_ADDR=127.0.0.1:8788      # 必须显式设置，没
 export XGOVERNOR_DATA_DIR=/tmp/xgovernor-pi-demo-home/.xgovernor   # tenants.toml 与 SQLite 都落在这里
 export XGOVERNOR_DEFAULT_WORKSPACE_ROOT=/tmp/xgovernor-pi-demo   # 可选；不设则退化为系统临时目录
 export E2B_API_KEY=e2b_...          # 本 demo 用 e2b 后端，必填；只用 local 后端可省略
-export DEEPSEEK_API_KEY=sk-...      # pi 的 LLM key（见 §0.1）；换 provider 就换对应环境变量
 export HOME=/tmp/xgovernor-pi-demo-home  # 保证 pi 能写 ~/.pi/agent/sessions（见 §0.2）；本机有正常 HOME 可省略
 mkdir -p "$XGOVERNOR_DEFAULT_WORKSPACE_ROOT" "$HOME" "$XGOVERNOR_DATA_DIR"
 
@@ -139,6 +137,11 @@ curl -sS -X POST http://127.0.0.1:8787/api/v1/sessions/open \
     "conversation_id": "demo-conversation-1",
     "sender_id": "demo-user",
     "workspace": { "kind": "daemon_default" },
+    "llm": {
+      "provider": "openai",
+      "model": "gpt-4.1-mini",
+      "api_key": "sk-..."
+    },
     "ext": { "runtime_pi": { "backend_id": "e2b" } }
   }'
 ```
@@ -333,5 +336,3 @@ turn 不会在重启后自动恢复（它所附着的沙箱本身不受影响，
   E2B 过期或手工删。现在 close 对 adapter 未挂回的会话走「按持久化状态直接清理」：`stop_instance`
   注册表 miss 时回落到按账本行 `lifecycle.delete`（`InstanceManager::destroy_by_runtime_id`），
   沙箱真实销毁、会话目录删除、行置 `closed`——不再泄漏。实跑确认 close 后 E2B 平台 running 归零。
-
-
