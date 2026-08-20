@@ -533,6 +533,7 @@ async fn clone_git_workspace(
             cwd: None,
             timeout_ms: Some(120_000),
             env: None,
+            extra: None,
         })
         .await
         .map_err(|error| SessionDomainError::Internal {
@@ -1457,6 +1458,22 @@ impl RuntimeAdapter for PiRuntime {
         capabilities
     }
 
+    fn capabilities_for_request(
+        &self,
+        request: &session_protocol::SessionOpenRequest,
+    ) -> BTreeSet<SessionRuntimeCapability> {
+        let mut capabilities = self.capabilities();
+        let backend_id = request
+            .ext
+            .get(EXT_NAMESPACE)
+            .and_then(|value| value.get("backend_id"))
+            .and_then(Value::as_str);
+        if backend_id != Some(E2B_BACKEND_ID) {
+            capabilities.remove(&SessionRuntimeCapability::Checkpoint);
+        }
+        capabilities
+    }
+
     async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
         // Registry conflict check up front, shared by both branches — this
         // is what naturally prevents concurrent double-restoration (plan
@@ -1989,6 +2006,7 @@ mod tests {
     fn open_request(workspace: session_protocol::WorkspaceSpec) -> SessionOpenRequest {
         SessionOpenRequest {
             runtime_id: None,
+            runtime_kind: None,
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),
             workspace,

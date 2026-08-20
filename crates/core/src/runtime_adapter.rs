@@ -136,6 +136,16 @@ pub trait RuntimeAdapter: Send + Sync {
     fn kind(&self) -> &str;
     fn capabilities(&self) -> BTreeSet<SessionRuntimeCapability>;
 
+    /// Capabilities for a particular open request. Runtime implementations
+    /// may narrow the process-wide set based on provider/backend selection;
+    /// the default preserves the historical process-wide behavior.
+    fn capabilities_for_request(
+        &self,
+        _request: &session_protocol::SessionOpenRequest,
+    ) -> BTreeSet<SessionRuntimeCapability> {
+        self.capabilities()
+    }
+
     async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError>;
     async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError>;
     async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError>;

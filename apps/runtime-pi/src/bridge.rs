@@ -433,6 +433,7 @@ async fn exec_handler(
             cwd: body.cwd.map(BackendPath),
             timeout_ms: body.timeout_ms,
             env: body.env.map(|map| map.into_iter().collect()),
+            extra: None,
         })
         .await
     {

@@ -189,7 +189,7 @@ mod tests {
                 runtime: Default::default(),
             },
             runtime: OpaqueRuntimeState {
-                runtime_kind: "test".into(),
+                runtime_kind: "tracking".into(),
                 schema_version: 1,
                 state: serde_json::Value::Null,
             },

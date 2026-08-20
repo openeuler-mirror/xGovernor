@@ -230,6 +230,7 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
         &ctx,
         SessionOpenRequest {
             runtime_id: None,
+            runtime_kind: None,
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),
             workspace: Default::default(),

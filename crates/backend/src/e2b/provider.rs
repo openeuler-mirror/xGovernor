@@ -1946,6 +1946,7 @@ mod tests {
                     cwd: Some(BackendPath(DEFAULT_WORKSPACE_ROOT.to_string())),
                     timeout_ms: Some(30_000),
                     env: None,
+                    extra: None,
                 })
                 .await
                 .map_err(|error| format!("execute structured grep: {error}"))?;
@@ -2044,6 +2045,7 @@ mod tests {
                     cwd: None,
                     timeout_ms: Some(120_000),
                     env: None,
+                    extra: None,
                 })
                 .await
                 .map_err(|error| format!("git clone exec failed: {error}"))?;
@@ -2069,6 +2071,7 @@ mod tests {
                     cwd: None,
                     timeout_ms: Some(10_000),
                     env: None,
+                    extra: None,
                 })
                 .await
                 .map_err(|error| format!("git rev-parse exec failed: {error}"))?;
@@ -2640,6 +2643,7 @@ mod tests {
                     cwd: None,
                     timeout_ms: Some(15_000),
                     env: None,
+            extra: None,
                 })
                 .await
                 .map_err(|error| format!("exec through reattached backend: {error}"))?;

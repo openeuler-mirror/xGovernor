@@ -48,6 +48,7 @@ fn seed_valid_session_file(session_dir: &str, file_name: &str) -> String {
 fn open_request() -> SessionOpenRequest {
     SessionOpenRequest {
         runtime_id: None,
+        runtime_kind: None,
         conversation_id: "conversation-1".into(),
         sender_id: "sender-1".into(),
         workspace: Default::default(),

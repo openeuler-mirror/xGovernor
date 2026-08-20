@@ -11,11 +11,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use xgovernor_core::{
-    Clock, Role, RuntimeIdGenerator, SessionApplication, SessionLeaseTable,
+    Clock, Role, RuntimeIdGenerator, RuntimeRegistration, SessionApplication, SessionLeaseTable,
     SqliteSessionRepository, TurnIdGenerator,
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, PiSessionEnvironment};
+use xgovernor_runtime_xiaoo::{XiaooRuntime, XiaooSessionEnvironment};
 use xgovernor_server::{
     create_router, load_tenants_file, SessionHttpState, TenantAdminState, TenantConfigError,
     TokenTable,
@@ -486,24 +487,41 @@ async fn main() {
     // runtime can actually provision (and no others), so the two stay in
     // lockstep by construction.
     let configured_backend_ids: Vec<String> = runtime_managers.keys().cloned().collect();
-    let runtime =
-        PiRuntime::new(runtime_managers, xgovernor_pi_session_root()).unwrap_or_else(|error| {
+    let pi_runtime = PiRuntime::new(runtime_managers.clone(), xgovernor_pi_session_root())
+        .unwrap_or_else(|error| {
             eprintln!("refusing to start: failed to initialize PiRuntime bridge: {error}");
             std::process::exit(1);
         });
+    let xiaoo_runtime = XiaooRuntime::new(runtime_managers);
 
     let lease_table = Arc::new(SessionLeaseTable::new());
-    let application = SessionApplication::new(
-        Arc::new(runtime),
+    let application = SessionApplication::with_runtime_registry(
+        "pi",
+        [
+            RuntimeRegistration::new(
+                Arc::new(pi_runtime),
+                Arc::new(PiSessionEnvironment::new(
+                    default_workspace_root.clone(),
+                    configured_backend_ids.clone(),
+                )),
+            ),
+            RuntimeRegistration::new(
+                Arc::new(xiaoo_runtime),
+                Arc::new(XiaooSessionEnvironment::new(
+                    default_workspace_root,
+                    configured_backend_ids,
+                )),
+            ),
+        ],
         Arc::new(session_repository),
         Arc::new(SystemClockAndUuidIds),
         Arc::new(SystemClockAndUuidIds),
-        Arc::new(PiSessionEnvironment::new(
-            default_workspace_root,
-            configured_backend_ids,
-        )),
         Arc::new(SystemClockAndUuidIds),
     )
+    .unwrap_or_else(|error| {
+        eprintln!("refusing to start: invalid runtime registry: {error}");
+        std::process::exit(1);
+    })
     .with_lease_table(lease_table.clone());
     application
         .restore_tenant_session_counts()

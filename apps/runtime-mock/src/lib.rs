@@ -174,6 +174,7 @@ async fn clone_git_workspace(
             cwd: None,
             timeout_ms: Some(120_000),
             env: None,
+            extra: None,
         })
         .await
         .map_err(|error| SessionDomainError::Internal {
@@ -492,6 +493,7 @@ async fn run_mock_turn(
         cwd: None,
         timeout_ms: Some(5_000),
         env: None,
+        extra: None,
     });
     tokio::pin!(exec_future);
     tokio::pin!(cancel_signal);
@@ -691,6 +693,7 @@ mod tests {
     fn open_request(workspace: WorkspaceSpec) -> SessionOpenRequest {
         SessionOpenRequest {
             runtime_id: None,
+            runtime_kind: None,
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),
             workspace,
@@ -983,6 +986,7 @@ mod tests {
                 &ctx,
                 SessionOpenRequest {
                     runtime_id: None,
+                    runtime_kind: None,
                     conversation_id: "conversation-1".into(),
                     sender_id: "sender-1".into(),
                     workspace: Default::default(),

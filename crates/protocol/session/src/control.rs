@@ -21,6 +21,8 @@ pub struct SessionLeaseClaim {
 pub struct SessionOpenRequest {
     #[serde(default)]
     pub runtime_id: Option<String>,
+    #[serde(default)]
+    pub runtime_kind: Option<String>,
     pub conversation_id: String,
     pub sender_id: String,
     #[serde(default)]

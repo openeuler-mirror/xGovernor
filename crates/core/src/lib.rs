@@ -16,8 +16,8 @@ pub mod turn_cancellation;
 
 pub use application::{
     enforce_workspace_axiom, Clock, NormalizedSessionEnvironment, RuntimeIdGenerator,
-    SessionApplication, SessionEnvironmentNormalizer, SessionListPage, SessionRepository,
-    SessionSubmission, TurnIdGenerator,
+    RuntimeRegistration, SessionApplication, SessionEnvironmentNormalizer, SessionListPage,
+    SessionRepository, SessionSubmission, TurnIdGenerator,
 };
 pub use domain::*;
 pub use memory_automation::{

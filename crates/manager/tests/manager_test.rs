@@ -658,7 +658,7 @@ async fn reconcile_rehydrates_registry_and_quota_from_the_ledger() {
 /// runtime_id` must fall back to a direct ledger-driven delete rather
 /// than reporting `NotFound` and leaving the sandbox running.
 #[tokio::test]
-async fn destroy_by_runtime_id_falls_back_to_a_ledger_driven_delete_when_the_registry_is_empty()
+async fn destroy_by_runtime_id_falls_back_to_a_ledger_driven_delete_when_the_registry_is_empty() 
 {
     let lifecycle = Arc::new(FakeLifecycle::new());
     let attach = Arc::new(FakeAttach::new());
@@ -816,6 +816,7 @@ async fn start_instance_then_backend_for_returns_a_working_backend_against_a_rea
             cwd: None,
             timeout_ms: Some(5_000),
             env: None,
+            extra: None,
         })
         .await
         .expect("exec should succeed through the attached backend");
@@ -934,6 +935,7 @@ async fn reconcile_after_restart_rebuilds_a_local_instance_from_the_ledger_alone
             cwd: None,
             timeout_ms: Some(5_000),
             env: None,
+            extra: None,
         })
         .await
         .expect("exec through the reattached backend should succeed");
