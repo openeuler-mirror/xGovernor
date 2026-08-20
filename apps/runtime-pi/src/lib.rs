@@ -1,66 +1,3 @@
-//! `RuntimeAdapter` backed by a real `pi --mode rpc` subprocess
-//! (badlogic/pi-mono's `@earendil-works/pi-coding-agent`).
-//!
-//! Updated architecture: unlike the very first cut of this crate, Pi's tool
-//! *execution* (file read/write/edit, exec, grep/glob) no longer touches the
-//! daemon host's filesystem directly. It is routed through xGovernor's usual
-//! `provider-protocol`/`operation-protocol`/`xgovernor_manager::InstanceManager`
-//! machinery — the same machinery `apps/runtime-mock` composes — via a small
-//! local HTTP bridge (see [`bridge`]) that a TypeScript Pi extension calls
-//! instead of Pi's built-in tools reaching the host fs. `start()` therefore:
-//! (1) looks up the `InstanceManager` for the requested `backend_id`, (2)
-//! calls `start_instance` on it exactly like `MockRuntime` does, obtaining a real
-//! `Arc<dyn OperationBackend>`, (3) registers that backend with the bridge
-//! under a freshly generated bearer token, and (4) spawns `pi --mode rpc`
-//! with that token/URL/workspace-root handed to it via environment
-//! variables and a `-e <extension_dir>` CLI flag pointing at the extension.
-//!
-//! The one remaining, still-deliberate deviation from
-//! `docs/runtime_adapter_guide.md` §2/§5 and `docs/protocol_boundaries.md`
-//! §5 point 4 is narrower than before: the RPC *control channel* — the
-//! long-lived, interactive, line-delimited JSON dialog with the `pi`
-//! process's stdin/stdout — still goes through `tokio::process` directly on
-//! the daemon host, not through `operation-protocol`. That is a genuine
-//! structural mismatch, not a shortcut: `OperationExec` is a one-shot,
-//! fully-buffered single request/response contract
-//! (`stdin(Stdio::null())`), and cannot drive a persistent bidirectional
-//! stdio conversation. Everything Pi's tool calls actually *touch* now goes
-//! through the bridge into a real attached backend; only the control-plane
-//! dialog itself is the exception. See `apps/runtime-pi/demo/easydemo.md` for
-//! background and a runnable walkthrough (some of which now describes the
-//! superseded bypass design; the bridge is the current source of truth).
-//!
-//! Scope cut, still intentional: unlike `MockRuntime`, this crate keeps
-//! its own in-process `runtime_id -> PiInstance` registry (for the `pi`
-//! child process and its stdio plumbing) rather than relying on
-//! `InstanceManager` for that part — `InstanceManager` here only owns the
-//! sandbox/backend side of each session, not the `pi` process itself. A `pi`
-//! process's lifetime is tied to this server process's lifetime, and a
-//! restart loses track of any still-running `pi` subprocesses (they are not
-//! orphan-reaped, nor automatically restarted), even though the underlying
-//! sandbox they were attached to is still tracked by the composed
-//! `InstanceManager`(s) the normal way.
-//!
-//! What changed (2026-08-17, lazy restoration, see
-//! `docs/pi_session_restore_plan.md`): the registry itself still does not
-//! survive a restart, but the *session* does. `start()`'s cold path persists
-//! everything needed to rebuild it into `SessionRecord.runtime` (the opaque
-//! state-quarantine slot, §1.1: `backend_id`, `pi_session_dir`, optional
-//! `executable`/`extension_dir` overrides, workspace metadata), and any
-//! request that hits the "SQLite row exists, adapter has no in-memory
-//! instance" gap after a restart replays `start()` with
-//! `RuntimeStartRequest.state = Some(..)` (`ensure_runtime_attached` in
-//! `application.rs`): the sandbox handle is recovered from the composed
-//! `InstanceManager` (`reconcile()` at startup re-attaches surviving
-//! sandboxes — e2b via a fresh platform liveness check + access-token
-//! fetch, local by rebuilding from persisted `provider_options`), and `pi`
-//! is re-spawned with `--session <latest jsonl>` so it loads the
-//! conversation back itself. Fail-closed branches (§1.4): sandbox gone →
-//! `pi_sandbox_gone`; session file missing/corrupt → `pi_session_state_lost`;
-//! neither silently cold-starts a fresh conversation. `close` on a
-//! not-restored session destroys the sandbox directly from persisted state
-//! (`cleanup_from_state`) instead of spawning `pi` just to kill it.
-
 mod bridge;
 mod session_file;
 
@@ -72,7 +9,7 @@ use provider_protocol::{BackendId, ProviderControlError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_protocol::{
-    SessionExtensions, SessionInteractionAnswer, SessionInteractionOption,
+    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionInteractionOption,
     SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
     SessionTurnOutcome, SessionUsage,
 };
@@ -82,12 +19,13 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 use xgovernor_core::{
     enforce_workspace_axiom, CheckpointPayload, IsolationBoundary, IsolationFacts,
-    NetworkIsolation, NormalizedSessionEnvironment, OpaqueRuntimeState, RuntimeAdapter,
-    RuntimeEvent, RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput,
+    NetworkIsolation, NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm,
+    RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput,
     RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput, SandboxCapability, SecurityContext,
     SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess, WorkspaceFacts,
 };
@@ -148,6 +86,187 @@ fn resolve_extension_dir(ext: &PiRuntimeExt) -> String {
 const LOCAL_BACKEND_ID: &str = "local";
 const E2B_BACKEND_ID: &str = "e2b";
 const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
+const PI_LLM_STATE_FILE: &str = ".xgovernor-llm.json";
+const PI_MODEL_COMMAND: &str = "xgovernor-model";
+const PI_RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Fully resolved, per-session Pi model configuration. This is deliberately
+/// provider-neutral: `provider` and `model` are passed through exactly as the
+/// caller selected them. When `api_base` is present, the bundled extension
+/// registers that endpoint as an OpenAI-compatible provider before selecting
+/// the model; otherwise Pi's built-in provider catalogue is used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiLlmConfig {
+    provider: String,
+    model: String,
+    #[serde(default)]
+    api_base: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    credential_source: String,
+}
+
+impl PiLlmConfig {
+    fn resolve(request: &LlmOverrideRequest) -> Result<Self, SessionDomainError> {
+        let required = |name: &str, value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| SessionDomainError::InvalidRequest {
+                    message: format!("pi llm.{name} is required when an llm override is supplied"),
+                })
+        };
+        let provider = required("provider", &request.provider)?;
+        let model = required("model", &request.model)?;
+        let api_base = request
+            .api_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let (api_key, credential_source) = if let Some(key) = request
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            (Some(key.to_string()), "request".to_string())
+        } else if let Some(name) = request
+            .api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let key = std::env::var(name).map_err(|_| SessionDomainError::InvalidRequest {
+                message: format!(
+                    "pi llm.api_key_env references unset environment variable '{name}'"
+                ),
+            })?;
+            if key.trim().is_empty() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: format!(
+                        "pi llm.api_key_env references empty environment variable '{name}'"
+                    ),
+                });
+            }
+            (Some(key), format!("env:{name}"))
+        } else {
+            (None, "runtime_default".to_string())
+        };
+
+        Ok(Self {
+            provider,
+            model,
+            api_base,
+            api_key,
+            credential_source,
+        })
+    }
+
+    fn descriptor(&self) -> ResolvedLlm {
+        ResolvedLlm {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            api_base: self.api_base.clone(),
+            credential_source: self.credential_source.clone(),
+        }
+    }
+}
+
+fn resolve_llm(
+    request: Option<&LlmOverrideRequest>,
+) -> Result<Option<PiLlmConfig>, SessionDomainError> {
+    request.map(PiLlmConfig::resolve).transpose()
+}
+
+async fn persist_llm_config(
+    session_dir: &std::path::Path,
+    config: &PiLlmConfig,
+) -> Result<(), SessionDomainError> {
+    let bytes = serde_json::to_vec(config).expect("PiLlmConfig always serializes");
+    tokio::fs::write(session_dir.join(PI_LLM_STATE_FILE), bytes)
+        .await
+        .map_err(|error| SessionDomainError::Unavailable {
+            message: format!("failed to persist pi session llm configuration: {error}"),
+        })
+}
+
+async fn load_llm_config(
+    session_dir: &std::path::Path,
+) -> Result<Option<PiLlmConfig>, SessionDomainError> {
+    let path = session_dir.join(PI_LLM_STATE_FILE);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(SessionDomainError::Unavailable {
+                message: format!("failed to read pi session llm configuration: {error}"),
+            })
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| SessionDomainError::Unavailable {
+            message: format!(
+                "pi session llm configuration '{}' is corrupt: {error}",
+                path.display()
+            ),
+        })
+}
+
+async fn configure_pi_launch(
+    command: &mut Command,
+    session_dir: &std::path::Path,
+    config: Option<&PiLlmConfig>,
+) -> Result<(), SessionDomainError> {
+    let Some(config) = config else { return Ok(()) };
+
+    command
+        .arg("--provider")
+        .arg(&config.provider)
+        .arg("--model")
+        .arg(&config.model);
+    if let Some(api_key) = &config.api_key {
+        command.arg("--api-key").arg(api_key);
+    }
+
+    // Pi has no generic `--base-url` flag. A request carrying api_base gets
+    // an isolated models.json, scoped to this one child process. The wire
+    // protocol currently has no provider API-kind field, so api_base means
+    // OpenAI Chat Completions compatible until that contract is extended.
+    if let Some(api_base) = &config.api_base {
+        let agent_dir = session_dir.join(".pi-agent");
+        tokio::fs::create_dir_all(&agent_dir)
+            .await
+            .map_err(|error| SessionDomainError::Unavailable {
+                message: format!("failed to create isolated pi agent directory: {error}"),
+            })?;
+        let mut provider = json!({
+            "baseUrl": api_base,
+            "api": "openai-completions",
+            "models": [{ "id": config.model }],
+        });
+        provider["apiKey"] = json!(config.api_key.as_deref().unwrap_or("xgovernor-keyless"));
+        let models = json!({ "providers": { config.provider.clone(): provider } });
+        tokio::fs::write(
+            agent_dir.join("models.json"),
+            serde_json::to_vec_pretty(&models).expect("models.json always serializes"),
+        )
+        .await
+        .map_err(|error| SessionDomainError::Unavailable {
+            message: format!("failed to write isolated pi models.json: {error}"),
+        })?;
+        command.env("PI_CODING_AGENT_DIR", agent_dir);
+        if config.api_key.is_none() {
+            command.arg("--api-key").arg("xgovernor-keyless");
+        }
+    }
+    persist_llm_config(session_dir, config).await
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct GitWorkspaceMetadata {
@@ -365,6 +484,8 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             _ => unreachable!("backend profile checked above"),
         };
 
+        let llm = resolve_llm(request.llm.as_ref())?.map(|config| config.descriptor());
+
         Ok(NormalizedSessionEnvironment {
             workspace: WorkspaceFacts {
                 workspace_id: request.conversation_id.clone(),
@@ -384,7 +505,7 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 }),
             },
             sandbox_capabilities: capabilities,
-            llm: None,
+            llm,
             lease: None,
         })
     }
@@ -492,6 +613,10 @@ struct PiInstance {
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
     current_turn: Mutex<Option<CurrentTurn>>,
+    /// Correlates the small number of RPC commands for which the adapter must
+    /// observe acceptance before continuing (currently per-turn model
+    /// selection). Normal prompts keep their existing asynchronous contract.
+    pending_responses: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     /// Bearer token this instance's backend is registered under on the
     /// shared [`Bridge`]. `stop()` unregisters it so a dangling token can't
     /// keep proxying to a backend whose sandbox is about to be torn down.
@@ -506,6 +631,7 @@ struct PiInstance {
     /// a restart — see [`PiPersistedState`]. Immutable snapshot taken at
     /// `start()` time; `export_state()` just clones and re-wraps it.
     persisted_state: PiPersistedState,
+    session_dir: PathBuf,
     activity: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -828,6 +954,86 @@ async fn write_command(instance: &PiInstance, command: &Value) -> std::io::Resul
     stdin.flush().await
 }
 
+async fn write_command_for_response(
+    instance: &PiInstance,
+    command: Value,
+) -> Result<Value, SessionDomainError> {
+    let id = command
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SessionDomainError::Internal {
+            message: "correlated pi RPC command is missing an id".to_string(),
+            source: None,
+        })?
+        .to_string();
+    let (tx, rx) = oneshot::channel();
+    instance
+        .pending_responses
+        .lock()
+        .await
+        .insert(id.clone(), tx);
+    if let Err(error) = write_command(instance, &command).await {
+        instance.pending_responses.lock().await.remove(&id);
+        return Err(SessionDomainError::Unavailable {
+            message: format!("failed to write correlated pi RPC command: {error}"),
+        });
+    }
+    let response = timeout(PI_RPC_RESPONSE_TIMEOUT, rx)
+        .await
+        .map_err(|_| SessionDomainError::Timeout {
+            operation: "pi_rpc_response".to_string(),
+            timeout_ms: PI_RPC_RESPONSE_TIMEOUT.as_millis() as u64,
+        })?
+        .map_err(|_| SessionDomainError::Unavailable {
+            message: "pi process exited before replying to RPC command".to_string(),
+        })?;
+    if !response
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(SessionDomainError::InvalidRequest {
+            message: response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("pi rejected model configuration")
+                .to_string(),
+        });
+    }
+    Ok(response)
+}
+
+async fn configure_instance_llm(
+    instance: &PiInstance,
+    config: &PiLlmConfig,
+) -> Result<(), SessionDomainError> {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(config).expect("PiLlmConfig always serializes"));
+    let id = format!("xgovernor-model-{}", Uuid::new_v4());
+    write_command_for_response(
+        instance,
+        json!({
+            "id": id,
+            "type": "prompt",
+            "message": format!("/{PI_MODEL_COMMAND} {encoded}"),
+        }),
+    )
+    .await?;
+    write_command_for_response(
+        instance,
+        json!({
+            "id": format!("xgovernor-set-model-{}", Uuid::new_v4()),
+            "type": "set_model",
+            "provider": config.provider,
+            "modelId": config.model,
+        }),
+    )
+    .await?;
+    persist_llm_config(&instance.session_dir, config).await
+}
+
 fn map_answer_to_pi_value(
     method: &str,
     answer: &SessionInteractionAnswer,
@@ -881,6 +1087,12 @@ fn extract_usage(message: &Value) -> SessionUsage {
 }
 
 async fn handle_response(instance: &PiInstance, message: &Value) {
+    if let Some(id) = message.get("id").and_then(Value::as_str) {
+        if let Some(waiter) = instance.pending_responses.lock().await.remove(id) {
+            let _ = waiter.send(message.clone());
+            return;
+        }
+    }
     let command = message.get("command").and_then(Value::as_str).unwrap_or("");
     let success = message
         .get("success")
@@ -1200,6 +1412,9 @@ async fn read_events(instance: Arc<PiInstance>, stdout: ChildStdout) {
         }
     }
 
+    let pending = std::mem::take(&mut *instance.pending_responses.lock().await);
+    drop(pending);
+
     // The process ended (or its stdout pipe broke) while a turn was still in
     // flight: surface a terminal `Failed` event so the caller does not hang
     // forever waiting for one that will never come.
@@ -1235,6 +1450,7 @@ impl RuntimeAdapter for PiRuntime {
 
     fn capabilities(&self) -> BTreeSet<SessionRuntimeCapability> {
         let mut capabilities = BTreeSet::from([SessionRuntimeCapability::Interaction]);
+        capabilities.insert(SessionRuntimeCapability::ModelOverride);
         if self.managers.contains_key(E2B_BACKEND_ID) {
             capabilities.insert(SessionRuntimeCapability::Checkpoint);
         }
@@ -1254,6 +1470,9 @@ impl RuntimeAdapter for PiRuntime {
             }
         }
 
+        // Validate request-supplied model configuration before provisioning a
+        // sandbox. A malformed llm block must have no provider-side effects.
+        let requested_llm = resolve_llm(request.llm.as_ref())?;
         let plan = match &request.state {
             None => self.prepare_cold_start(&request).await?,
             Some(state) => self.prepare_resume(&request, state).await?,
@@ -1268,6 +1487,10 @@ impl RuntimeAdapter for PiRuntime {
             persisted_state,
             destroy_sandbox_on_spawn_failure,
         } = plan;
+        let llm = match requested_llm {
+            Some(config) => Some(config),
+            None => load_llm_config(&session_dir).await?,
+        };
 
         let workspace_root = backend.paths().workspace_root().clone();
         let bridge_token = Uuid::new_v4().to_string();
@@ -1304,6 +1527,13 @@ impl RuntimeAdapter for PiRuntime {
         if let Some(session_file) = &resume_session_file {
             command.arg("--session").arg(session_file);
         }
+        if let Err(error) = configure_pi_launch(&mut command, &session_dir, llm.as_ref()).await {
+            self.bridge.unregister(&bridge_token);
+            if destroy_sandbox_on_spawn_failure {
+                let _ = manager.stop_instance(&request.runtime_id).await;
+            }
+            return Err(error);
+        }
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -1330,9 +1560,11 @@ impl RuntimeAdapter for PiRuntime {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             current_turn: Mutex::new(None),
+            pending_responses: Mutex::new(HashMap::new()),
             bridge_token,
             manager,
             persisted_state,
+            session_dir,
             activity,
         });
 
@@ -1422,6 +1654,7 @@ impl RuntimeAdapter for PiRuntime {
         request: RuntimeLoadRequest,
     ) -> Result<(), SessionDomainError> {
         let state = PiPersistedState::from_opaque(&request.runtime_state)?;
+        let requested_llm = resolve_llm(request.llm.as_ref())?;
         let manager = self
             .managers
             .get(&state.backend_id)
@@ -1451,6 +1684,10 @@ impl RuntimeAdapter for PiRuntime {
             }
         })?;
         copy_dir(&PathBuf::from(&state.pi_session_dir), &session_dir).await?;
+        let llm = match requested_llm {
+            Some(config) => Some(config),
+            None => load_llm_config(&session_dir).await?,
+        };
         let executable = state
             .executable
             .clone()
@@ -1487,6 +1724,11 @@ impl RuntimeAdapter for PiRuntime {
         if let Ok(file) = session_file::latest_complete_turn_file(&session_dir) {
             command.arg("--session").arg(file);
         }
+        if let Err(error) = configure_pi_launch(&mut command, &session_dir, llm.as_ref()).await {
+            self.bridge.unregister(&token);
+            let _ = manager.stop_instance(&request.new_runtime_id).await;
+            return Err(error);
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -1504,12 +1746,14 @@ impl RuntimeAdapter for PiRuntime {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             current_turn: Mutex::new(None),
+            pending_responses: Mutex::new(HashMap::new()),
             bridge_token: token,
             manager,
             persisted_state: PiPersistedState {
                 pi_session_dir: session_dir.to_string_lossy().into_owned(),
                 ..state
             },
+            session_dir,
             activity,
         });
         tokio::spawn(read_events(Arc::clone(&instance), stdout));
@@ -1581,6 +1825,13 @@ impl RuntimeAdapter for PiRuntime {
                 pending_interactions: HashMap::new(),
                 output_sequence: 0,
             });
+        }
+
+        if let Some(config) = resolve_llm(input.llm.as_ref())? {
+            if let Err(error) = configure_instance_llm(&instance, &config).await {
+                instance.current_turn.lock().await.take();
+                return Err(error);
+            }
         }
 
         let command = json!({

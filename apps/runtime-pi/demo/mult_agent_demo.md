@@ -50,8 +50,9 @@ LLM API 配额/限速（两个 agent 共用同一个 DeepSeek key）与 E2B 账�
 ## 运行
 
 ```bash
-# 前置：pi 已装（pi --version），DEEPSEEK_API_KEY 必填，E2B_API_KEY 可选但推荐
-DEEPSEEK_API_KEY=sk-... E2B_API_KEY=e2b_... bash apps/runtime-pi/demo/multi_agent_demo.sh
+# 前置：pi 已装；LLM provider/model/key 由 demo 的 session open 请求传入，E2B_API_KEY 可选但推荐
+XGOVERNOR_DEMO_LLM_PROVIDER=openai XGOVERNOR_DEMO_LLM_MODEL=gpt-4.1-mini \
+XGOVERNOR_DEMO_LLM_KEY=sk-... E2B_API_KEY=e2b_... bash apps/runtime-pi/demo/multi_agent_demo.sh
 
 # 跑完保留 server 进程便于手工复现
 bash apps/runtime-pi/demo/multi_agent_demo.sh --keep-server

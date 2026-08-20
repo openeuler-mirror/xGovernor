@@ -2,7 +2,7 @@
 
 [English](./README.md) | [中文](./README.zh-CN.md)
 
-面向异构 AI agent runtime 的会话控制面（governor）：一个服务端，负责打开、治理、观测 **agent 会话**，而把真正的"思考"交给可插拔的 **agent runtime**（pi、xiaoO、opencode……）。它刻意**不**实现自己的 LLM 决策环路——客户端只面对一份统一的 HTTP + SSE 会话 API；执行环境（本机目录、远程 E2B 沙箱）由沙箱 provider 统一管理；治理（会话租约、孤儿回收、配额、能力门控）内建在服务端。
+xGovernor是一款面向生产、易于使用的多Agent控制面，提供兼容不同异构Agent Runtime 和热插拔各类沙箱后端、插件的灵活能力。
 
 [License](./License) · [Rust](https://www.rust-lang.org/) · [Version]()
 
@@ -18,7 +18,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
-pi --version   # 需要 >= 0.84.2
+pi --version
 ```
 
 桥接扩展的依赖（Node.js >= 22.19.0）：
@@ -27,29 +27,23 @@ pi --version   # 需要 >= 0.84.2
 cd apps/runtime-pi/extension && npm install
 ```
 
-**3. LLM key**（pi 思考时用）
-
-```bash
-export DEEPSEEK_API_KEY=sk-...
-```
+**3. LLM 配置**在创建 session 时传入；server 启动不需要绑定 DeepSeek 或其他 LLM key。
 
 可选：`E2B_API_KEY=e2b_...` 启用远程 E2B 沙箱后端；不设则只有本机 `local` 沙箱。
 
 ## 启动
 
-`xgovernor-server` 同时监听两个面，启动时必须配置 token：
+`xgovernor-server` 启动时根据权限能力拆分为两套监听端口，启动时必须配置环境 token：
 
-| 环境变量 | 默认值 | 含义 |
-|---|---|---|
-| `XGOVERNOR_BIND_ADDR` | `127.0.0.1:8787` | admin 面监听地址（必须是回环地址） |
-| `XGOVERNOR_TENANT_BIND_ADDR` | *(必填，无默认)* | tenant 面监听地址 |
-| `XGOVERNOR_TENANTS_CONFIG_PATH` | `$XGOVERNOR_DATA_DIR/tenants.toml` | 声明式凭证/身份策略文件（见下）；**默认路径**缺失 = dev 模式（每个请求隐式获得 admin 身份）；**显式设置**的路径缺失则 fail-closed 拒绝启动 |
-| `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | SQLite 数据库所在目录（默认也是 `tenants.toml` 所在目录） |
-| `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | 系统临时目录 | 会话工作区根目录 |
-| `E2B_API_KEY` | *(未设置)* | 设置后注册 `e2b` 远程沙箱后端 |
-| `DEEPSEEK_API_KEY` 等 | *(未设置)* | 透传给 pi 子进程的 LLM key |
 
-凭证与角色配置在 `tenants.toml` 文件里（`docs/tenancy_design.md` §4），启动时加载，支持 `SIGHUP` 热重载——轮换 token 或新增租户不需要重启：
+| 环境变量                               | 默认值        | 含义                  |
+| ---------------------------------- | ---------- | ------------------- |
+| `XGOVERNOR_TENANT_BIND_ADDR`       | *(必填，无默认)* | tenant 面监听地址        |
+| `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | *(必填，无默认)* | 会话工作区根目录            |
+| `E2B_API_KEY`                      | *(未设置)*    | 设置后注册 `e2b` 远程沙箱后端  |
+
+
+凭证与角色配置在 `tenants.toml` 文件里，默认位置~/.xgovernor/tenants.toml，启动时加载，支持 `SIGHUP` 热重载——轮换 token 或新增租户不需要重启：
 
 ```toml
 [admin]
@@ -76,11 +70,14 @@ tokens = ["demo-admin-token"]
 tenant_id = "demo-tenant"
 tokens = ["demo-tenant-token"]
 EOF
-export DEEPSEEK_API_KEY=sk-...
 cargo run -p xgovernor-server
 ```
 
+
+
 ## 最小跑通一个 case
+
+
 
 ### admin 面（管理端）
 
@@ -96,6 +93,11 @@ curl -s localhost:8787/api/v1/sessions/open -H 'content-type: application/json' 
   "conversation_id": "demo",
   "sender_id": "me",
   "workspace": { "kind": "daemon_default" },
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "api_key": "sk-..."
+  },
   "ext": { "runtime_pi": { "backend_id": "local" } }
 }'
 # 记下响应里的 runtime_id
@@ -137,6 +139,7 @@ curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' 
   "conversation_id": "demo",
   "sender_id": "me",
   "workspace": { "kind": "git", "url": "https://github.com/example/repo.git" },
+  "llm": { "provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-..." },
   "ext": { "runtime_pi": { "backend_id": "e2b" } }
 }'
 # 记下响应里的 runtime_id；沙箱内会先 git clone 该仓库再作为工作区
@@ -148,33 +151,26 @@ curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' 
 
 没有运行时管理 API——新增租户就是改配置文件 + 热重载：
 
-1. **编辑 `tenants.toml`**（默认 `~/.xgovernor/tenants.toml`），加一个 `[[tenant]]` 块：
-
-   ```toml
+1. **编辑** `tenants.toml`（默认 `~/.xgovernor/tenants.toml`），加一个 `[[tenant]]` 块：
+  ```toml
    [[tenant]]
    tenant_id = "acme"                        # 必填，不能与其他租户重复
    tokens = ["acme-token-1", "acme-token-2"] # 必填，至少一个；全局唯一（不能与任何 admin token 重复）
    principal = "acme-ops"                    # 可选，默认 "tenant"
    max_sessions = 20                         # 可选，默认不限
    max_requests_per_minute = 120             # 可选，默认不限
-   ```
-
+  ```
    一个租户可以配多个 token（轮换用）；同一个 token 只能属于一个身份。
-
 2. **热重载，无需重启**：
-
-   ```bash
+  ```bash
    kill -HUP <xgovernor-server pid>
-   ```
-
+  ```
    服务重读文件并整体替换 token 表，两个监听面同时生效。重载失败（TOML 解析错误、token / tenant_id 重复、空 tokens 列表）时**保留旧配置**并打错误日志；Windows 或 dev 模式启动的服务没有热重载，需重启。
-
 3. **验证新租户**：
-
-   ```bash
+  ```bash
    curl -s localhost:8788/api/v1/health -H 'Authorization: Bearer acme-token-1'
    # → 200 生效；401 说明 token 未被识别
-   ```
+  ```
 
 删除租户 = 删掉对应的 `[[tenant]]` 块再热重载（注意整体替换语义：确认新文件完整再触发重载）。
 
@@ -183,6 +179,8 @@ curl -s localhost:8788/api/v1/sessions/open -H 'content-type: application/json' 
 ```bash
 cargo test --workspace
 ```
+
+
 
 ## 许可证
 

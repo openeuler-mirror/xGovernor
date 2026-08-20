@@ -34,6 +34,25 @@ fn record_launch_args_if_session_dir_present() {
     }
 }
 
+fn record_command(command: &serde_json::Value) {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(session_dir) = args
+        .iter()
+        .position(|arg| arg == "--session-dir")
+        .and_then(|index| args.get(index + 1))
+    else {
+        return;
+    };
+    let path = std::path::Path::new(session_dir).join("fake_pi_commands.jsonl");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{command}");
+    }
+}
+
 fn main() {
     record_launch_args_if_session_dir_present();
 
@@ -62,8 +81,19 @@ fn main() {
     // consumes from it while a scenario function is blocked in its own
     // `recv_timeout` loop.
     while let Ok(command) = rx.recv() {
+        record_command(&command);
         match command.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "prompt" => handle_prompt(&command, &rx),
+            "set_model" => emit(serde_json::json!({
+                "type": "response",
+                "command": "set_model",
+                "id": command.get("id"),
+                "success": true,
+                "data": {
+                    "provider": command.get("provider"),
+                    "id": command.get("modelId")
+                }
+            })),
             // A stray `abort`/`extension_ui_response` with no scenario
             // currently waiting on it (e.g. arrived after settle) — nothing
             // to do.
@@ -90,6 +120,10 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
         "id": id,
         "success": true
     }));
+
+    if message.starts_with("/xgovernor-model ") {
+        return;
+    }
 
     if message == "trigger-interaction" {
         run_interaction_scenario(&id, rx);

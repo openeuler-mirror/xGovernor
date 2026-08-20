@@ -878,6 +878,32 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionLoadRequest,
     ) -> Result<SessionOpenResponse, SessionDomainError> {
+        let resolved_llm = request.llm.as_ref().and_then(|llm| {
+            let provider = llm.provider.as_deref()?.trim();
+            let model = llm.model.as_deref()?.trim();
+            if provider.is_empty() || model.is_empty() {
+                return None;
+            }
+            Some(crate::ResolvedLlm {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                api_base: llm.api_base.clone(),
+                credential_source: llm
+                    .api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(|_| "request".to_string())
+                    .or_else(|| {
+                        llm.api_key_env
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|name| !name.is_empty())
+                            .map(|name| format!("env:{name}"))
+                    })
+                    .unwrap_or_else(|| "runtime_default".to_string()),
+            })
+        });
         let runtime_id = request
             .runtime_id
             .unwrap_or_else(|| self.runtime_ids.next_runtime_id());
@@ -929,7 +955,7 @@ impl SessionApplication {
             isolation: checkpoint.isolation,
             capabilities: checkpoint.capabilities,
             runtime: checkpoint.runtime_state,
-            llm: None,
+            llm: resolved_llm,
             lease: None,
             lineage: Some(CheckpointLineage {
                 parent_runtime_id: None,

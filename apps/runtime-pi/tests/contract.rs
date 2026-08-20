@@ -22,8 +22,9 @@ mod support;
 
 use serde_json::{json, Value};
 use session_protocol::{
-    SessionExtensions, SessionInteractionAnswer, SessionOpenRequest, SessionToolActivityPhase,
-    SessionToolActivityStatus, SessionTurnOutcome, SessionTurnRequest,
+    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionOpenRequest,
+    SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
+    SessionTurnOutcome, SessionTurnRequest,
 };
 use std::time::{Duration, Instant};
 use support::{
@@ -36,6 +37,188 @@ use xgovernor_core::{
     SecurityContext, SessionDomainError,
 };
 use xgovernor_runtime_pi::EXT_NAMESPACE;
+
+fn llm(provider: &str, model: &str, api_key: &str) -> LlmOverrideRequest {
+    LlmOverrideRequest {
+        provider: Some(provider.into()),
+        model: Some(model.into()),
+        api_base: None,
+        api_key_env: None,
+        api_key: Some(api_key.into()),
+    }
+}
+
+#[tokio::test]
+async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = new_pi_runtime();
+    assert!(runtime
+        .capabilities()
+        .contains(&SessionRuntimeCapability::ModelOverride));
+
+    runtime
+        .start(RuntimeStartRequest {
+            runtime_id: "runtime-llm".into(),
+            conversation_id: "conversation-llm".into(),
+            sender_id: "sender-llm".into(),
+            workspace: workspace_facts(workspace.path().to_str().unwrap()),
+            state: None,
+            llm: Some(llm("openai", "gpt-4.1-mini", "open-key")),
+            owner_ref: "admin".into(),
+            ext: pi_runtime_ext(),
+        })
+        .await
+        .expect("start must accept a caller-selected provider/model");
+
+    let mut events = runtime
+        .submit_turn(RuntimeTurnInput {
+            runtime_id: "runtime-llm".into(),
+            turn_id: "turn-llm".into(),
+            text: "hello-after-switch".into(),
+            entry: no_entry(),
+            llm: Some(llm("anthropic", "claude-test-model", "anthropic-key")),
+            reasoning_effort: None,
+            ext: Default::default(),
+        })
+        .await
+        .expect("turn must switch to the caller-selected provider/model");
+    while let Some(event) = events.recv().await {
+        if matches!(
+            event,
+            RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
+        ) {
+            break;
+        }
+    }
+
+    let state = runtime
+        .export_state("runtime-llm")
+        .await
+        .expect("runtime state must be exportable");
+    let session_dir = std::path::PathBuf::from(
+        state
+            .state
+            .get("pi_session_dir")
+            .and_then(Value::as_str)
+            .expect("runtime state must carry its pi session directory"),
+    );
+    let launch_args: Vec<String> = serde_json::from_slice(
+        &std::fs::read(session_dir.join("fake_pi_launch_args.json")).expect("launch args"),
+    )
+    .expect("launch args JSON");
+    let flag_value = |flag: &str| {
+        launch_args
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| launch_args.get(index + 1))
+            .map(String::as_str)
+    };
+    assert_eq!(flag_value("--provider"), Some("openai"));
+    assert_eq!(flag_value("--model"), Some("gpt-4.1-mini"));
+    assert_eq!(flag_value("--api-key"), Some("open-key"));
+
+    let commands: Vec<Value> = std::fs::read_to_string(session_dir.join("fake_pi_commands.jsonl"))
+        .expect("command log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("command JSON"))
+        .collect();
+    assert!(commands[0]
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.starts_with("/xgovernor-model ")));
+    assert_eq!(
+        commands[1].get("type").and_then(Value::as_str),
+        Some("set_model")
+    );
+    assert_eq!(
+        commands[1].get("provider").and_then(Value::as_str),
+        Some("anthropic")
+    );
+    assert_eq!(
+        commands[1].get("modelId").and_then(Value::as_str),
+        Some("claude-test-model")
+    );
+    assert_eq!(
+        commands[2].get("message").and_then(Value::as_str),
+        Some("hello-after-switch")
+    );
+
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(session_dir.join(".xgovernor-llm.json")).expect("persisted llm config"),
+    )
+    .expect("persisted llm JSON");
+    assert_eq!(persisted["provider"], "anthropic");
+    assert_eq!(persisted["model"], "claude-test-model");
+    runtime.stop("runtime-llm").await.ok();
+}
+
+#[tokio::test]
+async fn llm_override_requires_explicit_provider_and_model() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = new_pi_runtime();
+    let error = runtime
+        .start(RuntimeStartRequest {
+            runtime_id: "runtime-invalid-llm".into(),
+            conversation_id: "conversation".into(),
+            sender_id: "sender".into(),
+            workspace: workspace_facts(workspace.path().to_str().unwrap()),
+            state: None,
+            llm: Some(LlmOverrideRequest {
+                model: Some("some-model".into()),
+                ..Default::default()
+            }),
+            owner_ref: "admin".into(),
+            ext: pi_runtime_ext(),
+        })
+        .await
+        .expect_err("missing provider must fail closed");
+    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+}
+
+#[tokio::test]
+async fn api_base_creates_a_session_isolated_openai_compatible_provider() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = new_pi_runtime();
+    runtime
+        .start(RuntimeStartRequest {
+            runtime_id: "runtime-custom-base".into(),
+            conversation_id: "conversation".into(),
+            sender_id: "sender".into(),
+            workspace: workspace_facts(workspace.path().to_str().unwrap()),
+            state: None,
+            llm: Some(LlmOverrideRequest {
+                provider: Some("my-gateway".into()),
+                model: Some("my-model".into()),
+                api_base: Some("https://llm.example.test/v1".into()),
+                api_key: Some("gateway-key".into()),
+                api_key_env: None,
+            }),
+            owner_ref: "admin".into(),
+            ext: pi_runtime_ext(),
+        })
+        .await
+        .expect("custom OpenAI-compatible endpoint must start");
+
+    let state = runtime.export_state("runtime-custom-base").await.unwrap();
+    let session_dir = std::path::Path::new(state.state["pi_session_dir"].as_str().unwrap());
+    let models: Value = serde_json::from_slice(
+        &std::fs::read(session_dir.join(".pi-agent/models.json")).expect("models.json"),
+    )
+    .expect("models JSON");
+    assert_eq!(
+        models["providers"]["my-gateway"]["baseUrl"],
+        "https://llm.example.test/v1"
+    );
+    assert_eq!(
+        models["providers"]["my-gateway"]["api"],
+        "openai-completions"
+    );
+    assert_eq!(
+        models["providers"]["my-gateway"]["models"][0]["id"],
+        "my-model"
+    );
+    runtime.stop("runtime-custom-base").await.ok();
+}
 
 #[tokio::test]
 async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_completes() {

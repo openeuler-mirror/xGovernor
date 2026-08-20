@@ -9,10 +9,10 @@
 #
 # 两个 turn 背靠背提交、两条 SSE 流并发拉取，验证「互不影响、各自执行」：
 # 每个会话有独立的 pi 子进程、独立的桥接层 token、独立的沙箱/工作区，
-# 唯一共享的是 DeepSeek API 配额与 daemon 主机本身。
+# 唯一共享的是调用方所选 LLM 的 API 配额与 daemon 主机本身。
 #
 # 用法：
-#   DEEPSEEK_API_KEY=sk-... E2B_API_KEY=e2b_... bash apps/runtime-pi/demo/multi_agent_demo.sh
+#   XGOVERNOR_DEMO_LLM_KEY=sk-... E2B_API_KEY=e2b_... bash apps/runtime-pi/demo/multi_agent_demo.sh
 #   bash apps/runtime-pi/demo/multi_agent_demo.sh --keep-server   # 跑完后保留 server 进程
 #
 # 可调环境变量：
@@ -21,6 +21,7 @@
 #   XGOVERNOR_DEMO_TIMEOUT_S  单个 agent 的等待上限（秒，默认 600）
 #   XGOVERNOR_DEMO_ROOT       演示数据目录（默认 mktemp）
 #   PROMPT_A / PROMPT_B       覆盖两个 agent 的 prompt
+#   XGOVERNOR_DEMO_LLM_PROVIDER / XGOVERNOR_DEMO_LLM_MODEL / XGOVERNOR_DEMO_LLM_KEY
 #
 # 配套文档：apps/runtime-pi/demo/mult_agent_demo.md
 set -euo pipefail
@@ -46,6 +47,9 @@ if [[ "${1:-}" == "--keep-server" ]]; then KEEP_SERVER=1; fi
 
 PROMPT_A="${PROMPT_A:-请分析当前 git 仓库（工作区根目录）的主要作用：阅读 README.md 和 README.zh-CN.md、crates/ 与 apps/ 的目录结构，然后给出一份简洁的中文总结——这个项目是做什么的、核心架构是什么、当前完成度如何。只读分析：不要修改任何文件，不要运行可能产生副作用的命令。}"
 PROMPT_B="${PROMPT_B:-请查询今天 A 股大盘的涨跌情况。用 bash + curl 获取上证指数、深证成指、创业板指的实时行情，例如：curl -s 'https://qt.gtimg.cn/q=sh000001,sz399001,sz399006'（返回 GBK 编码，可用 iconv -f gbk -t utf-8 转码），也可以尝试东方财富等公开行情接口。以实际返回的数据为准报告涨跌点数与百分比；数据拿不到就如实说明，不要编造。}"
+LLM_PROVIDER="${XGOVERNOR_DEMO_LLM_PROVIDER:-openai}"
+LLM_MODEL="${XGOVERNOR_DEMO_LLM_MODEL:-gpt-4.1-mini}"
+LLM_KEY="${XGOVERNOR_DEMO_LLM_KEY:-}"
 
 API_URL="http://$ADMIN_ADDR/api/v1"
 AUTH="Authorization: Bearer $ADMIN_TOKEN"
@@ -103,8 +107,8 @@ if ! command -v pi >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then fail "需要 jq"; exit 1; fi
-if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
-  fail "DEEPSEEK_API_KEY 未设置（pi 的 LLM key，见 easydemo.md §0.1）"
+if [[ -z "$LLM_KEY" ]]; then
+  fail "XGOVERNOR_DEMO_LLM_KEY 未设置（每个 session 自选 LLM，见 easydemo.md §0.1）"
   exit 1
 fi
 ok "pi $(pi --version 2>/dev/null | head -1)"
@@ -185,6 +189,7 @@ open_a=$(api_post "sessions/open" "{
   \"conversation_id\": \"two-agent-repo\",
   \"sender_id\": \"demo-user\",
   \"workspace\": { \"kind\": \"local_path\", \"path\": \"$REPO_DIR\" },
+  \"llm\": { \"provider\": \"$LLM_PROVIDER\", \"model\": \"$LLM_MODEL\", \"api_key\": \"$LLM_KEY\" },
   \"ext\": { \"runtime_pi\": { \"backend_id\": \"local\" } }
 }")
 RID_A=$(printf '%s' "$open_a" | jq -r '.runtime_id // empty')
@@ -196,6 +201,7 @@ open_b=$(api_post "sessions/open" "{
   \"conversation_id\": \"two-agent-stock\",
   \"sender_id\": \"demo-user\",
   \"workspace\": { \"kind\": \"daemon_default\" },
+  \"llm\": { \"provider\": \"$LLM_PROVIDER\", \"model\": \"$LLM_MODEL\", \"api_key\": \"$LLM_KEY\" },
   \"ext\": { \"runtime_pi\": { \"backend_id\": \"$([[ $E2B_CONFIGURED == 1 ]] && echo e2b || echo local)\" } }
 }")
 RID_B=$(printf '%s' "$open_b" | jq -r '.runtime_id // empty')
