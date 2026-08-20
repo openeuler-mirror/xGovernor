@@ -103,6 +103,9 @@ cargo run -p xgovernor-server
 | `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | Directory holding the SQLite database (and, by default, `tenants.toml`) |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | OS temp dir | Workspace root for `workspace: daemon_default` |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
+| `E2B_API_URL` | `https://api.e2b.app` | E2B control-plane URL; set this for self-hosted E2B |
+| `E2B_DOMAIN` | `e2b.app` | Sandbox hostname suffix, without a URL scheme; a port is allowed |
+| `E2B_ENVD_SCHEME` | `https` | Sandbox envd URL scheme (`http` or `https`) |
 
 Credentials and roles live in a `tenants.toml` file (`docs/tenancy_design.md` §4), loaded at startup and hot-reloaded on `SIGHUP` — no restart needed to rotate tokens or add a tenant:
 

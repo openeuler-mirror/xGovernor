@@ -106,6 +106,17 @@ EOF
 cargo run -p xgovernor-server
 ```
 
+本地自托管 E2B（控制面 `3000`、sandbox 反代 `3002`）可改为：
+
+```bash
+export E2B_API_KEY="<self-hosted-key>"
+export E2B_API_URL="http://127.0.0.1:3000"
+export E2B_DOMAIN="e2b.app:3002"
+export E2B_ENVD_SCHEME="http"
+```
+
+此时 sandbox envd URL 为 `http://49983-<sandbox-id>.e2b.app:3002`；修改环境变量后需要重启 xGovernor。
+
 凭证与身份来自 `tenants.toml`（`docs/tenancy_design.md` §4），启动时加载，`SIGHUP` 热重载；`[[tenant]]` 节的 `max_sessions`/`max_requests_per_minute` 字段省略即视为不限（`apps/server/src/httpserver/tenant_config.rs`）。会话数据（SQLite）默认落在
 `~/.xgovernor/xgovernor.db`，可用 `XGOVERNOR_DATA_DIR` 改路径（`tenants.toml` 的默认路径也跟着搬家，除非另设 `XGOVERNOR_TENANTS_CONFIG_PATH`）——`local`/`e2b` 两个 `InstanceManager` 的 provider-instance ledger 也共享这个文件。
 

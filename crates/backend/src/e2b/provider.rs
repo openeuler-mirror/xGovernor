@@ -46,6 +46,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const E2B_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const E2B_ENVD_SCHEME_ENV: &str = "E2B_ENVD_SCHEME";
+const DEFAULT_ENVD_SCHEME: &str = "https";
 const WORKSPACE_INIT_MAX_ATTEMPTS: usize = 6;
 const WORKSPACE_INIT_BASE_DELAY_MS: u64 = 200;
 const WORKSPACE_INIT_MAX_DELAY_MS: u64 = 2_000;
@@ -226,11 +228,7 @@ impl E2bProvider {
             .or_else(|| Some(BackendPath(DEFAULT_HOME_DIR.to_string())));
         let temp_root = backend_path(options.temp_root.as_deref().unwrap_or(DEFAULT_TEMP_ROOT))?;
         let envd_port = options.envd_port.unwrap_or(DEFAULT_ENVD_PORT);
-        let envd_scheme = options
-            .envd_scheme
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "https".to_string());
+        let envd_scheme = resolve_envd_scheme(&options)?;
         let timeout_secs = options
             .timeout_secs
             .or_else(|| resource_limits.timeout_ms.map(|ms| ms / 1000))
@@ -469,11 +467,7 @@ impl E2bProvider {
             .or_else(|| Some(BackendPath(DEFAULT_HOME_DIR.to_string())));
         let temp_root = backend_path(options.temp_root.as_deref().unwrap_or(DEFAULT_TEMP_ROOT))?;
         let envd_port = options.envd_port.unwrap_or(DEFAULT_ENVD_PORT);
-        let envd_scheme = options
-            .envd_scheme
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "https".to_string());
+        let envd_scheme = resolve_envd_scheme(&options)?;
 
         let state = Arc::new(E2bBackendState {
             backend_id: instance.backend_id.0.clone(),
@@ -1386,6 +1380,27 @@ fn resolve_connection_options(
     resolve_connection_options_from_values(options, api_url_env.as_deref(), domain_env.as_deref())
 }
 
+fn resolve_envd_scheme(options: &E2bProviderOptions) -> Result<String, ProviderControlError> {
+    let env_value = std::env::var(E2B_ENVD_SCHEME_ENV).ok();
+    resolve_envd_scheme_from_value(options, env_value.as_deref())
+}
+
+fn resolve_envd_scheme_from_value(
+    options: &E2bProviderOptions,
+    env_value: Option<&str>,
+) -> Result<String, ProviderControlError> {
+    let scheme = non_empty(options.envd_scheme.as_deref())
+        .or_else(|| non_empty(env_value))
+        .unwrap_or(DEFAULT_ENVD_SCHEME)
+        .to_ascii_lowercase();
+    match scheme.as_str() {
+        "http" | "https" => Ok(scheme),
+        _ => Err(ProviderControlError::InvalidRequest {
+            message: format!("invalid e2b envd scheme {scheme:?}; expected 'http' or 'https'"),
+        }),
+    }
+}
+
 fn resolve_connection_options_from_values(
     options: &E2bProviderOptions,
     api_url_env: Option<&str>,
@@ -2223,6 +2238,36 @@ mod tests {
 
         assert_eq!(connection.api_base, "https://control.internal.example.com/");
         assert_eq!(connection.sandbox_domain, "sandboxes.internal.example.com");
+    }
+
+    #[test]
+    fn envd_scheme_defaults_to_https_and_accepts_environment_http() {
+        let options = parse_options(&json!({})).expect("options");
+        assert_eq!(
+            resolve_envd_scheme_from_value(&options, None).expect("default scheme"),
+            "https"
+        );
+        assert_eq!(
+            resolve_envd_scheme_from_value(&options, Some(" HTTP ")).expect("environment scheme"),
+            "http"
+        );
+    }
+
+    #[test]
+    fn explicit_envd_scheme_overrides_environment_and_invalid_values_are_rejected() {
+        let options = parse_options(&json!({ "envd_scheme": "https" })).expect("options");
+        assert_eq!(
+            resolve_envd_scheme_from_value(&options, Some("http")).expect("explicit scheme"),
+            "https"
+        );
+
+        let options = parse_options(&json!({})).expect("options");
+        let error = resolve_envd_scheme_from_value(&options, Some("ftp"))
+            .expect_err("unsupported scheme must be rejected");
+        let ProviderControlError::InvalidRequest { message } = error else {
+            panic!("expected InvalidRequest error, got {error:?}");
+        };
+        assert!(message.contains("expected 'http' or 'https'"));
     }
 
     #[test]
