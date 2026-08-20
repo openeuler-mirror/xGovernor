@@ -41,6 +41,9 @@ cd apps/runtime-pi/extension && npm install
 | `XGOVERNOR_TENANT_BIND_ADDR`       | *(必填，无默认)* | tenant 面监听地址        |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | *(必填，无默认)* | 会话工作区根目录            |
 | `E2B_API_KEY`                      | *(未设置)*    | 设置后注册 `e2b` 远程沙箱后端  |
+| `E2B_API_URL`                      | `https://api.e2b.app` | E2B 控制面地址；自托管 E2B 时覆盖 |
+| `E2B_DOMAIN`                       | `e2b.app` | 沙箱域名后缀（不带协议，可带端口） |
+| `E2B_ENVD_SCHEME`                  | `https` | 沙箱 envd 的协议：`http` 或 `https` |
 
 
 凭证与角色配置在 `tenants.toml` 文件里，默认位置~/.xgovernor/tenants.toml，启动时加载，支持 `SIGHUP` 热重载——轮换 token 或新增租户不需要重启：
