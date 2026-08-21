@@ -421,6 +421,13 @@ where
 
 #[tokio::main]
 async fn main() {
+    if std::env::args_os().any(|arg| arg == "--worker") {
+        if let Err(error) = xgovernor_runtime_xiaoo::worker::run_worker_from_env().await {
+            eprintln!("xiaoo worker failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let _log_guard = install_logging(&xgovernor_data_dir());
 
     let admin_bind_addr =
