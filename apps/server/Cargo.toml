@@ -33,6 +33,7 @@ backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }
 xgovernor-runtime-pi = { path = "../runtime-pi" }
+xgovernor-runtime-xiaoo = { path = "../runtime-xiaoo" }
 dirs.workspace = true
 
 [dev-dependencies]

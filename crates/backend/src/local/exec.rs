@@ -458,6 +458,7 @@ mod linux_bubblewrap_tests {
                 cwd: Some(BackendPath(cwd.to_string_lossy().into_owned())),
                 timeout_ms: Some(5_000),
                 env: None,
+                extra: None,
             })
             .await
             .unwrap()
@@ -515,6 +516,7 @@ mod pipe_drain_tests {
                     cwd: Some(BackendPath(workspace.to_string_lossy().into_owned())),
                     timeout_ms: Some(2_000),
                     env: None,
+                    extra: None,
                 })
                 .await
                 .unwrap()
@@ -567,6 +569,7 @@ mod pipe_drain_tests {
                     cwd: Some(BackendPath(workspace.to_string_lossy().into_owned())),
                     timeout_ms: Some(5_000),
                     env: None,
+                    extra: None,
                 })
                 .await
                 .unwrap()

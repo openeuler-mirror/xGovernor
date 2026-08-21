@@ -1,0 +1,30 @@
+[package]
+name = "xgovernor-runtime-xiaoo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio-util.workspace = true
+uuid.workspace = true
+session-protocol = { path = "../../crates/protocol/session" }
+provider-protocol = { path = "../../crates/protocol/provider" }
+operation-protocol = { path = "../../crates/protocol/operation" }
+xgovernor-core = { path = "../../crates/core" }
+xgovernor-manager = { path = "../../crates/manager" }
+xiaoo-api.workspace = true
+xiaoo-core.workspace = true
+llm-client.workspace = true
+agent-types.workspace = true
+agent-contracts.workspace = true
+compact.workspace = true
+prompt.workspace = true
+tool.workspace = true
+
+[dev-dependencies]
+backend = { path = "../../crates/backend" }
+tempfile.workspace = true

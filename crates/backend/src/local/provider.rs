@@ -572,6 +572,7 @@ mod tests {
                 cwd: None,
                 timeout_ms: Some(5_000),
                 env: None,
+                extra: None,
             })
             .await
             .unwrap();

@@ -3,6 +3,7 @@ members = [
     "apps/server",
     "apps/runtime-mock",
     "apps/runtime-pi",
+    "apps/runtime-xiaoo",
     "crates/protocol/provider",
     "crates/protocol/session",
     "crates/protocol/operation",
@@ -55,6 +56,14 @@ aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 url = "2.5"
+xiaoo-api = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+xiaoo-core = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+llm-client = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+agent-types = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+agent-contracts = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+compact = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+prompt = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
+tool = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "1ffe0952852226c36ecd998b8f088c7f59e7200e" }
 # Cerberus dependencies (disabled by default)
 # cerberus-core = { path = "crates/cerberus/cerberus-core" }
 

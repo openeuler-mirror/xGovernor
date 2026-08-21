@@ -13,7 +13,7 @@ use session_protocol::{
     SessionListResponse, SessionLoadRequest, SessionOpenRequest, SessionOpenResponse,
     SessionSubmitReceipt, SessionTurnRequest, TenantQuotaSnapshot,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -23,6 +23,28 @@ pub struct SessionSubmission {
     /// for a duplicate `client_request_id` — the original turn's event stream
     /// (if still unclaimed) is the one to attach to; no new stream exists.
     pub events: Option<mpsc::Receiver<SessionEvent>>,
+}
+
+/// One runtime implementation and the environment normalizer that owns its
+/// provider/workspace admission rules. Keeping the pair together prevents a
+/// session from being normalized with (for example) Pi rules and then
+/// started by xiaoO.
+#[derive(Clone)]
+pub struct RuntimeRegistration {
+    pub adapter: Arc<dyn RuntimeAdapter>,
+    pub environment: Arc<dyn SessionEnvironmentNormalizer>,
+}
+
+impl RuntimeRegistration {
+    pub fn new(
+        adapter: Arc<dyn RuntimeAdapter>,
+        environment: Arc<dyn SessionEnvironmentNormalizer>,
+    ) -> Self {
+        Self {
+            adapter,
+            environment,
+        }
+    }
 }
 
 /// How long the event-forwarding task waits for the subscriber to drain one
@@ -113,11 +135,11 @@ impl TurnGate {
 
 #[derive(Clone)]
 pub struct SessionApplication {
-    runtime: Arc<dyn RuntimeAdapter>,
+    runtimes: Arc<BTreeMap<String, RuntimeRegistration>>,
+    default_runtime_kind: Arc<str>,
     records: Arc<dyn SessionRepository>,
     turn_ids: Arc<dyn TurnIdGenerator>,
     runtime_ids: Arc<dyn RuntimeIdGenerator>,
-    environment: Arc<dyn SessionEnvironmentNormalizer>,
     clock: Arc<dyn Clock>,
     /// `None` (the `new()` default) leaves lease enforcement off, matching
     /// today's behavior exactly. `Some` opts every lease-gated method
@@ -141,17 +163,76 @@ impl SessionApplication {
         environment: Arc<dyn SessionEnvironmentNormalizer>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self {
-            runtime,
+        let default_runtime_kind = runtime.kind().to_string();
+        Self::with_runtime_registry(
+            default_runtime_kind,
+            [RuntimeRegistration::new(runtime, environment)],
             records,
             turn_ids,
             runtime_ids,
-            environment,
+            clock,
+        )
+        .expect("single runtime registration is valid")
+    }
+
+    /// Construct an application that can host multiple runtime kinds in one
+    /// process. `default_runtime_kind` is used only for new open requests
+    /// that omit `runtime_kind`; persisted sessions are always routed by
+    /// `OpaqueRuntimeState.runtime_kind`.
+    pub fn with_runtime_registry(
+        default_runtime_kind: impl Into<String>,
+        registrations: impl IntoIterator<Item = RuntimeRegistration>,
+        records: Arc<dyn SessionRepository>,
+        turn_ids: Arc<dyn TurnIdGenerator>,
+        runtime_ids: Arc<dyn RuntimeIdGenerator>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, SessionDomainError> {
+        let default_runtime_kind = default_runtime_kind.into();
+        let mut runtimes = BTreeMap::new();
+        for registration in registrations {
+            let kind = registration.adapter.kind().trim().to_string();
+            if kind.is_empty() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "runtime adapter kind must not be empty".into(),
+                });
+            }
+            if runtimes.insert(kind.clone(), registration).is_some() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: format!("duplicate runtime adapter kind: {kind}"),
+                });
+            }
+        }
+        if !runtimes.contains_key(&default_runtime_kind) {
+            return Err(SessionDomainError::InvalidRequest {
+                message: format!("default runtime kind '{default_runtime_kind}' is not registered"),
+            });
+        }
+        Ok(Self {
+            runtimes: Arc::new(runtimes),
+            default_runtime_kind: Arc::from(default_runtime_kind),
+            records,
+            turn_ids,
+            runtime_ids,
             clock,
             lease_table: None,
             turn_gate: Arc::new(TurnGate::default()),
             tenant_sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
+    }
+
+    fn registration(&self, kind: &str) -> Result<&RuntimeRegistration, SessionDomainError> {
+        self.runtimes
+            .get(kind)
+            .ok_or_else(|| SessionDomainError::InvalidRequest {
+                message: format!("unknown runtime_kind '{kind}'"),
+            })
+    }
+
+    fn registration_for_record(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<&RuntimeRegistration, SessionDomainError> {
+        self.registration(&record.runtime.runtime_kind)
     }
 
     /// Opt in to `SessionLeaseTable`-backed single-writer enforcement
@@ -248,6 +329,16 @@ impl SessionApplication {
             if !ctx.owns(record.tenant_id.as_deref()) {
                 return Err(SessionDomainError::NotFound { runtime_id });
             }
+            if let Some(requested_kind) = request.runtime_kind.as_deref() {
+                if requested_kind != record.runtime.runtime_kind {
+                    return Err(SessionDomainError::Conflict {
+                        message: format!(
+                            "session runtime_kind is '{}', not requested '{}'",
+                            record.runtime.runtime_kind, requested_kind
+                        ),
+                    });
+                }
+            }
             self.ensure_runtime_attached(ctx, &record).await?;
             // `ensure_runtime_attached` already persisted a `running` ->
             // `idle` restoration fallback (§1.3); mirror it onto this local
@@ -259,7 +350,13 @@ impl SessionApplication {
             return Ok(project_session(&record));
         }
 
-        let normalized = self.environment.normalize(ctx, &request).await?;
+        let runtime_kind = request
+            .runtime_kind
+            .as_deref()
+            .unwrap_or(&self.default_runtime_kind);
+        let registration = self.registration(runtime_kind)?;
+        let runtime = Arc::clone(&registration.adapter);
+        let normalized = registration.environment.normalize(ctx, &request).await?;
 
         // Fail-closed second gate (`docs/tenancy_design.md` §0/§7 step 2):
         // deliberately independent of whatever `self.environment.normalize`
@@ -288,7 +385,7 @@ impl SessionApplication {
             }
         }
 
-        let runtime_wire_capabilities = self.runtime.capabilities();
+        let runtime_wire_capabilities = runtime.capabilities_for_request(&request);
         for requested in &request.requested_capabilities.sandbox {
             if !normalized
                 .sandbox_capabilities
@@ -319,8 +416,7 @@ impl SessionApplication {
         }
 
         let now = self.clock.now_ms();
-        if let Err(error) = self
-            .runtime
+        if let Err(error) = runtime
             .start(RuntimeStartRequest {
                 runtime_id: runtime_id.clone(),
                 conversation_id: request.conversation_id.clone(),
@@ -340,15 +436,15 @@ impl SessionApplication {
         }
 
         // Reuse the pre-existing runtime-state quarantine slot
-        let runtime_state = match self.runtime.export_state(&runtime_id).await {
+        let runtime_state = match runtime.export_state(&runtime_id).await {
             Ok(state) => state,
             Err(SessionDomainError::UnsupportedCapability { .. }) => OpaqueRuntimeState {
-                runtime_kind: self.runtime.kind().into(),
+                runtime_kind: runtime.kind().into(),
                 schema_version: 1,
                 state: serde_json::Value::Null,
             },
             Err(error) => {
-                let _ = self.runtime.stop(&runtime_id).await;
+                let _ = runtime.stop(&runtime_id).await;
                 if let Some(tenant_id) = &tenant_id_for_quota {
                     self.release_tenant_session(tenant_id);
                 }
@@ -381,7 +477,7 @@ impl SessionApplication {
             created_by: ctx.principal.clone(),
         };
         if let Err(error) = self.records.save(record.clone()).await {
-            let _ = self.runtime.stop(&record.runtime_id).await;
+            let _ = runtime.stop(&record.runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -410,6 +506,7 @@ impl SessionApplication {
     ) -> Result<SessionSubmission, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
         self.ensure_runtime_attached(ctx, &record).await?;
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
         if request.llm.is_some()
@@ -458,8 +555,7 @@ impl SessionApplication {
             });
         }
 
-        let submitted = self
-            .runtime
+        let submitted = runtime
             .submit_turn(RuntimeTurnInput {
                 runtime_id: runtime_id.clone(),
                 turn_id: turn_id.clone(),
@@ -494,19 +590,60 @@ impl SessionApplication {
         let event_runtime_id = runtime_id.clone();
         let event_turn_id = turn_id.clone();
         let gate = Arc::clone(&self.turn_gate);
-        let cancel_runtime = Arc::clone(&self.runtime);
-        // TODO(state-persistence): when restart recovery enters scope, retain
-        // the runtime/repository handles here and, before forwarding a terminal
-        // event, export the adapter state, update the SessionRecord, and save it
-        // through a durable SessionRepository implementation.
+        let cancel_runtime = Arc::clone(&runtime);
+        let state_runtime = Arc::clone(&runtime);
+        let records = Arc::clone(&self.records);
+        let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
             let mut terminal_seen = false;
             let mut subscriber_abandoned = false;
-            while let Some(event) = runtime_events.recv().await {
+            while let Some(mut event) = runtime_events.recv().await {
                 let terminal = matches!(
                     event,
                     crate::RuntimeEvent::Completed { .. } | crate::RuntimeEvent::Failed { .. }
                 );
+                // A terminal event is the durability boundary: persist the
+                // runtime's latest opaque state before allowing a client to
+                // observe completion. This makes a successful terminal event
+                // a reliable restart-recovery point for every adapter that
+                // implements state export.
+                if terminal {
+                    let persisted = async {
+                        let state = match state_runtime.export_state(&event_runtime_id).await {
+                            Ok(state) => Some(state),
+                            Err(SessionDomainError::UnsupportedCapability { .. }) => None,
+                            Err(error) => return Err(error),
+                        };
+                        let mut record =
+                            records.get(&event_runtime_id).await?.ok_or_else(|| {
+                                SessionDomainError::NotFound {
+                                    runtime_id: event_runtime_id.clone(),
+                                }
+                            })?;
+                        if let Some(state) = state {
+                            record.runtime = state;
+                        }
+                        record.status = match &event {
+                            crate::RuntimeEvent::Completed { .. } => SessionStatus::Idle,
+                            crate::RuntimeEvent::Failed { .. } => SessionStatus::Failed,
+                            _ => unreachable!("guarded by terminal match"),
+                        };
+                        record.updated_at_ms = clock.now_ms();
+                        records.save(record).await
+                    }
+                    .await;
+                    if let Err(error) = persisted {
+                        event = crate::RuntimeEvent::Failed {
+                            error: crate::RuntimeFailure {
+                                code: "runtime_state_persist_failed".into(),
+                                message: error.to_string(),
+                                retryable: true,
+                                details: serde_json::Value::Null,
+                            },
+                            usage: session_protocol::SessionUsage::default(),
+                        };
+                    }
+                }
                 let sent = tokio::time::timeout(
                     FORWARD_SEND_TIMEOUT,
                     tx.send(project_runtime_event(
@@ -594,7 +731,8 @@ impl SessionApplication {
         {
             return Err(unsupported_runtime_capability("interaction"));
         }
-        self.runtime
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        runtime
             .answer_interaction(RuntimeInteractionInput {
                 runtime_id: request.runtime_id.clone(),
                 turn_id: request.turn_id.clone(),
@@ -637,7 +775,8 @@ impl SessionApplication {
         let mut record = self.require_session(ctx, runtime_id).await?;
         self.check_lease_holder(runtime_id, &lease).await?;
 
-        match self.runtime.stop(runtime_id).await {
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        match runtime.stop(runtime_id).await {
             Ok(()) => {}
             Err(SessionDomainError::NotFound { .. })
                 if record.runtime.state != serde_json::Value::Null =>
@@ -648,7 +787,7 @@ impl SessionApplication {
                 // destroy whatever it references directly instead of paying
                 // for a full restore-then-kill round trip through
                 // `ensure_runtime_attached` just to close it right back down.
-                self.runtime
+                runtime
                     .cleanup_from_state(runtime_id, &record.runtime)
                     .await?;
             }
@@ -798,7 +937,8 @@ impl SessionApplication {
     ) -> Result<(), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
         self.ensure_runtime_attached(ctx, &record).await?;
-        self.runtime.cancel(runtime_id, turn_id).await
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        runtime.cancel(runtime_id, turn_id).await
     }
 
     /// Export `request.parent_runtime_id`'s state and start a new runtime
@@ -833,6 +973,7 @@ impl SessionApplication {
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
         if !record
             .capabilities
             .runtime
@@ -847,7 +988,7 @@ impl SessionApplication {
                 capability: "checkpoint".into(),
             });
         }
-        let payload = self.runtime.checkpoint(&request.runtime_id).await?;
+        let payload = runtime.checkpoint(&request.runtime_id).await?;
         let checkpoint_id = payload.checkpoint_id.clone();
         let created_at_ms = self.clock.now_ms();
         self.records
@@ -917,6 +1058,11 @@ impl SessionApplication {
             .ok_or_else(|| SessionDomainError::NotFound {
                 runtime_id: request.checkpoint_id.clone(),
             })?;
+        let runtime = Arc::clone(
+            &self
+                .registration(&checkpoint.runtime_state.runtime_kind)?
+                .adapter,
+        );
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
         if let Some(tenant_id) = &tenant_id_for_quota {
             self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
@@ -925,8 +1071,7 @@ impl SessionApplication {
                     limit,
                 })?;
         }
-        if let Err(error) = self
-            .runtime
+        if let Err(error) = runtime
             .load_from_checkpoint(RuntimeLoadRequest {
                 new_runtime_id: runtime_id.clone(),
                 owner_ref: ctx.owner_ref(),
@@ -966,7 +1111,7 @@ impl SessionApplication {
             created_by: ctx.principal.clone(),
         };
         if let Err(error) = self.records.save(record.clone()).await {
-            let _ = self.runtime.stop(&runtime_id).await;
+            let _ = runtime.stop(&runtime_id).await;
             if let Some(id) = &tenant_id_for_quota {
                 self.release_tenant_session(id);
             }
@@ -1002,7 +1147,12 @@ impl SessionApplication {
         // External resources first, metadata last. If provider/archive
         // cleanup fails, keeping the SQLite row makes the operation
         // discoverable and retryable rather than silently orphaning it.
-        self.runtime
+        let runtime = Arc::clone(
+            &self
+                .registration(&checkpoint.runtime_state.runtime_kind)?
+                .adapter,
+        );
+        runtime
             .delete_checkpoint(
                 checkpoint.runtime_state.clone(),
                 checkpoint.provider_snapshot_id.clone(),
@@ -1025,10 +1175,8 @@ impl SessionApplication {
         let parent = self
             .require_session(ctx, &request.parent_runtime_id)
             .await?;
-        let exported = self
-            .runtime
-            .export_state(&request.parent_runtime_id)
-            .await?;
+        let runtime = Arc::clone(&self.registration_for_record(&parent)?.adapter);
+        let exported = runtime.export_state(&request.parent_runtime_id).await?;
 
         let runtime_id = request
             .runtime_id
@@ -1056,8 +1204,7 @@ impl SessionApplication {
                 })?;
         }
 
-        if let Err(error) = self
-            .runtime
+        if let Err(error) = runtime
             .start(RuntimeStartRequest {
                 runtime_id: runtime_id.clone(),
                 conversation_id: conversation_id.clone(),
@@ -1098,7 +1245,7 @@ impl SessionApplication {
             created_by: ctx.principal.clone(),
         };
         if let Err(error) = self.records.save(record.clone()).await {
-            let _ = self.runtime.stop(&record.runtime_id).await;
+            let _ = runtime.stop(&record.runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -1175,7 +1322,8 @@ impl SessionApplication {
         ctx: &SecurityContext,
         record: &SessionRecord,
     ) -> Result<(), SessionDomainError> {
-        match self.runtime.attach(&record.runtime_id).await {
+        let runtime = Arc::clone(&self.registration_for_record(record)?.adapter);
+        match runtime.attach(&record.runtime_id).await {
             Ok(()) => return Ok(()),
             Err(SessionDomainError::NotFound { .. }) => {}
             Err(error) => return Err(error),
@@ -1187,8 +1335,7 @@ impl SessionApplication {
             });
         }
 
-        if let Err(error) = self
-            .runtime
+        if let Err(error) = runtime
             .start(RuntimeStartRequest {
                 runtime_id: record.runtime_id.clone(),
                 conversation_id: record.conversation_id.clone(),
@@ -1209,7 +1356,7 @@ impl SessionApplication {
             return Err(error);
         }
 
-        if let Err(error) = self.runtime.attach(&record.runtime_id).await {
+        if let Err(error) = runtime.attach(&record.runtime_id).await {
             self.mark_restoration_failed(record, &error).await;
             return Err(error);
         }
@@ -1946,6 +2093,7 @@ mod tests {
                 &admin_ctx(),
                 SessionOpenRequest {
                     runtime_id: None,
+                    runtime_kind: None,
                     conversation_id: "conversation".into(),
                     sender_id: "sender".into(),
                     workspace: Default::default(),
@@ -1971,9 +2119,114 @@ mod tests {
         assert_eq!(started.sender_id, "sender");
     }
 
+    #[tokio::test]
+    async fn runtime_registry_uses_default_and_explicit_kinds() {
+        #[derive(Default)]
+        struct XiaooTestRuntime(CompletingRuntime);
+
+        #[async_trait]
+        impl RuntimeAdapter for XiaooTestRuntime {
+            fn kind(&self) -> &str {
+                "xiaoo"
+            }
+            fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
+                BTreeSet::new()
+            }
+            async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
+                self.0.start(request).await
+            }
+            async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
+                self.0.stop(runtime_id).await
+            }
+            async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
+                self.0.attach(runtime_id).await
+            }
+            async fn submit_turn(
+                &self,
+                input: RuntimeTurnInput,
+            ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
+                self.0.submit_turn(input).await
+            }
+            async fn answer_interaction(
+                &self,
+                input: RuntimeInteractionInput,
+            ) -> Result<(), SessionDomainError> {
+                self.0.answer_interaction(input).await
+            }
+            async fn cancel(
+                &self,
+                runtime_id: &str,
+                turn_id: Option<&str>,
+            ) -> Result<(), SessionDomainError> {
+                self.0.cancel(runtime_id, turn_id).await
+            }
+        }
+
+        let pi = Arc::new(CompletingRuntime::default());
+        let xiaoo = Arc::new(XiaooTestRuntime::default());
+        let application = SessionApplication::with_runtime_registry(
+            "test",
+            [
+                RuntimeRegistration::new(pi.clone(), Arc::new(TestEnvironment)),
+                RuntimeRegistration::new(xiaoo.clone(), Arc::new(TestEnvironment)),
+            ],
+            Arc::new(MemoryRepository::default()),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+        )
+        .unwrap();
+
+        application
+            .open(&admin_ctx(), open_request(Default::default()))
+            .await
+            .unwrap();
+        assert!(pi.started.lock().await.is_some());
+
+        let unknown = application
+            .open(
+                &admin_ctx(),
+                SessionOpenRequest {
+                    runtime_id: Some("other".into()),
+                    runtime_kind: Some("unknown".into()),
+                    ..open_request(Default::default())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(unknown, SessionDomainError::InvalidRequest { .. }));
+
+        // Use a separate repository so the fixed id from the default-open
+        // branch cannot trigger re-attach instead of a fresh explicit open.
+        let explicit = SessionApplication::with_runtime_registry(
+            "test",
+            [
+                RuntimeRegistration::new(pi, Arc::new(TestEnvironment)),
+                RuntimeRegistration::new(xiaoo.clone(), Arc::new(TestEnvironment)),
+            ],
+            Arc::new(MemoryRepository::default()),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+        )
+        .unwrap();
+        explicit
+            .open(
+                &admin_ctx(),
+                SessionOpenRequest {
+                    runtime_kind: Some("xiaoo".into()),
+                    ..open_request(Default::default())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(xiaoo.0.started.lock().await.is_some());
+    }
+
     fn open_request(workspace: session_protocol::WorkspaceSpec) -> SessionOpenRequest {
         SessionOpenRequest {
             runtime_id: None,
+            runtime_kind: None,
             conversation_id: "conversation".into(),
             sender_id: "sender".into(),
             workspace,
@@ -2220,7 +2473,7 @@ mod tests {
     #[async_trait]
     impl RuntimeAdapter for ForkableRuntime {
         fn kind(&self) -> &str {
-            "forkable"
+            "test"
         }
 
         fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {

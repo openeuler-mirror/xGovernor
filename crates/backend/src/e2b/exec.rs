@@ -669,6 +669,7 @@ mod tests {
             cwd: Some(BackendPath("/home/user/workspace".to_string())),
             timeout_ms: None,
             env: None,
+            extra: None,
         }
     }
 

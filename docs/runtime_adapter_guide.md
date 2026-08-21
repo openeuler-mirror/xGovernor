@@ -79,3 +79,40 @@ runtime/provider 侧错误映射到 `SessionDomainError`，映射决定客户端
 ## 6. 今天就能验证的最小路径
 
 不等 runtime 侧就绪时，可先把 adapter 的骨架对着 `apps/runtime-mock` 的测试跑起来：它证明的正是"governor 这半边一切就绪"——你的全部工作量都在 trait 的另一侧。
+## 7. 选择 Pi 或 xiaoO
+
+The production server registers both adapters. Existing clients continue to
+open Pi sessions because `runtime_kind` is optional and defaults to `pi`.
+Select xiaoO explicitly and provide its non-secret LLM reference under the
+runtime namespace:
+
+```json
+{
+  "runtime_kind": "xiaoo",
+  "conversation_id": "conversation-1",
+  "sender_id": "user-1",
+  "workspace": { "kind": "local_path", "path": "/absolute/workspace" },
+  "ext": {
+    "xiaoo": {
+      "backend_id": "local",
+      "provider": "openai",
+      "model": "gpt-5",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  }
+}
+```
+
+The daemon reads the named environment variable at open/recovery time; the
+value is never stored in session state. Inline `api_key` is rejected for
+xiaoO. `backend_id` may be `local` or `e2b` when that provider is configured.
+xiaoO exposes `bash`, `file_read`, `file_write`, `file_edit`, `glob`, `grep`,
+and `ask_user_question`; plugins, MCP, skills, subagents, LSP, and send-file
+are intentionally not registered in this first integration.
+
+Runtime routing is immutable for a session. Re-open, turn, cancel, close,
+interaction, state and checkpoint operations use the persisted runtime kind;
+an explicit conflicting kind on re-open is rejected. E2B xiaoO sessions
+advertise checkpoint support, while Local sessions do not. Fork remains
+disabled for xiaoO until the provider lifecycle can distinguish a daemon
+restore from creation of a new fork sandbox.
