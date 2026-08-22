@@ -22,7 +22,7 @@ dependencies = [
 [[package]]
 name = "agent-contracts"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-types",
  "async-trait",
@@ -35,7 +35,7 @@ dependencies = [
 [[package]]
 name = "agent-llm"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-types",
  "serde_json",
@@ -44,7 +44,7 @@ dependencies = [
 [[package]]
 name = "agent-types"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "chrono",
  "cron",
@@ -357,7 +357,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 [[package]]
 name = "compact"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-llm",
@@ -789,7 +789,7 @@ dependencies = [
 [[package]]
 name = "hook"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -1191,7 +1191,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llm-client"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-llm",
@@ -1262,7 +1262,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 [[package]]
 name = "lsp"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -1316,7 +1316,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 [[package]]
 name = "mcp"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1348,7 +1348,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 [[package]]
 name = "memory"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-llm",
@@ -1408,7 +1408,7 @@ dependencies = [
 [[package]]
 name = "moirai"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "async-trait",
  "rusqlite",
@@ -1507,7 +1507,7 @@ dependencies = [
 [[package]]
 name = "operation_backend"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -1676,7 +1676,7 @@ dependencies = [
 [[package]]
 name = "prompt"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-llm",
@@ -2278,7 +2278,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 [[package]]
 name = "skill"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -2346,7 +2346,7 @@ dependencies = [
 [[package]]
 name = "subagent"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-types",
  "async-trait",
@@ -2653,7 +2653,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "tool"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -2761,7 +2761,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 [[package]]
 name = "trace"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -3457,7 +3457,7 @@ dependencies = [
 [[package]]
 name = "xiaoo-api"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-types",
@@ -3466,6 +3466,7 @@ dependencies = [
  "llm-client",
  "prompt",
  "skill",
+ "thiserror 1.0.69",
  "tokio",
  "tool",
  "xiaoo-core",
@@ -3474,7 +3475,7 @@ dependencies = [
 [[package]]
 name = "xiaoo-core"
 version = "0.1.0"
-source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=1ffe0952852226c36ecd998b8f088c7f59e7200e#1ffe0952852226c36ecd998b8f088c7f59e7200e"
+source = "git+https://gitcode.com/openeuler/xiaoO.git?rev=268d48a72808e6b763aa2c2b2b159b8998930b89#268d48a72808e6b763aa2c2b2b159b8998930b89"
 dependencies = [
  "agent-contracts",
  "agent-llm",
