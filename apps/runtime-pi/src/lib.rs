@@ -1,4 +1,4 @@
-mod bridge;
+pub mod bridge;
 mod session_file;
 
 use async_trait::async_trait;

@@ -1,0 +1,215 @@
+use crate::xiaoo_backend::{HttpOperationBackend, WorkerConfig, WorkerResponse};
+use crate::{build_runtime, usage_from_outcome, WorkerRequest};
+use agent_contracts::interaction::InteractionHandle;
+use agent_types::interaction::{InteractionRequest, InteractionResponse};
+use agent_types::outcome::AgentOutcome;
+use agent_types::AgentId;
+use async_trait::async_trait;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::io::Write;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use xgovernor_core::{RuntimeEvent, RuntimeFailure};
+use xiaoo_api::runtime::{RuntimeInput, RuntimeOutput, RuntimeState};
+
+pub async fn run_worker_from_env() -> Result<(), String> {
+    let raw = std::env::var("XGOVERNOR_XIAOO_WORKER_CONFIG").map_err(|e| e.to_string())?;
+    let config: WorkerConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let backend = Arc::new(HttpOperationBackend::new(&config));
+    let mut state = RuntimeState::from_snapshot(config.loop_state, CancellationToken::new());
+    emit(&WorkerResponse::Ready)?;
+
+    let stdin = tokio::io::stdin();
+    let mut lines = BufReader::new(stdin).lines();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<WorkerRequest>();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request) = serde_json::from_str(&line) else {
+                break;
+            };
+            if request_tx.send(request).is_err() {
+                break;
+            }
+        }
+        let _ = request_tx.send(WorkerRequest::Shutdown);
+    });
+
+    while let Some(request) = request_rx.recv().await {
+        match request {
+            WorkerRequest::Run {
+                text,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                let effort = reasoning_effort
+                    .as_deref()
+                    .unwrap_or("off")
+                    .parse()
+                    .map_err(|e| format!("invalid reasoning effort: {e}"))?;
+                let runtime = build_runtime(&config.llm, model.as_deref(), backend.clone())
+                    .await
+                    .map_err(|e| format!("failed to build xiaoO runtime: {e:?}"))?;
+                state.cancel = CancellationToken::new();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let pending = Arc::new(Mutex::new(HashMap::new()));
+                let interaction = Arc::new(WorkerInteractionHandle {
+                    events: event_tx.clone(),
+                    pending,
+                });
+                let sink = Arc::new(crate::GovernorEventSink::new(event_tx));
+                let cancel = state.cancel.clone();
+                let mut run = Box::pin(
+                    runtime.run(
+                        &mut state,
+                        RuntimeInput::new(text)
+                            .with_visible_tools(runtime.visible_tools())
+                            .with_agent_id(AgentId("xiaoo".to_string()))
+                            .with_event_sink(sink)
+                            .with_interaction(interaction.clone())
+                            .with_reasoning_effort(effort),
+                    ),
+                );
+                let terminal = loop {
+                    tokio::select! {
+                        result = &mut run => break match result {
+                            Ok(RuntimeOutput::Complete(outcome)) => RuntimeEvent::Completed {
+                                outcome: match outcome { AgentOutcome::Complete { .. } => session_protocol::SessionTurnOutcome::Complete, AgentOutcome::MaxTurnsReached { .. } => session_protocol::SessionTurnOutcome::MaxTurns, AgentOutcome::BudgetExhausted { .. } => session_protocol::SessionTurnOutcome::BudgetExhausted, AgentOutcome::Cancelled { .. } => session_protocol::SessionTurnOutcome::Cancelled },
+                                usage: usage_from_outcome(&outcome),
+                            },
+                            Ok(RuntimeOutput::Suspended(_)) => failed("xiaoo_suspended", "xiaoO suspended without a pending interaction"),
+                            Err(error) => failed("xiaoo_runtime_error", &error.to_string()),
+                        },
+                        Some(request) = request_rx.recv() => match request {
+                            WorkerRequest::Answer { interaction_id, answer } => {
+                                if let Some(waiter) = interaction_pending(&interaction, &interaction_id).await { let _ = waiter.send(interaction_answer_to_agent(answer)); }
+                            }
+                            WorkerRequest::Cancel | WorkerRequest::Shutdown => cancel.cancel(),
+                            _ => {}
+                        },
+                        Some(event) = event_rx.recv() => { emit(&WorkerResponse::Event { event })?; }
+                    }
+                };
+                drop(run);
+                while let Ok(event) = event_rx.try_recv() {
+                    emit(&WorkerResponse::Event { event })?;
+                }
+                emit(&WorkerResponse::State {
+                    loop_state: state.to_snapshot(),
+                })?;
+                emit(&WorkerResponse::Event { event: terminal })?;
+            }
+            WorkerRequest::LoadState { loop_state } => {
+                state = RuntimeState::from_snapshot(loop_state, CancellationToken::new())
+            }
+            WorkerRequest::Shutdown | WorkerRequest::Answer { .. } | WorkerRequest::Cancel => {}
+        }
+    }
+    Ok(())
+}
+
+fn emit(response: &WorkerResponse) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string(response).map_err(|e| e.to_string())?
+    );
+    std::io::stdout().flush().map_err(|e| e.to_string())
+}
+
+fn failed(code: &str, message: &str) -> RuntimeEvent {
+    RuntimeEvent::Failed {
+        error: RuntimeFailure {
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+            details: Value::Null,
+        },
+        usage: Default::default(),
+    }
+}
+
+struct WorkerInteractionHandle {
+    events: mpsc::UnboundedSender<RuntimeEvent>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<InteractionResponse>>>>,
+}
+
+async fn interaction_pending(
+    handle: &WorkerInteractionHandle,
+    id: &str,
+) -> Option<oneshot::Sender<InteractionResponse>> {
+    handle.pending.lock().await.remove(id)
+}
+
+#[async_trait]
+impl InteractionHandle for WorkerInteractionHandle {
+    async fn ask(&self, request: &InteractionRequest) -> InteractionResponse {
+        let id = format!("interaction-{}", Uuid::new_v4());
+        let (prompt, kind, options) = match request {
+            InteractionRequest::Confirm { prompt, .. } => {
+                (prompt.clone(), "confirm".into(), vec![])
+            }
+            InteractionRequest::TextInput { prompt, .. } => {
+                (prompt.clone(), "text_input".into(), vec![])
+            }
+            InteractionRequest::Choice {
+                prompt, options, ..
+            } => (
+                prompt.clone(),
+                "choice".into(),
+                options
+                    .iter()
+                    .map(|v| session_protocol::SessionInteractionOption {
+                        id: v.clone(),
+                        label: v.clone(),
+                        description: None,
+                        value: Value::String(v.clone()),
+                    })
+                    .collect(),
+            ),
+        };
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+        if self
+            .events
+            .send(RuntimeEvent::InteractionRequested {
+                interaction_id: id,
+                interaction_kind: kind,
+                prompt,
+                options,
+                ext: Default::default(),
+            })
+            .is_err()
+        {
+            return crate::cancelled_interaction_response(request);
+        }
+        rx.await
+            .unwrap_or_else(|_| crate::cancelled_interaction_response(request))
+    }
+}
+
+fn interaction_answer_to_agent(
+    answer: session_protocol::SessionInteractionAnswer,
+) -> InteractionResponse {
+    match answer {
+        session_protocol::SessionInteractionAnswer::Confirm(allowed) => {
+            InteractionResponse::Confirmed { allowed }
+        }
+        session_protocol::SessionInteractionAnswer::Text(answer) => InteractionResponse::Text {
+            value: answer.value,
+            display_value: answer.display_value,
+        },
+        session_protocol::SessionInteractionAnswer::Selection(values) => {
+            InteractionResponse::Choice {
+                value: values.into_iter().next(),
+            }
+        }
+        session_protocol::SessionInteractionAnswer::Cancelled
+        | session_protocol::SessionInteractionAnswer::Data(_) => {
+            InteractionResponse::Choice { value: None }
+        }
+    }
+}

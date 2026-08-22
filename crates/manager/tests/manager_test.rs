@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use backend::{ActiveLedgerEntry, OperationAttach, ProviderInstanceLedger};
 use backend::local::LocalProvider;
+use backend::{ActiveLedgerEntry, OperationAttach, ProviderInstanceLedger};
 use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
 use provider_protocol::*;
@@ -658,8 +658,7 @@ async fn reconcile_rehydrates_registry_and_quota_from_the_ledger() {
 /// runtime_id` must fall back to a direct ledger-driven delete rather
 /// than reporting `NotFound` and leaving the sandbox running.
 #[tokio::test]
-async fn destroy_by_runtime_id_falls_back_to_a_ledger_driven_delete_when_the_registry_is_empty() 
-{
+async fn destroy_by_runtime_id_falls_back_to_a_ledger_driven_delete_when_the_registry_is_empty() {
     let lifecycle = Arc::new(FakeLifecycle::new());
     let attach = Arc::new(FakeAttach::new());
     let ledger = Arc::new(FakeLedger::default());

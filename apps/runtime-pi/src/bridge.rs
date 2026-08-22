@@ -121,10 +121,12 @@ impl Bridge {
 fn router(bridge: Arc<Bridge>) -> Router {
     Router::new()
         .route("/v1/workspace-root", post(workspace_root_handler))
+        .route("/v1/resolve", post(resolve_handler))
         .route("/v1/stat", post(stat_handler))
         .route("/v1/read", post(read_handler))
         .route("/v1/write", post(write_handler))
         .route("/v1/mkdir", post(mkdir_handler))
+        .route("/v1/temp", post(temp_handler))
         .route("/v1/exec", post(exec_handler))
         .route("/v1/glob", post(glob_handler))
         .route("/v1/grep", post(grep_handler))
@@ -240,6 +242,47 @@ fn operation_error_response(error: OperationError) -> Response {
 
 async fn workspace_root_handler(session: AuthedSession) -> Response {
     Json(json!({ "path": session.workspace_root.0 })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveRequestBody {
+    raw_path: String,
+    base: String,
+    explicit_base: Option<String>,
+}
+
+async fn resolve_handler(
+    session: AuthedSession,
+    body: Result<Json<ResolveRequestBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+    let base = match body.base.as_str() {
+        "workspace_root" => operation_protocol::capability::path::ResolveBase::WorkspaceRoot,
+        "home_dir" => operation_protocol::capability::path::ResolveBase::HomeDir,
+        "explicit" => match body.explicit_base {
+            Some(path) => {
+                operation_protocol::capability::path::ResolveBase::Explicit(BackendPath(path))
+            }
+            None => return bad_request_response("explicit_base is required".into()),
+        },
+        other => return bad_request_response(format!("unknown resolve base '{other}'")),
+    };
+    let _activity = session.activity.read().await;
+    match session
+        .backend
+        .paths()
+        .resolve_path(operation_protocol::capability::path::ResolvePathRequest {
+            raw_path: body.raw_path,
+            base,
+        })
+        .await
+    {
+        Ok(path) => Json(json!({ "path": path.0 })).into_response(),
+        Err(error) => operation_error_response(error),
+    }
 }
 
 // ---- POST /v1/stat ----
@@ -365,7 +408,49 @@ async fn write_handler(
         })
         .await
     {
-        Ok(outcome) => Json(json!({ "path": outcome.path.0 })).into_response(),
+        Ok(outcome) => {
+            Json(json!({ "path": outcome.path.0, "created": outcome.created })).into_response()
+        }
+        Err(error) => operation_error_response(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TempRequestBody {
+    kind: String,
+    preferred_parent: Option<String>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+async fn temp_handler(
+    session: AuthedSession,
+    body: Result<Json<TempRequestBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection_response(rejection),
+    };
+    let kind = match body.kind.as_str() {
+        "file" => operation_protocol::capability::filesystem::TempPathKind::File,
+        "directory" => operation_protocol::capability::filesystem::TempPathKind::Directory,
+        other => return bad_request_response(format!("unknown temp path kind '{other}'")),
+    };
+    let _activity = session.activity.read().await;
+    match session
+        .backend
+        .files()
+        .temp_path(
+            operation_protocol::capability::filesystem::TempPathRequest {
+                kind,
+                preferred_parent: body.preferred_parent.map(BackendPath),
+                prefix: body.prefix,
+                suffix: body.suffix,
+            },
+        )
+        .await
+    {
+        Ok(path) => Json(json!({ "path": path.0 })).into_response(),
         Err(error) => operation_error_response(error),
     }
 }
@@ -412,6 +497,8 @@ struct ExecRequestBody {
     timeout_ms: Option<u64>,
     #[serde(default)]
     shell: Option<String>,
+    #[serde(default)]
+    extra: Option<serde_json::Value>,
 }
 
 async fn exec_handler(
@@ -433,7 +520,7 @@ async fn exec_handler(
             cwd: body.cwd.map(BackendPath),
             timeout_ms: body.timeout_ms,
             env: body.env.map(|map| map.into_iter().collect()),
-            extra: None,
+            extra: body.extra,
         })
         .await
     {

@@ -1,5 +1,6 @@
 use crate::{OpaqueRuntimeState, SessionDomainError, WorkspaceFacts};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use session_protocol::{
     LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionRuntimeCapability,
@@ -84,7 +85,7 @@ pub struct RuntimeInteractionInput {
     pub ext: SessionExtensions,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeFailure {
     pub code: String,
     pub message: String,
@@ -92,7 +93,8 @@ pub struct RuntimeFailure {
     pub details: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     OutputDelta {
         stream_id: String,
