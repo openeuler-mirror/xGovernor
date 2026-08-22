@@ -3,6 +3,7 @@ use crate::{build_runtime, usage_from_outcome, WorkerRequest};
 use agent_contracts::interaction::InteractionHandle;
 use agent_types::interaction::{InteractionRequest, InteractionResponse};
 use agent_types::outcome::AgentOutcome;
+use agent_types::AgentId;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -66,6 +67,8 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                     runtime.run(
                         &mut state,
                         RuntimeInput::new(text)
+                            .with_visible_tools(runtime.visible_tools())
+                            .with_agent_id(AgentId("xiaoo".to_string()))
                             .with_event_sink(sink)
                             .with_interaction(interaction.clone())
                             .with_reasoning_effort(effort),

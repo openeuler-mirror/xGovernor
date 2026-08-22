@@ -56,14 +56,14 @@ aes-gcm = "0.10"
 rand = "0.8"
 hex = "0.4"
 url = "2.5"
-xiaoo-api = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-xiaoo-core = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-llm-client = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-agent-types = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-agent-contracts = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-compact = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-prompt = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
-tool = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "268d48a72808e6b763aa2c2b2b159b8998930b89" }
+xiaoo-api = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+xiaoo-core = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+llm-client = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+agent-types = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+agent-contracts = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+compact = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+prompt = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
+tool = { git = "https://gitcode.com/openeuler/xiaoO.git", rev = "b4d52e8b09b691bac024c2fe864150cbc22804c0" }
 # Cerberus dependencies (disabled by default)
 # cerberus-core = { path = "crates/cerberus/cerberus-core" }
 
