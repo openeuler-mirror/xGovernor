@@ -2,9 +2,9 @@ use backend::{ActiveLedgerEntry, OperationAttach, ProviderInstanceLedger};
 use operation_protocol::OperationBackend;
 use provider_protocol::{
     BackendId, ProviderCapability, ProviderControlError, ProviderCreateRequest,
-    ProviderDeleteRequest, ProviderInstance, ProviderKind, ProviderLifecycle,
-    ProviderLifecycleReason, ProviderLoadRequest, ProviderLoadSource, ProviderResourceLimits,
-    ProviderSnapshot,
+    ProviderDeleteRequest, ProviderInspectRequest, ProviderInstance, ProviderInstanceStatus,
+    ProviderKind, ProviderLifecycle, ProviderLifecycleReason, ProviderLoadRequest,
+    ProviderLoadSource, ProviderResourceLimits, ProviderSnapshot,
 };
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -444,6 +444,35 @@ impl InstanceManager {
                 backend_id: record.instance.backend_id.clone(),
                 instance_id: record.instance.instance_id.clone(),
                 reason: ProviderLifecycleReason::UserRequested,
+                correlation: Value::Null,
+            })
+            .await
+    }
+
+    /// Best-effort platform-liveness probe backing
+    /// `RuntimeAdapter::check_alive`'s pi-runtime implementation. Unlike
+    /// `stop_instance`/`checkpoint_instance`, this takes no per-runtime lock
+    /// — it is a pure read with nothing to serialize against, and the
+    /// reclaim sweep calling it must not contend with in-flight mutating
+    /// operations on the same instance.
+    pub async fn inspect_instance(
+        &self,
+        runtime_id: &str,
+    ) -> Result<ProviderInstanceStatus, ProviderControlError> {
+        let record = self
+            .instances
+            .lock()
+            .expect("InstanceManager registry lock poisoned")
+            .get(runtime_id)
+            .cloned()
+            .ok_or_else(|| ProviderControlError::NotFound {
+                resource_ref: runtime_id.to_string(),
+            })?;
+        self.lifecycle
+            .inspect(ProviderInspectRequest {
+                backend_id: record.instance.backend_id.clone(),
+                instance_id: Some(record.instance.instance_id.clone()),
+                reason: ProviderLifecycleReason::Reconcile,
                 correlation: Value::Null,
             })
             .await

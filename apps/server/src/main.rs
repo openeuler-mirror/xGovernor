@@ -551,6 +551,15 @@ async fn main() {
     // exits, same as before this task added shutdown handling at all.
     let _orphan_reaper = xgovernor_core::spawn_orphan_reaper(application.clone(), lease_table);
 
+    // Providers with a client-set idle timeout (e.g. E2B) can kill a sandbox
+    // with no push notification to xGovernor — the platform just stops
+    // answering. This sweep periodically re-verifies every active session's
+    // runtime against its provider and force-closes the ones confirmed gone
+    // as `SessionStatus::Closed`, so they don't sit stuck showing
+    // idle/running forever (see `xgovernor_core::spawn_reclaim_sweeper`'s doc
+    // comment). Same dropped-handle convention as `_orphan_reaper` above.
+    let _reclaim_sweeper = xgovernor_core::spawn_reclaim_sweeper(application.clone());
+
     // Each listener gets its own `SessionHttpState` (and therefore its own,
     // independent `streams` table of pending turn-event subscriptions) — see
     // `SessionHttpState::spawn_stream_sweeper`'s doc comment. Same

@@ -254,7 +254,7 @@ impl E2bProvider {
             sandbox_domain.as_str(),
         );
 
-        let state = Arc::new(E2bBackendState {
+        let state = Arc::new_cyclic(|self_weak| E2bBackendState {
             backend_id: backend_id.0.clone(),
             api_base,
             api_key,
@@ -283,6 +283,9 @@ impl E2bProvider {
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart")),
             http: http.clone(),
             lifecycle: Mutex::new(E2bLifecycle::Active),
+            timeout_secs,
+            last_refresh: Mutex::new(Instant::now()),
+            self_weak: self_weak.clone(),
         });
         let backend: Arc<dyn OperationBackend> =
             Arc::new(E2bOperationBackend::new(Arc::clone(&state)));
@@ -468,8 +471,13 @@ impl E2bProvider {
         let temp_root = backend_path(options.temp_root.as_deref().unwrap_or(DEFAULT_TEMP_ROOT))?;
         let envd_port = options.envd_port.unwrap_or(DEFAULT_ENVD_PORT);
         let envd_scheme = resolve_envd_scheme(&options)?;
+        // The platform's actual remaining deadline isn't re-fetched here
+        // (`SandboxDetailResponse` doesn't carry it) — re-asserting the
+        // originally-requested timeout on the next keep-alive refresh is
+        // safe regardless of how much of the previous deadline was left.
+        let timeout_secs = options.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        let state = Arc::new(E2bBackendState {
+        let state = Arc::new_cyclic(|self_weak| E2bBackendState {
             backend_id: instance.backend_id.0.clone(),
             api_base: connection.api_base,
             api_key,
@@ -498,6 +506,9 @@ impl E2bProvider {
                 .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart")),
             http,
             lifecycle: Mutex::new(E2bLifecycle::Active),
+            timeout_secs,
+            last_refresh: Mutex::new(Instant::now()),
+            self_weak: self_weak.clone(),
         });
         let backend: Arc<dyn OperationBackend> =
             Arc::new(E2bOperationBackend::new(Arc::clone(&state)));
@@ -1099,6 +1110,19 @@ impl ProviderLifecycle for E2bProvider {
         })
     }
 
+    /// Unlike every other accessor here, this deliberately re-verifies
+    /// against the platform rather than trusting the in-memory registry
+    /// alone — it is the single source of truth `check_alive`
+    /// (`RuntimeAdapter::check_alive`, used by the core-layer reclaim sweep)
+    /// relies on to notice a sandbox the platform already killed via its
+    /// idle `timeout` (`backend.rs`'s `touch_activity`/`refresh_timeout`
+    /// push that deadline out on real activity, but a session left idle
+    /// past it is gone with no signal to this process otherwise). When the
+    /// instance has no live sandbox at all (e.g. paused — snapshotted and
+    /// deleted by design), there is nothing to re-verify: the registry's
+    /// own state already correctly reflects that, so no network call is
+    /// made and `Err(NotFound)` is reserved for "the platform confirms this
+    /// sandbox id no longer exists", not "there was never one to check".
     async fn inspect(
         &self,
         request: ProviderInspectRequest,
@@ -1109,26 +1133,51 @@ impl ProviderLifecycle for E2bProvider {
             });
         };
 
-        let registry = self.lock_registry()?;
-        let record =
-            registry
-                .get(instance_id.0.as_str())
-                .ok_or_else(|| ProviderControlError::NotFound {
+        let (instance, live) = {
+            let registry = self.lock_registry()?;
+            let record = registry.get(instance_id.0.as_str()).ok_or_else(|| {
+                ProviderControlError::NotFound {
                     resource_ref: instance_id.0.clone(),
-                })?;
+                }
+            })?;
+            let live = record.live.as_ref().map(|live| {
+                (
+                    live.state.sandbox_id.clone(),
+                    live.state.api_base.clone(),
+                    live.state.api_key.clone(),
+                )
+            });
+            (record.instance.clone(), live)
+        };
+
+        if let Some((sandbox_id, api_base, api_key)) = live {
+            let http = new_e2b_http_client()?;
+            // Propagates `ProviderControlError::NotFound` on a 404 straight
+            // through — that is exactly the "platform reclaimed this
+            // sandbox" signal the caller needs; any other error (transport,
+            // non-404 failure) also propagates so a network blip is never
+            // mistaken for reclaim.
+            fetch_sandbox_detail(
+                &http,
+                api_base.as_str(),
+                api_key.as_str(),
+                sandbox_id.as_str(),
+            )
+            .await?;
+        }
 
         Ok(ProviderInstanceStatus {
-            backend_id: record.instance.backend_id.clone(),
+            backend_id: instance.backend_id,
             provider: self.kind.clone(),
-            instance_id: Some(record.instance.instance_id.clone()),
-            state: record.instance.state,
-            endpoint: record.instance.endpoint.clone(),
-            snapshot: record.instance.snapshot.clone(),
-            capabilities: record.instance.capabilities.clone(),
-            resources: record.instance.resources,
+            instance_id: Some(instance.instance_id),
+            state: instance.state,
+            endpoint: instance.endpoint,
+            snapshot: instance.snapshot,
+            capabilities: instance.capabilities,
+            resources: instance.resources,
             last_error: None,
-            metadata: record.instance.metadata.clone(),
-            updated_at_ms: record.instance.updated_at_ms,
+            metadata: instance.metadata,
+            updated_at_ms: instance.updated_at_ms,
         })
     }
 

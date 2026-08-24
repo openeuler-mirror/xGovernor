@@ -641,7 +641,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn exec_with_default_shell(default_shell: Option<&str>) -> E2bExec {
-        E2bExec::new(Arc::new(E2bBackendState {
+        E2bExec::new(Arc::new_cyclic(|self_weak| E2bBackendState {
             backend_id: "e2b:test".to_string(),
             api_base: "https://api.e2b.test".to_string(),
             api_key: "test-key".to_string(),
@@ -658,6 +658,9 @@ mod tests {
             envd_file_upload_multipart: false,
             http: reqwest::Client::new(),
             lifecycle: Mutex::new(E2bLifecycle::Active),
+            timeout_secs: 3600,
+            last_refresh: Mutex::new(Instant::now()),
+            self_weak: self_weak.clone(),
         }))
     }
 

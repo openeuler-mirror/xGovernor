@@ -572,6 +572,9 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
+        }
 
         async fn submit_turn(
             &self,

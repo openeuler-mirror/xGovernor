@@ -323,6 +323,9 @@ impl RuntimeAdapter for MockRuntime {
     fn kind(&self) -> &str {
         "mock"
     }
+    async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        Ok(true)
+    }
 
     fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
         BTreeSet::new()

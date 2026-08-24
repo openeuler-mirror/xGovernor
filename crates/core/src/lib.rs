@@ -8,6 +8,7 @@ pub mod memory_automation;
 pub mod orphan_reaper;
 pub mod projection;
 pub mod prompt_utils;
+pub mod reclaim_sweeper;
 pub mod runtime_adapter;
 pub mod security;
 pub mod session_lease;
@@ -30,6 +31,7 @@ pub use projection::{project_session, project_session_error, project_session_sum
 pub use prompt_utils::{
     compose_subagent_delegation_rules, generate_skills_dirs_table, SubagentRoleRecord,
 };
+pub use reclaim_sweeper::spawn_reclaim_sweeper;
 pub use runtime_adapter::*;
 pub use security::{Role, SecurityContext, TenantQuota, ADMIN_OWNER_REF};
 // NOTE: `session_lease::SessionLease` (the operational, heartbeat-bearing

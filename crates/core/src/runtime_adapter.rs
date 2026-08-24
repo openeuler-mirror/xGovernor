@@ -151,6 +151,7 @@ pub trait RuntimeAdapter: Send + Sync {
     async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError>;
     async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError>;
     async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError>;
+    async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>;
     async fn submit_turn(
         &self,
         input: RuntimeTurnInput,
