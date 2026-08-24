@@ -4,7 +4,7 @@ use crate::{
     OpaqueRuntimeState, RuntimeAdapter, RuntimeCapability, RuntimeEntryContext,
     RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput,
     SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord,
-    SessionStatus, WorkspaceFacts, STALE_LEASE_THRESHOLD_MS,
+    SessionStatus, WorkspaceFacts,
 };
 use session_protocol::{
     SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointRequest,
@@ -988,7 +988,7 @@ impl SessionApplication {
         Ok(SessionHeartbeatResponse {
             runtime_id: runtime_id.to_string(),
             accepted: true,
-            lease_expires_at_ms: Some(self.clock.now_ms() + STALE_LEASE_THRESHOLD_MS),
+            lease_expires_at_ms: Some(self.clock.now_ms() + lease_table.stale_threshold_ms()),
         })
     }
 
@@ -1802,7 +1802,7 @@ fn audit_log<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RuntimeEvent, RuntimeStartRequest, TenantQuota};
+    use crate::{RuntimeEvent, RuntimeStartRequest, TenantQuota, STALE_LEASE_THRESHOLD_MS};
     use async_trait::async_trait;
     use session_protocol::{SessionAcceptedInputKind, SessionLifecycleStatus, SessionUsage};
     use std::collections::BTreeSet;
@@ -2084,7 +2084,7 @@ mod tests {
             Ok(())
         }
 
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -2237,7 +2237,7 @@ mod tests {
             async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
                 self.0.attach(runtime_id).await
             }
-            async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
                 Ok(true)
             }
             async fn submit_turn(
@@ -2591,7 +2591,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -3106,7 +3106,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -3213,7 +3213,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -3330,7 +3330,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -3494,7 +3494,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 

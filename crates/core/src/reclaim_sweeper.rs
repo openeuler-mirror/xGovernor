@@ -4,6 +4,19 @@ use std::time::Duration;
 pub const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const RECLAIM_SWEEP_MAX_CANDIDATES: usize = 10_000;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReclaimSweeperConfig {
+    pub interval: Duration,
+}
+
+impl Default for ReclaimSweeperConfig {
+    fn default() -> Self {
+        Self {
+            interval: RECLAIM_SWEEP_INTERVAL,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum SweepOutcome {
     Alive,
@@ -29,7 +42,7 @@ async fn sweep_one_record(
     }
 }
 
-async fn sweep_once(app: &SessionApplication) {
+async fn sweep_once_with_config(app: &SessionApplication, _config: ReclaimSweeperConfig) {
     let sweeper_ctx = SecurityContext::admin("system:reclaim-sweeper");
     let page = match app
         .list_active_sessions_for_reclaim_sweep(RECLAIM_SWEEP_MAX_CANDIDATES)
@@ -61,7 +74,7 @@ async fn sweep_once(app: &SessionApplication) {
             }
             SweepOutcome::Closed => tracing::warn!(
                 runtime_id = %runtime_id,
-                "reclaim sweep: provider sandbox is gone; session force-closed as reclaimed"
+                "reclaim sweep: provider sandbox is gone; session force-closed"
             ),
             SweepOutcome::CheckFailed(error) => tracing::debug!(
                 runtime_id = %runtime_id,
@@ -78,12 +91,19 @@ async fn sweep_once(app: &SessionApplication) {
 }
 
 pub fn spawn_reclaim_sweeper(app: SessionApplication) -> tokio::task::JoinHandle<()> {
+    spawn_reclaim_sweeper_with_config(app, ReclaimSweeperConfig::default())
+}
+
+pub fn spawn_reclaim_sweeper_with_config(
+    app: SessionApplication,
+    config: ReclaimSweeperConfig,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
+        let mut ticker = tokio::time::interval(config.interval);
         ticker.tick().await; // first tick fires immediately; skip it
         loop {
             ticker.tick().await;
-            sweep_once(&app).await;
+            sweep_once_with_config(&app, config).await;
         }
     })
 }

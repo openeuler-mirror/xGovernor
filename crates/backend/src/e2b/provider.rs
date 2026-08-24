@@ -17,10 +17,11 @@
 //! process in E2B's model.
 
 use super::backend::{
-    envd_host, join_url, normalize_backend_path, parse_error_message, shell_quote, E2bBackendState,
-    E2bLifecycle, E2bOperationBackend, DEFAULT_API_BASE, DEFAULT_DOMAIN, DEFAULT_ENVD_PORT,
-    DEFAULT_HOME_DIR, DEFAULT_SHELL, DEFAULT_TEMPLATE_ID, DEFAULT_TEMP_ROOT, DEFAULT_TIMEOUT_SECS,
-    DEFAULT_WORKSPACE_ROOT, E2B_PROVIDER_KIND,
+    configured_activity_refresh_throttle, envd_host, join_url, normalize_backend_path,
+    parse_error_message, shell_quote, E2bBackendState, E2bLifecycle, E2bOperationBackend,
+    DEFAULT_API_BASE, DEFAULT_DOMAIN, DEFAULT_ENVD_PORT, DEFAULT_HOME_DIR, DEFAULT_SHELL,
+    DEFAULT_TEMPLATE_ID, DEFAULT_TEMP_ROOT, DEFAULT_TIMEOUT_SECS, DEFAULT_WORKSPACE_ROOT,
+    E2B_PROVIDER_KIND,
 };
 use super::bootstrap::{apply_e2b_bootstrap, E2bBootstrapPlan};
 use super::error::E2bFailure;
@@ -166,6 +167,19 @@ pub struct E2bProvider {
     registry: Mutex<HashMap<String, E2bInstanceRecord>>,
 }
 
+fn configured_default_timeout_secs() -> u64 {
+    match std::env::var("XGOVERNOR_E2B_TIMEOUT_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => secs,
+            _ => {
+                tracing::warn!(value = %value, default_secs = DEFAULT_TIMEOUT_SECS, "invalid XGOVERNOR_E2B_TIMEOUT_SECS; using default");
+                DEFAULT_TIMEOUT_SECS
+            }
+        },
+        Err(_) => DEFAULT_TIMEOUT_SECS,
+    }
+}
+
 impl E2bProvider {
     pub fn new() -> Self {
         Self {
@@ -232,7 +246,7 @@ impl E2bProvider {
         let timeout_secs = options
             .timeout_secs
             .or_else(|| resource_limits.timeout_ms.map(|ms| ms / 1000))
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+            .unwrap_or_else(configured_default_timeout_secs);
 
         let created = create_e2b_sandbox(
             &http,
@@ -284,6 +298,7 @@ impl E2bProvider {
             http: http.clone(),
             lifecycle: Mutex::new(E2bLifecycle::Active),
             timeout_secs,
+            activity_refresh_throttle: configured_activity_refresh_throttle(),
             last_refresh: Mutex::new(Instant::now()),
             self_weak: self_weak.clone(),
         });
@@ -475,7 +490,9 @@ impl E2bProvider {
         // (`SandboxDetailResponse` doesn't carry it) — re-asserting the
         // originally-requested timeout on the next keep-alive refresh is
         // safe regardless of how much of the previous deadline was left.
-        let timeout_secs = options.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_secs = options
+            .timeout_secs
+            .unwrap_or_else(configured_default_timeout_secs);
 
         let state = Arc::new_cyclic(|self_weak| E2bBackendState {
             backend_id: instance.backend_id.0.clone(),
@@ -507,6 +524,7 @@ impl E2bProvider {
             http,
             lifecycle: Mutex::new(E2bLifecycle::Active),
             timeout_secs,
+            activity_refresh_throttle: configured_activity_refresh_throttle(),
             last_refresh: Mutex::new(Instant::now()),
             self_weak: self_weak.clone(),
         });

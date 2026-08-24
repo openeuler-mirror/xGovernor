@@ -27,11 +27,9 @@ const LEASE_TABLE_SHARD_COUNT: usize = 16;
 /// orphaned and may be taken over.
 pub const STALE_LEASE_THRESHOLD_MS: u64 = 45_000;
 
-/// Reaper threshold (2 h): a session with no live lease for longer than this
+/// Reaper threshold (30 min): a session with no live lease for longer than this
 /// (and no in-flight turn) is force-closed to reclaim leaked backends.
-/// Conservative so a user who detaches and comes back an hour later still
-/// finds the session warm.
-pub const ORPHAN_SESSION_THRESHOLD_MS: u64 = 7_200_000;
+pub const ORPHAN_SESSION_THRESHOLD_MS: u64 = 1_800_000;
 
 /// Reaper sweep interval. `spawn_orphan_reaper` and any future observability
 /// surface share this single source of truth.
@@ -137,11 +135,30 @@ pub enum LeaseAcquireOutcome {
 pub struct SessionLeaseTable {
     /// Per-session lease table, sharded by `session_id` hash.
     shards: Arc<[Mutex<HashMap<String, SessionLease>>]>,
+    stale_threshold_ms: u64,
 }
 
 impl SessionLeaseTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a lease table with an explicit heartbeat staleness window.
+    /// The window controls lease takeover and the lease expiry timestamp
+    /// reported by the session API; orphan force-close has its own threshold.
+    pub fn with_stale_threshold_ms(stale_threshold_ms: u64) -> Self {
+        let shards: Vec<Mutex<HashMap<String, SessionLease>>> = (0..LEASE_TABLE_SHARD_COUNT)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
+        let shards: Arc<[Mutex<HashMap<String, SessionLease>>]> = Arc::from(shards);
+        Self {
+            shards,
+            stale_threshold_ms,
+        }
+    }
+
+    pub fn stale_threshold_ms(&self) -> u64 {
+        self.stale_threshold_ms
     }
 
     /// Pick the shard owning `session_id` (stable within a process via
@@ -184,7 +201,7 @@ impl SessionLeaseTable {
                 }
                 LeaseAcquireOutcome::Acquired
             }
-            Some(lease) if lease.is_stale(now, STALE_LEASE_THRESHOLD_MS) => {
+            Some(lease) if lease.is_stale(now, self.stale_threshold_ms) => {
                 *lease = fresh_lease(client_id.to_string(), client_pid, client_hostname, now);
                 LeaseAcquireOutcome::Acquired
             }
@@ -236,7 +253,7 @@ impl SessionLeaseTable {
             Some(lease) => {
                 // Compute staleness under the mutex so the caller sees the
                 // exact state the daemon used to reject.
-                let stale = lease.is_stale(now, STALE_LEASE_THRESHOLD_MS);
+                let stale = lease.is_stale(now, self.stale_threshold_ms);
                 Err(LeaseCheckFailure::Busy {
                     holder_client_id: lease.client_id.clone(),
                     holder_hostname: lease.client_hostname.clone(),
@@ -311,7 +328,7 @@ impl SessionLeaseTable {
         // Anonymous (`None`) callers never match the recorded holder; they
         // fall through to the stale / Busy arms below.
         let is_holder = client_id.is_some_and(|cid| lease.client_id == cid);
-        if is_holder || lease.is_stale(now, STALE_LEASE_THRESHOLD_MS) {
+        if is_holder || lease.is_stale(now, self.stale_threshold_ms) {
             Ok(())
         } else {
             Err(LeaseCheckFailure::Busy {
@@ -354,7 +371,7 @@ impl SessionLeaseTable {
         if is_holder {
             return Ok(());
         }
-        if lease.is_stale(now, STALE_LEASE_THRESHOLD_MS) {
+        if lease.is_stale(now, self.stale_threshold_ms) {
             // Stale lease: take it over for an identified caller (so
             // the next heartbeat succeeds), then allow the RPC through.
             if let Some(cid) = client_id.filter(|s| !s.is_empty()) {
@@ -409,7 +426,10 @@ impl Default for SessionLeaseTable {
             .map(|_| Mutex::new(HashMap::new()))
             .collect();
         let shards: Arc<[Mutex<HashMap<String, SessionLease>>]> = Arc::from(shards);
-        Self { shards }
+        Self {
+            shards,
+            stale_threshold_ms: STALE_LEASE_THRESHOLD_MS,
+        }
     }
 }
 

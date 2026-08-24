@@ -659,6 +659,7 @@ mod tests {
             http: reqwest::Client::new(),
             lifecycle: Mutex::new(E2bLifecycle::Active),
             timeout_secs: 3600,
+            activity_refresh_throttle: crate::e2b::backend::ACTIVITY_REFRESH_THROTTLE,
             last_refresh: Mutex::new(Instant::now()),
             self_weak: self_weak.clone(),
         }))
