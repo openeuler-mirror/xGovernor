@@ -263,6 +263,10 @@ mod tests {
             Ok(())
         }
 
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
+        }
+
         async fn submit_turn(
             &self,
             _input: RuntimeTurnInput,

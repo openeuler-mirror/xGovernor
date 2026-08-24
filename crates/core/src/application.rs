@@ -772,9 +772,70 @@ impl SessionApplication {
         runtime_id: &str,
         lease: SessionLeaseClaim,
     ) -> Result<SessionControlResponse, SessionDomainError> {
-        let mut record = self.require_session(ctx, runtime_id).await?;
+        let record = self.require_session(ctx, runtime_id).await?;
         self.check_lease_holder(runtime_id, &lease).await?;
+        self.finalize_closed_session(record, runtime_id, None).await
+    }
 
+    /// System-forced counterpart to `close`: called only by the reclaim
+    /// sweep (`reclaim_sweeper.rs`) once `RuntimeAdapter::check_alive` has
+    /// already confirmed the provider-side sandbox is gone. Deliberately
+    /// skips `check_lease_holder` — unlike `close`, there is no live runtime
+    /// left for a lease to protect, so a fresh/active lease must not block
+    /// this from recording what the provider already did. Thin
+    /// audit-logging wrapper (`docs/tenancy_design.md` §6) around
+    /// [`Self::reclaim_impl`] — see [`audit_log`].
+    pub async fn reclaim(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+    ) -> Result<SessionControlResponse, SessionDomainError> {
+        let result = self.reclaim_impl(ctx, runtime_id).await;
+        audit_log(ctx, "reclaim", Some(runtime_id), &result);
+        result
+    }
+
+    async fn reclaim_impl(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+    ) -> Result<SessionControlResponse, SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        // TOCTOU guard: the reclaim sweep's candidate list is a snapshot, and
+        // this record may have already reached a terminal status by the time
+        // `check_alive` and this call run (e.g. the owning client noticed the
+        // same dead sandbox and called `close` first). Must not overwrite a
+        // legitimate `Closed`/`Failed` with a second close — treat "already
+        // terminal" as a no-op success, since the desired end state (not left
+        // dangling as active) already holds.
+        if matches!(record.status, SessionStatus::Closed | SessionStatus::Failed) {
+            return Ok(SessionControlResponse {
+                runtime_id: runtime_id.to_string(),
+                status: crate::projection::project_status(record.status),
+                updated_at_ms: record.updated_at_ms,
+            });
+        }
+        self.finalize_closed_session(
+            record,
+            runtime_id,
+            Some("provider sandbox no longer exists (idle-timeout expiry)".to_string()),
+        )
+        .await
+    }
+
+    /// Shared tail for `close`/`reclaim`: stop the runtime (tolerating the
+    /// no-in-memory-instance case the same way for both — see the §1.4
+    /// comment below), tombstone the record as `Closed`, and drop
+    /// lease/turn-gate/tenant-slot bookkeeping. `note`, when present,
+    /// overwrites `last_error` — used by `reclaim` to record why the session
+    /// was force-closed; `close` passes `None` and leaves any prior error
+    /// untouched.
+    async fn finalize_closed_session(
+        &self,
+        mut record: SessionRecord,
+        runtime_id: &str,
+        note: Option<String>,
+    ) -> Result<SessionControlResponse, SessionDomainError> {
         let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
         match runtime.stop(runtime_id).await {
             Ok(()) => {}
@@ -797,6 +858,9 @@ impl SessionApplication {
         let now = self.clock.now_ms();
         record.status = SessionStatus::Closed;
         record.updated_at_ms = now;
+        if note.is_some() {
+            record.last_error = note;
+        }
         let tenant_id = record.tenant_id.clone();
         self.records.save(record).await?;
 
@@ -817,6 +881,21 @@ impl SessionApplication {
             status: SessionLifecycleStatus::Closed,
             updated_at_ms: now,
         })
+    }
+
+    /// Best-effort platform-liveness probe for the reclaim sweep
+    /// (`reclaim_sweeper.rs`) — resolves `runtime_id`'s current record and
+    /// runtime adapter, then delegates to `RuntimeAdapter::check_alive`. Not
+    /// audit-logged (unlike `close`/`reclaim`): this is a read-only probe, not
+    /// a state-changing control operation.
+    pub async fn check_alive(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+    ) -> Result<bool, SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        runtime.check_alive(runtime_id).await
     }
 
     /// Release `lease.client_id`'s write lease without stopping the runtime,
@@ -1439,6 +1518,19 @@ impl SessionApplication {
         let page = self.records.list_active(Some(tenant_id), 1).await?;
         Ok(page.total_active > 0)
     }
+
+    /// All non-terminal sessions across every tenant, most-recently-updated
+    /// first, capped at `limit` — candidate source for the reclaim sweep
+    /// (`reclaim_sweeper.rs`). Deliberately tenant-unscoped (`None`): unlike
+    /// `list_sessions` (a self-service query gated by the caller's own
+    /// `ctx.tenant_id()`), the sweep is server-internal trusted code that
+    /// must see every tenant's sessions to do its job.
+    pub async fn list_active_sessions_for_reclaim_sweep(
+        &self,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        self.records.list_active(None, limit).await
+    }
 }
 
 /// Result of [`SessionRepository::list_active`]: `sessions` is capped at the
@@ -1712,7 +1804,7 @@ mod tests {
     use super::*;
     use crate::{RuntimeEvent, RuntimeStartRequest, TenantQuota};
     use async_trait::async_trait;
-    use session_protocol::{SessionAcceptedInputKind, SessionUsage};
+    use session_protocol::{SessionAcceptedInputKind, SessionLifecycleStatus, SessionUsage};
     use std::collections::BTreeSet;
     use tokio::sync::Mutex;
 
@@ -1992,6 +2084,10 @@ mod tests {
             Ok(())
         }
 
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
+        }
+
         async fn submit_turn(
             &self,
             input: RuntimeTurnInput,
@@ -2140,6 +2236,9 @@ mod tests {
             }
             async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
                 self.0.attach(runtime_id).await
+            }
+            async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+                Ok(true)
             }
             async fn submit_turn(
                 &self,
@@ -2491,6 +2590,9 @@ mod tests {
 
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
         }
 
         async fn submit_turn(
@@ -3004,6 +3106,9 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
         }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
+        }
 
         async fn submit_turn(
             &self,
@@ -3107,6 +3212,9 @@ mod tests {
 
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
         }
 
         async fn submit_turn(
@@ -3221,6 +3329,9 @@ mod tests {
 
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
         }
 
         async fn submit_turn(
@@ -3382,6 +3493,9 @@ mod tests {
 
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             Ok(())
+        }
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+            Ok(true)
         }
 
         async fn submit_turn(

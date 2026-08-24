@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use provider_protocol::BackendId;
+use provider_protocol::{BackendId, ProviderControlError};
 use serde_json::{json, Value};
 use session_protocol::{SessionRuntimeCapability, SessionUsage};
 use std::collections::{BTreeSet, HashMap};
@@ -291,6 +291,17 @@ impl RuntimeAdapter for XiaooRuntime {
 
     async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
         self.instance_for(runtime_id).await.map(|_| ())
+    }
+
+    async fn check_alive(&self, runtime_id: &str) -> Result<bool, SessionDomainError> {
+        let instance = self.instance_for(runtime_id).await?;
+        match instance.manager.inspect_instance(runtime_id).await {
+            Ok(_) => Ok(true),
+            // The registry still knows about this instance but the platform
+            // no longer does — confirmed reclaim, not a lookup miss.
+            Err(ProviderControlError::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_provider_error(error)),
+        }
     }
 
     async fn submit_turn(

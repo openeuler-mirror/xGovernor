@@ -11,8 +11,8 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use super::error::E2bFailure;
 use super::exec::E2bExec;
@@ -30,6 +30,7 @@ pub(crate) const DEFAULT_HOME_DIR: &str = "/home/user";
 pub(crate) const DEFAULT_TEMP_ROOT: &str = "/tmp";
 pub(crate) const DEFAULT_SHELL: &str = "/bin/sh";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 3600;
+pub(crate) const ACTIVITY_REFRESH_THROTTLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum E2bLifecycle {
@@ -56,6 +57,14 @@ pub(crate) struct E2bBackendState {
     pub(crate) envd_file_upload_multipart: bool,
     pub(crate) http: reqwest::Client,
     pub(crate) lifecycle: Mutex<E2bLifecycle>,
+    /// Timeout (seconds) this sandbox was provisioned with — resent verbatim
+    /// on each keep-alive refresh via `POST /sandboxes/{id}/timeout`.
+    pub(crate) timeout_secs: u64,
+    pub(crate) last_refresh: Mutex<Instant>,
+    /// Lets `touch_activity` (called from `&self`) obtain an owned `Arc` to
+    /// spawn a `'static` refresh task. Set via `Arc::new_cyclic` at
+    /// construction — see `provider.rs`.
+    pub(crate) self_weak: Weak<E2bBackendState>,
 }
 
 pub struct E2bOperationBackend {
@@ -188,6 +197,7 @@ impl E2bBackendState {
     }
 
     pub(crate) fn envd_request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.touch_activity();
         let mut request = self.http.request(method, self.envd_url(path));
         if let Some(token) = self
             .envd_access_token
@@ -232,6 +242,69 @@ impl E2bBackendState {
         }
 
         Err(http_error("delete e2b sandbox", response).await)
+    }
+
+    /// Best-effort keep-alive: called on every `envd_request`, throttled to
+    /// at most once per `ACTIVITY_REFRESH_THROTTLE`. Non-blocking — a
+    /// throttled or already-in-flight call is a no-op, and the actual HTTP
+    /// call runs on a detached task so it never delays the caller's real
+    /// operation.
+    pub(crate) fn touch_activity(&self) {
+        let mut last_refresh = match self.last_refresh.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if last_refresh.elapsed() < ACTIVITY_REFRESH_THROTTLE {
+            return;
+        }
+        *last_refresh = Instant::now();
+        drop(last_refresh);
+
+        let Some(state) = self.self_weak.upgrade() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Err(error) = state.refresh_timeout().await {
+                tracing::warn!(
+                    sandbox_id = %state.sandbox_id,
+                    error = %error,
+                    "e2b keep-alive timeout refresh failed"
+                );
+            }
+        });
+    }
+
+    /// `POST /sandboxes/{id}/timeout` — E2B's timeout is absolute ("kill at
+    /// last-set + timeout", not additive), so this resends the sandbox's
+    /// full `timeout_secs` to push the deadline back out.
+    pub(crate) async fn refresh_timeout(&self) -> Result<(), OperationError> {
+        let started_at = Instant::now();
+        let response = self
+            .http
+            .post(self.platform_url(format!("/sandboxes/{}/timeout", self.sandbox_id).as_str()))
+            .header("X-API-Key", self.api_key.as_str())
+            .json(&serde_json::json!({ "timeout": self.timeout_secs }))
+            .send()
+            .await
+            .map_err(|error| {
+                let failure =
+                    E2bFailure::from_reqwest("failed to call e2b refresh timeout", &error);
+                failure.log(
+                    "refresh_timeout",
+                    Some(self.sandbox_id.as_str()),
+                    None,
+                    started_at.elapsed().as_millis(),
+                );
+                OperationError::Transport {
+                    message: failure.message,
+                }
+            })?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        Err(http_error("refresh e2b sandbox timeout", response).await)
     }
 }
 
