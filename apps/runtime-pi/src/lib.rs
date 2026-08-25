@@ -1529,11 +1529,18 @@ impl RuntimeAdapter for PiRuntime {
             .arg(&session_dir)
             .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
             .env("XGOVERNOR_BRIDGE_TOKEN", &bridge_token)
-            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0)
-            // Deliberately no `.current_dir(...)`: Pi's own built-in tools no
-            // longer touch the daemon host's filesystem at all (that is the
-            // whole point of the bridge), so there is no host-side directory
-            // for this process to be rooted in.
+            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0);
+        // Root the `pi` process in the sandbox workspace directory so pi's
+        // session cwd (and thus the "Current working directory" line pi writes
+        // into its system prompt) matches the workspace the model actually
+        // operates against. Only the `local` backend's workspace root is a
+        // real directory on this daemon host; the `e2b` backend's root
+        // (`/home/user/workspace`) lives on the remote sandbox, so the process
+        // cannot chdir into it from here and keeps the host cwd.
+        if persisted_state.backend_id == LOCAL_BACKEND_ID {
+            command.current_dir(&workspace_root.0);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1733,7 +1740,11 @@ impl RuntimeAdapter for PiRuntime {
             .arg(&session_dir)
             .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
             .env("XGOVERNOR_BRIDGE_TOKEN", &token)
-            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0)
+            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0);
+        if state.backend_id == LOCAL_BACKEND_ID {
+            command.current_dir(&workspace_root.0);
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
