@@ -27,6 +27,7 @@
 | ------------------------------------------------------ | ---- | ------------------------- | ---------------------------- |
 | `/api/v1/health`                                       | GET  | —                         | 200                          |
 | `/api/v1/sessions`                                     | GET  | —                         | 200 SessionListResponse      |
+| `/api/v1/checkpoints`                                  | GET  | query: `limit`, `offset`  | 200 SessionCheckpointListResponse |
 | `/api/v1/sessions/open`                                | POST | SessionOpenRequest        | 200 SessionOpenResponse      |
 | `/api/v1/sessions/turns`                               | POST | SessionTurnRequest        | 202 SessionSubmitReceipt     |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | —                         | 200 SSE 流                    |
@@ -51,6 +52,7 @@
 | ------------------------------------------------------ | ---- | ------------------------------ |
 | `/api/v1/health`                                       | GET  | 存活探测                           |
 | `/api/v1/sessions`                                     | GET  | 自助查询：调用方可见的活跃会话列表 + 配额快照       |
+| `/api/v1/checkpoints`                                  | GET  | 查看调用方可见的持久化 checkpoint（tenant 隔离，admin 全部可见） |
 | `/api/v1/sessions/open`                                | POST | 打开会话（携带 `runtime_id` 时为幂等重附着）  |
 | `/api/v1/sessions/turns`                               | POST | 提交 turn → 回执携带服务端签发的 `turn_id` |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | 单个 turn 的 SSE 事件流              |
@@ -91,6 +93,29 @@
   "quota": { "max_sessions": 10, "active_sessions": 1, "max_requests_per_minute": null }
 }
 ```
+
+### checkpoint 列表
+
+`GET /api/v1/checkpoints?limit=100&offset=0` 返回持久化 checkpoint 的分页元数据。tenant 身份只能看到自己租户创建的 checkpoint，admin 身份看到全部。`limit` 默认为 `100`，服务端最大为 `200`；`offset` 默认为 `0`，结果按 `created_at_ms DESC, checkpoint_id DESC` 稳定排序。
+
+```json
+{
+  "checkpoints": [
+    {
+      "checkpoint_id": "checkpoint-…",
+      "source_runtime_id": "runtime-…",
+      "tenant_id": "tenant-a",
+      "created_by": "tenant-token",
+      "created_at_ms": 0
+    }
+  ],
+  "total": 1,
+  "has_more": false,
+  "next_offset": null
+}
+```
+
+列表不会返回 provider snapshot ID、opaque runtime state 或 workspace 归档路径；这些字段只在服务端用于 load/delete。
 
 - `sessions` 只含**活跃**会话（`opening | idle | running | paused`），从不包含 `failed`/`closed`；按 `updated_at_ms` 降序排列。
 - v1 无真正分页：`sessions` 最多返回服务端固定上限（当前 100）条最近更新的记录；`has_more` 为 true 表示调用方真实活跃会话数超过了这个上限。

@@ -1,11 +1,12 @@
 use super::response::session_error;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use session_protocol::{
     SessionCancelRequest, SessionCheckpointDeleteRequest, SessionCheckpointRequest,
     SessionCloseRequest, SessionDetachRequest, SessionEvent, SessionForkRequest,
@@ -27,6 +28,14 @@ const MAX_PENDING_STREAMS: usize = 1000;
 /// (`docs/tenancy_design.md` §4 addendum): callers get the most-recent N
 /// active sessions, full stop.
 const DEFAULT_SESSION_LIST_LIMIT: usize = 100;
+const DEFAULT_CHECKPOINT_LIST_LIMIT: usize = 100;
+const MAX_CHECKPOINT_LIST_LIMIT: usize = 200;
+
+#[derive(Debug, Deserialize)]
+struct CheckpointListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
 
 /// One pending stream: the receiving half of a turn's forwarded eventx w
 /// channel, plus when it was registered (for TTL expiry).
@@ -143,6 +152,7 @@ pub fn session_router(state: Arc<SessionHttpState>) -> Router {
             get(stream_turn_events),
         )
         .route("/api/v1/sessions", get(list_sessions))
+        .route("/api/v1/checkpoints", get(list_checkpoints))
         .with_state(state)
 }
 
@@ -319,6 +329,26 @@ async fn list_sessions(
     match state
         .application
         .list_sessions(&ctx, DEFAULT_SESSION_LIST_LIMIT)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => session_error(project_session_error(error)),
+    }
+}
+
+async fn list_checkpoints(
+    State(state): State<Arc<SessionHttpState>>,
+    Extension(ctx): Extension<SecurityContext>,
+    Query(query): Query<CheckpointListQuery>,
+) -> Response {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CHECKPOINT_LIST_LIMIT)
+        .clamp(1, MAX_CHECKPOINT_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    match state
+        .application
+        .list_checkpoints(&ctx, limit, offset)
         .await
     {
         Ok(response) => Json(response).into_response(),

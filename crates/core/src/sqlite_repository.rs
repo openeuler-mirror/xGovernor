@@ -29,7 +29,9 @@
 //! WAL mode is enabled on open, matching this codebase's single-writer
 //! control-plane posture (`docs/tenancy_design.md` line 4: "单写者控制面").
 
-use crate::application::{SessionListPage, SessionRepository};
+use crate::application::{
+    CheckpointListEntry, CheckpointListPage, SessionListPage, SessionRepository,
+};
 use crate::domain::{
     CheckpointLineage, EffectiveCapabilities, IsolationFacts, OpaqueRuntimeState, ResolvedLlm,
     SessionDomainError, SessionLease, SessionRecord, SessionStatus, WorkspaceFacts,
@@ -359,6 +361,63 @@ impl SessionRepository for SqliteSessionRepository {
         result.map_err(|error| internal_error(format!("sqlite checkpoint delete failed: {error}")))
     }
 
+    async fn list_checkpoints(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<CheckpointListPage, SessionDomainError> {
+        let conn = self.conn.clone();
+        let tenant_id = tenant_id.map(str::to_string);
+        let limit = limit as i64;
+        let offset = offset as i64;
+        let result = tokio::task::spawn_blocking(move || -> Result<CheckpointListPage, String> {
+            let conn = conn
+                .lock()
+                .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM checkpoints WHERE (tenant_id = ?1 OR ?1 IS NULL)",
+                    params![tenant_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT checkpoint_id, source_runtime_id, tenant_id, created_by, created_at_ms
+                     FROM checkpoints
+                     WHERE (tenant_id = ?1 OR ?1 IS NULL)
+                     ORDER BY created_at_ms DESC, checkpoint_id DESC
+                     LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![tenant_id, limit, offset], |row| {
+                    Ok(CheckpointListEntry {
+                        checkpoint_id: row.get(0)?,
+                        source_runtime_id: row.get(1)?,
+                        tenant_id: row.get(2)?,
+                        created_by: row.get(3)?,
+                        created_at_ms: row.get::<_, i64>(4)? as u64,
+                    })
+                })
+                .map_err(|error| error.to_string())?;
+            let mut checkpoints = Vec::new();
+            for row in rows {
+                checkpoints.push(row.map_err(|error| error.to_string())?);
+            }
+            Ok(CheckpointListPage {
+                checkpoints,
+                total: total.max(0) as u64,
+            })
+        })
+        .await
+        .map_err(|error| {
+            internal_error(format!("sqlite checkpoint list task panicked: {error}"))
+        })?;
+        result.map_err(|error| internal_error(format!("sqlite checkpoint list failed: {error}")))
+    }
+
     async fn active_session_counts_by_tenant(
         &self,
     ) -> Result<HashMap<String, usize>, SessionDomainError> {
@@ -557,6 +616,43 @@ mod tests {
         assert!(repo.delete_checkpoint("checkpoint-1").await.unwrap());
         assert_eq!(repo.get_checkpoint("checkpoint-1").await.unwrap(), None);
         assert!(!repo.delete_checkpoint("checkpoint-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_list_is_tenant_scoped_and_paginated() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        let mut first = sample_record("runtime-a");
+        first.tenant_id = Some("tenant-a".into());
+        let mut second = sample_record("runtime-b");
+        second.tenant_id = Some("tenant-b".into());
+        for (record, id, created_at) in
+            [(&first, "checkpoint-a", 20), (&second, "checkpoint-b", 10)]
+        {
+            repo.save_checkpoint(crate::CheckpointRecord {
+                checkpoint_id: id.into(),
+                source_runtime_id: record.runtime_id.clone(),
+                provider_snapshot_id: format!("snapshot-{id}"),
+                runtime_state: record.runtime.clone(),
+                workspace: record.workspace.clone(),
+                isolation: record.isolation.clone(),
+                capabilities: record.capabilities.clone(),
+                owner_ref: format!("tenant/{}", record.tenant_id.as_deref().unwrap()),
+                tenant_id: record.tenant_id.clone(),
+                created_by: Some("test".into()),
+                created_at_ms: created_at,
+            })
+            .await
+            .unwrap();
+        }
+        let tenant_page = repo.list_checkpoints(Some("tenant-a"), 1, 0).await.unwrap();
+        assert_eq!(tenant_page.total, 1);
+        assert_eq!(tenant_page.checkpoints[0].checkpoint_id, "checkpoint-a");
+
+        let admin_page = repo.list_checkpoints(None, 1, 0).await.unwrap();
+        assert_eq!(admin_page.total, 2);
+        assert_eq!(admin_page.checkpoints[0].checkpoint_id, "checkpoint-a");
+        let next_page = repo.list_checkpoints(None, 1, 1).await.unwrap();
+        assert_eq!(next_page.checkpoints[0].checkpoint_id, "checkpoint-b");
     }
 
     #[tokio::test]
