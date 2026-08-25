@@ -7,11 +7,12 @@ use crate::{
     SessionStatus, WorkspaceFacts,
 };
 use session_protocol::{
-    SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointRequest,
-    SessionCheckpointResult, SessionControlResponse, SessionEvent, SessionForkRequest,
-    SessionHeartbeatResponse, SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus,
-    SessionListResponse, SessionLoadRequest, SessionOpenRequest, SessionOpenResponse,
-    SessionSubmitReceipt, SessionTurnRequest, TenantQuotaSnapshot,
+    SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointListResponse,
+    SessionCheckpointRequest, SessionCheckpointResult, SessionCheckpointSummary,
+    SessionControlResponse, SessionEvent, SessionForkRequest, SessionHeartbeatResponse,
+    SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionListResponse,
+    SessionLoadRequest, SessionOpenRequest, SessionOpenResponse, SessionSubmitReceipt,
+    SessionTurnRequest, TenantQuotaSnapshot,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -1210,6 +1211,49 @@ impl SessionApplication {
         result
     }
 
+    /// Lists checkpoints visible to the caller. Tenant callers are restricted
+    /// to their own tenant; admin callers see all checkpoints.
+    pub async fn list_checkpoints(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionCheckpointListResponse, SessionDomainError> {
+        let result = self.list_checkpoints_impl(ctx, limit, offset).await;
+        audit_log(ctx, "list_checkpoints", None, &result);
+        result
+    }
+
+    async fn list_checkpoints_impl(
+        &self,
+        ctx: &SecurityContext,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionCheckpointListResponse, SessionDomainError> {
+        let page = self
+            .records
+            .list_checkpoints(ctx.tenant_id(), limit, offset)
+            .await?;
+        let returned = page.checkpoints.len();
+        let has_more = (offset as u64).saturating_add(returned as u64) < page.total;
+        Ok(SessionCheckpointListResponse {
+            checkpoints: page
+                .checkpoints
+                .into_iter()
+                .map(|entry| SessionCheckpointSummary {
+                    checkpoint_id: entry.checkpoint_id,
+                    source_runtime_id: entry.source_runtime_id,
+                    tenant_id: entry.tenant_id,
+                    created_by: entry.created_by,
+                    created_at_ms: entry.created_at_ms,
+                })
+                .collect(),
+            total: page.total,
+            has_more,
+            next_offset: has_more.then_some(offset.saturating_add(returned)),
+        })
+    }
+
     async fn delete_checkpoint_impl(
         &self,
         ctx: &SecurityContext,
@@ -1544,6 +1588,21 @@ pub struct SessionListPage {
     pub total_active: u32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointListPage {
+    pub checkpoints: Vec<CheckpointListEntry>,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointListEntry {
+    pub checkpoint_id: String,
+    pub source_runtime_id: String,
+    pub tenant_id: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
+}
+
 #[async_trait::async_trait]
 pub trait SessionRepository: Send + Sync {
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError>;
@@ -1572,6 +1631,17 @@ pub trait SessionRepository: Send + Sync {
         })
     }
     async fn delete_checkpoint(&self, _checkpoint_id: &str) -> Result<bool, SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "checkpoint repository is not configured".into(),
+            source: None,
+        })
+    }
+    async fn list_checkpoints(
+        &self,
+        _tenant_id: Option<&str>,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<CheckpointListPage, SessionDomainError> {
         Err(SessionDomainError::Internal {
             message: "checkpoint repository is not configured".into(),
             source: None,

@@ -88,6 +88,29 @@ pub struct SessionCheckpointResult {
     pub created_at_ms: u64,
 }
 
+/// Public metadata for a persisted checkpoint. Provider snapshot identifiers
+/// and opaque runtime state remain server-side details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpointSummary {
+    pub checkpoint_id: String,
+    pub source_runtime_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    pub created_at_ms: u64,
+}
+
+/// Paginated response for `GET /api/v1/checkpoints`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpointListResponse {
+    pub checkpoints: Vec<SessionCheckpointSummary>,
+    pub total: u64,
+    pub has_more: bool,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCheckoutRequest {
