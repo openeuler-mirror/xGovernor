@@ -1,0 +1,13 @@
+[package]
+name = "agent-runtime-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+session-protocol = { path = "../session" }
+
+[dev-dependencies]
+serde_json.workspace = true

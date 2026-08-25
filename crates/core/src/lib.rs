@@ -15,6 +15,8 @@ pub mod session_lease;
 pub mod sqlite_repository;
 pub mod turn_cancellation;
 
+pub use agent_runtime_protocol as runtime_protocol;
+
 pub use application::{
     enforce_workspace_axiom, CheckpointListEntry, CheckpointListPage, Clock,
     NormalizedSessionEnvironment, RuntimeIdGenerator, RuntimeRegistration, SessionApplication,
