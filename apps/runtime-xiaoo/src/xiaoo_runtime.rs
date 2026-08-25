@@ -181,10 +181,15 @@ impl RuntimeAdapter for XiaooRuntime {
             }
             let ext = read_ext(&request.ext)?;
             let manager = self.manager_for(&ext.backend_id)?;
-            let provider_options = json!({
+            // `allow_internet_access` is an e2b-only provider option; the
+            // local provider rejects unknown fields, so only include it
+            // for e2b (mirrors apps/runtime-pi/src/lib.rs::prepare_cold_start).
+            let mut provider_options = json!({
                 "workspace_root": request.workspace.root,
-                "allow_internet_access": ext.backend_id == E2B_BACKEND_ID,
             });
+            if ext.backend_id == E2B_BACKEND_ID {
+                provider_options["allow_internet_access"] = json!(true);
+            }
             let backend = manager
                 .start_instance(
                     request.runtime_id.clone(),
