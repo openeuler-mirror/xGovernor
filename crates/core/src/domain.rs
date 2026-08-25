@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 pub use agent_runtime_protocol::{
-    RuntimeCapability, RuntimeStateSnapshot as OpaqueRuntimeState,
-    RuntimeWorkspace as WorkspaceFacts, RuntimeWorkspaceAccess as WorkspaceAccess,
+    RuntimeStateSnapshot as OpaqueRuntimeState, RuntimeWorkspace as WorkspaceFacts,
+    RuntimeWorkspaceAccess as WorkspaceAccess,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +28,18 @@ pub enum SandboxCapability {
     Pause,
     Snapshot,
     Network,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCapability {
+    Interaction,
+    Steering,
+    Fork,
+    Checkpoint,
+    StateExport,
+    ModelOverride,
+    ReasoningControl,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

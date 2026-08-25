@@ -46,6 +46,18 @@ impl RuntimeRegistration {
             environment,
         }
     }
+
+    /// Registers a runtime implemented only against the neutral protocol
+    /// crate. Core owns the domain/capability/error adaptation.
+    pub fn from_protocol(
+        runtime: Arc<dyn agent_runtime_protocol::AgentRuntime>,
+        environment: Arc<dyn SessionEnvironmentNormalizer>,
+    ) -> Self {
+        Self::new(
+            Arc::new(crate::ProtocolRuntimeAdapter::new(runtime)),
+            environment,
+        )
+    }
 }
 
 /// How long the event-forwarding task waits for the subscriber to drain one

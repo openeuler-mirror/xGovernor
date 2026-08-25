@@ -1,15 +1,43 @@
+use crate::WorkspaceFacts;
 use crate::{OpaqueRuntimeState, SessionDomainError};
 pub use agent_runtime_protocol::{
-    CheckpointPayload, RuntimeEntryContext, RuntimeEvent, RuntimeFailure,
-    RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest,
-    RuntimeTurnRequest as RuntimeTurnInput,
+    RuntimeEntryContext, RuntimeEvent, RuntimeFailure,
+    RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeTurnRequest as RuntimeTurnInput,
 };
 use async_trait::async_trait;
-use session_protocol::SessionRuntimeCapability;
+use session_protocol::{LlmOverrideRequest, SessionExtensions, SessionRuntimeCapability};
 use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
 pub type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeStartRequest {
+    pub runtime_id: String,
+    pub conversation_id: String,
+    pub sender_id: String,
+    pub workspace: WorkspaceFacts,
+    pub state: Option<OpaqueRuntimeState>,
+    pub llm: Option<LlmOverrideRequest>,
+    pub owner_ref: String,
+    pub ext: SessionExtensions,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeLoadRequest {
+    pub new_runtime_id: String,
+    pub owner_ref: String,
+    pub provider_snapshot_id: String,
+    pub runtime_state: OpaqueRuntimeState,
+    pub llm: Option<LlmOverrideRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointPayload {
+    pub checkpoint_id: String,
+    pub runtime_state: OpaqueRuntimeState,
+    pub provider_snapshot_id: String,
+}
 
 /// The single internal seam for every agent runtime.
 #[async_trait]
@@ -197,4 +225,3 @@ pub fn project_runtime_event(
         },
     }
 }
-

@@ -8,6 +8,7 @@ pub mod memory_automation;
 pub mod orphan_reaper;
 pub mod projection;
 pub mod prompt_utils;
+pub mod protocol_runtime_adapter;
 pub mod reclaim_sweeper;
 pub mod runtime_adapter;
 pub mod security;
@@ -34,6 +35,7 @@ pub use projection::{project_session, project_session_error, project_session_sum
 pub use prompt_utils::{
     compose_subagent_delegation_rules, generate_skills_dirs_table, SubagentRoleRecord,
 };
+pub use protocol_runtime_adapter::ProtocolRuntimeAdapter;
 pub use reclaim_sweeper::{
     spawn_reclaim_sweeper, spawn_reclaim_sweeper_with_config, ReclaimSweeperConfig,
 };

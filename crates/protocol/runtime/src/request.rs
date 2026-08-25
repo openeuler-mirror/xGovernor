@@ -32,19 +32,8 @@ pub struct RuntimeStartRequest {
     pub state: Option<RuntimeStateSnapshot>,
     #[serde(default)]
     pub llm: Option<LlmOverrideRequest>,
-    pub owner_ref: String,
     #[serde(default)]
     pub ext: SessionExtensions,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RuntimeLoadRequest {
-    pub new_runtime_id: String,
-    pub owner_ref: String,
-    pub provider_snapshot_id: String,
-    pub runtime_state: RuntimeStateSnapshot,
-    #[serde(default)]
-    pub llm: Option<LlmOverrideRequest>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +78,12 @@ pub struct RuntimeCancelRequest {
     pub runtime_id: String,
     #[serde(default)]
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeCapabilityContext {
+    #[serde(default)]
+    pub ext: SessionExtensions,
 }
 
 /// Internal worker command envelope. This is deliberately separate from the

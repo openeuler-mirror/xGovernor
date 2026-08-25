@@ -11,7 +11,6 @@ pub enum RuntimeError {
     Conflict { code: String, message: String },
     UnsupportedCapability { capability: String },
     WorkerUnavailable { message: String, retryable: bool },
-    ProviderUnavailable { message: String, retryable: bool },
     StateCorrupt { message: String },
     Internal { message: String },
 }

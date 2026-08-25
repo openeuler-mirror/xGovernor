@@ -9,12 +9,3 @@ pub struct RuntimeStateSnapshot {
     #[serde(default)]
     pub state: Value,
 }
-
-/// State returned after coordinating a runtime and its optional provider
-/// snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointPayload {
-    pub checkpoint_id: String,
-    pub runtime_state: RuntimeStateSnapshot,
-    pub provider_snapshot_id: String,
-}

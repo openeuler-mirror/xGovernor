@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 pub enum RuntimeCapability {
     Interaction,
     Steering,
-    Fork,
-    Checkpoint,
     StateExport,
     ModelOverride,
     ReasoningControl,
