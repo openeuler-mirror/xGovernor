@@ -26,12 +26,14 @@ pub use memory_automation::{
     MemoryAutomationError, MemoryAutomationHealth, RecallMemory, TurnMemoryAutomation,
     TurnMemoryContext,
 };
-pub use orphan_reaper::spawn_orphan_reaper;
+pub use orphan_reaper::{spawn_orphan_reaper, spawn_orphan_reaper_with_config, OrphanReaperConfig};
 pub use projection::{project_session, project_session_error, project_session_summary};
 pub use prompt_utils::{
     compose_subagent_delegation_rules, generate_skills_dirs_table, SubagentRoleRecord,
 };
-pub use reclaim_sweeper::spawn_reclaim_sweeper;
+pub use reclaim_sweeper::{
+    spawn_reclaim_sweeper, spawn_reclaim_sweeper_with_config, ReclaimSweeperConfig,
+};
 pub use runtime_adapter::*;
 pub use security::{Role, SecurityContext, TenantQuota, ADMIN_OWNER_REF};
 // NOTE: `session_lease::SessionLease` (the operational, heartbeat-bearing

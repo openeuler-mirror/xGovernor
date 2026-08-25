@@ -32,6 +32,19 @@ pub(crate) const DEFAULT_SHELL: &str = "/bin/sh";
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 3600;
 pub(crate) const ACTIVITY_REFRESH_THROTTLE: Duration = Duration::from_secs(60);
 
+pub(crate) fn configured_activity_refresh_throttle() -> Duration {
+    match std::env::var("XGOVERNOR_E2B_ACTIVITY_REFRESH_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(value = %value, default_secs = ACTIVITY_REFRESH_THROTTLE.as_secs(), "invalid XGOVERNOR_E2B_ACTIVITY_REFRESH_SECS; using default");
+                ACTIVITY_REFRESH_THROTTLE
+            }
+        },
+        Err(_) => ACTIVITY_REFRESH_THROTTLE,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum E2bLifecycle {
     Active,
@@ -60,6 +73,7 @@ pub(crate) struct E2bBackendState {
     /// Timeout (seconds) this sandbox was provisioned with — resent verbatim
     /// on each keep-alive refresh via `POST /sandboxes/{id}/timeout`.
     pub(crate) timeout_secs: u64,
+    pub(crate) activity_refresh_throttle: Duration,
     pub(crate) last_refresh: Mutex<Instant>,
     /// Lets `touch_activity` (called from `&self`) obtain an owned `Arc` to
     /// spawn a `'static` refresh task. Set via `Arc::new_cyclic` at
@@ -254,7 +268,7 @@ impl E2bBackendState {
             Ok(guard) => guard,
             Err(_) => return,
         };
-        if last_refresh.elapsed() < ACTIVITY_REFRESH_THROTTLE {
+        if last_refresh.elapsed() < self.activity_refresh_throttle {
             return;
         }
         *last_refresh = Instant::now();

@@ -102,7 +102,13 @@ cargo run -p xgovernor-server
 | `XGOVERNOR_TENANTS_CONFIG_PATH` | `$XGOVERNOR_DATA_DIR/tenants.toml` | Declarative token/identity policy file (see below); missing at the *default* path means dev mode (every request resolves to implicit admin), missing at an explicitly-set path is a fail-closed startup error |
 | `XGOVERNOR_DATA_DIR` | `~/.xgovernor` | Directory holding the SQLite database (and, by default, `tenants.toml`) |
 | `XGOVERNOR_DEFAULT_WORKSPACE_ROOT` | OS temp dir | Workspace root for `workspace: daemon_default` |
+| `XGOVERNOR_LEASE_STALE_SECS` | `45` | Heartbeat staleness window for lease takeover/expiry |
+| `XGOVERNOR_ORPHAN_THRESHOLD_SECS` | `1800` | No-heartbeat duration before the orphan reaper force-closes a session |
+| `XGOVERNOR_ORPHAN_REAPER_INTERVAL_SECS` | `600` | Orphan reaper polling interval |
+| `XGOVERNOR_RECLAIM_SWEEP_INTERVAL_SECS` | `300` | Provider sandbox liveness sweep interval |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
+| `XGOVERNOR_E2B_TIMEOUT_SECS` | `3600` | Default E2B sandbox timeout; explicit provider `timeout_secs` overrides it |
+| `XGOVERNOR_E2B_ACTIVITY_REFRESH_SECS` | `60` | Minimum spacing between E2B timeout refresh requests |
 | `E2B_API_URL` | `https://api.e2b.app` | E2B control-plane URL; set this for self-hosted E2B |
 | `E2B_DOMAIN` | `e2b.app` | Sandbox hostname suffix, without a URL scheme; a port is allowed |
 | `E2B_ENVD_SCHEME` | `https` | Sandbox envd URL scheme (`http` or `https`) |

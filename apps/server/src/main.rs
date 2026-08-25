@@ -11,8 +11,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use xgovernor_core::{
-    Clock, Role, RuntimeIdGenerator, RuntimeRegistration, SessionApplication, SessionLeaseTable,
-    SqliteSessionRepository, TurnIdGenerator,
+    spawn_orphan_reaper_with_config, spawn_reclaim_sweeper_with_config, Clock, OrphanReaperConfig,
+    ReclaimSweeperConfig, Role, RuntimeIdGenerator, RuntimeRegistration, SessionApplication,
+    SessionLeaseTable, SqliteSessionRepository, TurnIdGenerator,
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, PiSessionEnvironment};
@@ -26,6 +27,19 @@ const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_MAX_SANDBOXES_PER_OWNER: usize = 20;
 const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
+
+fn configured_duration_secs(name: &str, default_secs: u64) -> Duration {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                tracing::warn!(variable = name, value = %value, default_secs, "invalid positive duration; using default");
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
+}
 
 /// Environment variable gating whether the `e2b` `InstanceManager` is
 /// constructed at all (see [`build_e2b_instance_manager`] and its call site in
@@ -501,7 +515,21 @@ async fn main() {
         });
     let xiaoo_runtime = XiaooRuntime::new(runtime_managers);
 
-    let lease_table = Arc::new(SessionLeaseTable::new());
+    let mut lease_stale = configured_duration_secs("XGOVERNOR_LEASE_STALE_SECS", 45);
+    let orphan_threshold = configured_duration_secs("XGOVERNOR_ORPHAN_THRESHOLD_SECS", 1_800);
+    if lease_stale > orphan_threshold {
+        tracing::warn!(
+            lease_stale_secs = lease_stale.as_secs(),
+            orphan_threshold_secs = orphan_threshold.as_secs(),
+            "lease stale window exceeds orphan threshold; clamping lease stale window to the orphan threshold"
+        );
+        lease_stale = orphan_threshold;
+    }
+    let orphan_interval = configured_duration_secs("XGOVERNOR_ORPHAN_REAPER_INTERVAL_SECS", 600);
+    let reclaim_interval = configured_duration_secs("XGOVERNOR_RECLAIM_SWEEP_INTERVAL_SECS", 300);
+    let lease_table = Arc::new(SessionLeaseTable::with_stale_threshold_ms(
+        lease_stale.as_millis().min(u64::MAX as u128) as u64,
+    ));
     let application = SessionApplication::with_runtime_registry(
         "pi",
         [
@@ -539,7 +567,7 @@ async fn main() {
         });
 
     // Component C (docs/session_orchestration_skeleton.md): force-close any
-    // session whose lease has carried no live heartbeat for over 2h, so a
+    // session whose lease has carried no live heartbeat for over the configured threshold, so a
     // client that crashes/disappears without detach/close doesn't leak a
     // sandbox forever. Detached from the request path on purpose — dropping
     // the returned JoinHandle does not stop it (see xgovernor_core::
@@ -549,7 +577,14 @@ async fn main() {
     // (unlike an in-flight HTTP request), so there is no drain-completeness
     // reason to stop it early — it simply stops existing when the process
     // exits, same as before this task added shutdown handling at all.
-    let _orphan_reaper = xgovernor_core::spawn_orphan_reaper(application.clone(), lease_table);
+    let _orphan_reaper = spawn_orphan_reaper_with_config(
+        application.clone(),
+        lease_table,
+        OrphanReaperConfig {
+            threshold: orphan_threshold,
+            interval: orphan_interval,
+        },
+    );
 
     // Providers with a client-set idle timeout (e.g. E2B) can kill a sandbox
     // with no push notification to xGovernor — the platform just stops
@@ -558,7 +593,12 @@ async fn main() {
     // as `SessionStatus::Closed`, so they don't sit stuck showing
     // idle/running forever (see `xgovernor_core::spawn_reclaim_sweeper`'s doc
     // comment). Same dropped-handle convention as `_orphan_reaper` above.
-    let _reclaim_sweeper = xgovernor_core::spawn_reclaim_sweeper(application.clone());
+    let _reclaim_sweeper = spawn_reclaim_sweeper_with_config(
+        application.clone(),
+        ReclaimSweeperConfig {
+            interval: reclaim_interval,
+        },
+    );
 
     // Each listener gets its own `SessionHttpState` (and therefore its own,
     // independent `streams` table of pending turn-event subscriptions) — see

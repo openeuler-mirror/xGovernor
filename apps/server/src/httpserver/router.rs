@@ -233,7 +233,7 @@ mod tests {
         async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
             unreachable!("router tests never drive a real turn")
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 

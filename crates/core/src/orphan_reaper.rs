@@ -6,8 +6,8 @@
 //! its own — the runtime keeps running, leaking sandbox/provider resources,
 //! until something force-closes it. This module is that something: a
 //! background sweep that force-closes any session whose lease has carried no
-//! live heartbeat for longer than [`ORPHAN_SESSION_THRESHOLD_MS`] (2h,
-//! conservative on purpose — see that constant's own doc comment).
+//! live heartbeat for longer than [`ORPHAN_SESSION_THRESHOLD_MS`] (30 min by
+//! default; configurable by the server).
 //!
 //! Deliberately reads its candidate set from `SessionLeaseTable::snapshot()`,
 //! not `SessionRepository` — the lease table already carries the "who last
@@ -27,6 +27,22 @@ use crate::{
 };
 use session_protocol::SessionLeaseClaim;
 use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+pub struct OrphanReaperConfig {
+    pub threshold: Duration,
+    pub interval: Duration,
+}
+
+impl Default for OrphanReaperConfig {
+    fn default() -> Self {
+        Self {
+            threshold: Duration::from_millis(ORPHAN_SESSION_THRESHOLD_MS),
+            interval: REAPER_INTERVAL,
+        }
+    }
+}
 
 /// Outcome of a single candidate's reap attempt. Kept as an explicit enum
 /// (rather than logging inline from `reap_one_record`) so `sweep_once`'s
@@ -59,17 +75,15 @@ enum ReapOutcome {
 /// `SessionLeaseTable::check_holder`, whose stale-passthrough arm lets an
 /// anonymous caller through once the recorded holder's heartbeat is older
 /// than `STALE_LEASE_THRESHOLD_MS` (45s) — and anything reaching this
-/// function already failed a stricter 2h bar, so the 45s check always passes
-/// too.
-async fn reap_one_record(
+/// function already failed the configured orphan threshold, so production
+/// startup clamps the stale lease window to no greater than that threshold.
+async fn reap_one_record_with_threshold(
     app: &SessionApplication,
     lease_table: &SessionLeaseTable,
     session_id: &str,
+    threshold_ms: u64,
 ) -> ReapOutcome {
-    if lease_table
-        .has_live_lease(session_id, ORPHAN_SESSION_THRESHOLD_MS)
-        .await
-    {
+    if lease_table.has_live_lease(session_id, threshold_ms).await {
         return ReapOutcome::StillLive;
     }
     // The reaper is server-internal trusted code, not a caller acting on
@@ -88,11 +102,25 @@ async fn reap_one_record(
     }
 }
 
+#[cfg(test)]
+async fn reap_one_record(
+    app: &SessionApplication,
+    lease_table: &SessionLeaseTable,
+    session_id: &str,
+) -> ReapOutcome {
+    reap_one_record_with_threshold(app, lease_table, session_id, ORPHAN_SESSION_THRESHOLD_MS).await
+}
+
 /// Sweep every entry currently in `lease_table`, force-closing the ones past
 /// `ORPHAN_SESSION_THRESHOLD_MS`. Split out from [`spawn_orphan_reaper`] so a
 /// test can drive exactly one sweep synchronously instead of waiting on
-/// `REAPER_INTERVAL` (10 min) in real time.
-async fn sweep_once(app: &SessionApplication, lease_table: &SessionLeaseTable) {
+/// `REAPER_INTERVAL` (10 min by default) in real time.
+async fn sweep_once_with_config(
+    app: &SessionApplication,
+    lease_table: &SessionLeaseTable,
+    config: OrphanReaperConfig,
+) {
+    let threshold_ms = config.threshold.as_millis().min(u64::MAX as u128) as u64;
     let now = match current_time_ms() {
         Ok(now) => now,
         Err(_) => {
@@ -101,15 +129,15 @@ async fn sweep_once(app: &SessionApplication, lease_table: &SessionLeaseTable) {
         }
     };
     for (session_id, holder_client_id, last_heartbeat_ms) in lease_table.snapshot().await {
-        if now.saturating_sub(last_heartbeat_ms) <= ORPHAN_SESSION_THRESHOLD_MS {
+        if now.saturating_sub(last_heartbeat_ms) <= threshold_ms {
             continue;
         }
-        match reap_one_record(app, lease_table, &session_id).await {
+        match reap_one_record_with_threshold(app, lease_table, &session_id, threshold_ms).await {
             ReapOutcome::Closed => tracing::warn!(
                 session_id = %session_id,
                 holder_client_id = %holder_client_id,
                 last_heartbeat_ms,
-                threshold_ms = ORPHAN_SESSION_THRESHOLD_MS,
+                threshold_ms,
                 "orphan reaper force-closed a session with no live lease past the threshold"
             ),
             ReapOutcome::StillLive => tracing::debug!(
@@ -125,6 +153,11 @@ async fn sweep_once(app: &SessionApplication, lease_table: &SessionLeaseTable) {
     }
 }
 
+#[cfg(test)]
+async fn sweep_once(app: &SessionApplication, lease_table: &SessionLeaseTable) {
+    sweep_once_with_config(app, lease_table, OrphanReaperConfig::default()).await;
+}
+
 /// Spawn a background task that calls [`sweep_once`] every `REAPER_INTERVAL`
 /// (10 min) for the lifetime of the returned task. The first sweep runs one
 /// interval after this is called, not immediately — this avoids racing a
@@ -138,12 +171,20 @@ pub fn spawn_orphan_reaper(
     app: SessionApplication,
     lease_table: Arc<SessionLeaseTable>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_orphan_reaper_with_config(app, lease_table, OrphanReaperConfig::default())
+}
+
+pub fn spawn_orphan_reaper_with_config(
+    app: SessionApplication,
+    lease_table: Arc<SessionLeaseTable>,
+    config: OrphanReaperConfig,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REAPER_INTERVAL);
+        let mut ticker = tokio::time::interval(config.interval);
         ticker.tick().await; // first tick fires immediately; skip it
         loop {
             ticker.tick().await;
-            sweep_once(&app, &lease_table).await;
+            sweep_once_with_config(&app, &lease_table, config).await;
         }
     })
 }
@@ -263,7 +304,7 @@ mod tests {
             Ok(())
         }
 
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError>{
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
             Ok(true)
         }
 
@@ -383,13 +424,13 @@ mod tests {
             .acquire("runtime-1", "client-a", None, None)
             .await;
         // Stale enough to lose the write lock (past the 45s threshold) but
-        // nowhere near the 2h orphan threshold.
+        // nowhere near the default 30min orphan threshold.
         lease_table
             .set_last_heartbeat_ms_for_test(
                 "runtime-1",
                 current_time_ms()
                     .expect("wall clock")
-                    .saturating_sub(3_600_000),
+                    .saturating_sub(900_000),
             )
             .await;
         let runtime = Arc::new(TrackingRuntime::default());
