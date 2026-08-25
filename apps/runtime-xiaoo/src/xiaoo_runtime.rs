@@ -1,7 +1,11 @@
+use agent_runtime_protocol::{
+    decode_worker_response, encode_worker_request, worker_error_event, RuntimeCancelRequest,
+    RuntimeError, RuntimeStateSnapshot, WorkerRequest, WorkerResponse,
+};
 use async_trait::async_trait;
 use provider_protocol::{BackendId, ProviderControlError};
 use serde_json::{json, Value};
-use session_protocol::{SessionRuntimeCapability, SessionUsage};
+use session_protocol::SessionRuntimeCapability;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,18 +15,18 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{
     CapabilityFamily, CheckpointPayload, OpaqueRuntimeState, RuntimeAdapter, RuntimeEvent,
-    RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput, RuntimeLoadRequest,
-    RuntimeStartRequest, RuntimeTurnInput, SessionDomainError,
+    RuntimeEventReceiver, RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest,
+    RuntimeTurnInput, SessionDomainError,
 };
 use xgovernor_manager::InstanceManager;
 use xgovernor_runtime_pi::bridge::Bridge;
 use xiaoo_api::runtime::RuntimeState;
 
 use crate::map_provider_error;
-use crate::xiaoo_backend::{spawn_worker_process, PersistedLlm, WorkerConfig, WorkerResponse};
+use crate::xiaoo_backend::{spawn_worker_process, PersistedLlm, WorkerConfig};
 use crate::{
     clone_git_workspace, read_ext, state_from_opaque, state_to_opaque, validate_persisted_llm,
-    WorkerRequest, XiaooPersistedState, E2B_BACKEND_ID, EXT_NAMESPACE,
+    XiaooPersistedState, E2B_BACKEND_ID, EXT_NAMESPACE, STATE_SCHEMA_VERSION,
 };
 
 struct XiaooWorkerInstance {
@@ -35,6 +39,29 @@ struct XiaooWorkerInstance {
     active_turn: Mutex<Option<String>>,
     pending_interactions: Arc<Mutex<HashMap<String, String>>>,
     persisted: Mutex<XiaooPersistedState>,
+}
+
+fn map_runtime_error(error: RuntimeError) -> SessionDomainError {
+    match error {
+        RuntimeError::InvalidRequest { message, .. } | RuntimeError::StateCorrupt { message } => {
+            SessionDomainError::InvalidRequest { message }
+        }
+        RuntimeError::NotFound { runtime_id } => SessionDomainError::NotFound { runtime_id },
+        RuntimeError::Conflict { message, .. } => SessionDomainError::Conflict { message },
+        RuntimeError::UnsupportedCapability { capability } => {
+            SessionDomainError::UnsupportedCapability {
+                family: CapabilityFamily::Runtime,
+                capability,
+            }
+        }
+        RuntimeError::WorkerUnavailable { message, .. } => {
+            SessionDomainError::Unavailable { message }
+        }
+        RuntimeError::Internal { message } => SessionDomainError::Internal {
+            message,
+            source: None,
+        },
+    }
 }
 
 pub struct XiaooRuntime {
@@ -87,19 +114,13 @@ impl XiaooRuntime {
         instance: &XiaooWorkerInstance,
         request: WorkerRequest,
     ) -> Result<(), SessionDomainError> {
-        let line = serde_json::to_string(&request).map_err(|e| SessionDomainError::Internal {
+        let line = encode_worker_request(&request).map_err(|e| SessionDomainError::Internal {
             message: e.to_string(),
             source: None,
         })?;
         let mut stdin = instance.stdin.lock().await;
         stdin
             .write_all(line.as_bytes())
-            .await
-            .map_err(|e| SessionDomainError::Unavailable {
-                message: format!("xiaoO worker write failed: {e}"),
-            })?;
-        stdin
-            .write_all(b"\n")
             .await
             .map_err(|e| SessionDomainError::Unavailable {
                 message: format!("xiaoO worker write failed: {e}"),
@@ -329,15 +350,7 @@ impl RuntimeAdapter for XiaooRuntime {
             *active = Some(input.turn_id.clone());
         }
         if let Err(error) = self
-            .send_worker(
-                &instance,
-                WorkerRequest::Run {
-                    turn_id: input.turn_id.clone(),
-                    text: input.text,
-                    model: input.llm.as_ref().and_then(|llm| llm.model.clone()),
-                    reasoning_effort: input.reasoning_effort,
-                },
-            )
+            .send_worker(&instance, WorkerRequest::SubmitTurn(input.clone()))
             .await
         {
             instance.active_turn.lock().await.take();
@@ -350,19 +363,14 @@ impl RuntimeAdapter for XiaooRuntime {
                 let read = instance.stdout.lock().await.read_line(&mut line).await;
                 if !matches!(read, Ok(n) if n > 0) {
                     let _ = tx
-                        .send(RuntimeEvent::Failed {
-                            error: RuntimeFailure {
-                                code: "xiaoo_worker_exited".into(),
-                                message: "xiaoO worker event stream closed".into(),
-                                retryable: true,
-                                details: Value::Null,
-                            },
-                            usage: SessionUsage::default(),
-                        })
+                        .send(worker_error_event(RuntimeError::WorkerUnavailable {
+                            message: "xiaoO worker event stream closed".into(),
+                            retryable: true,
+                        }))
                         .await;
                     break;
                 }
-                match serde_json::from_str::<WorkerResponse>(line.trim()) {
+                match decode_worker_response(&line) {
                     Ok(WorkerResponse::Event { event }) => {
                         let terminal = matches!(
                             event,
@@ -379,24 +387,31 @@ impl RuntimeAdapter for XiaooRuntime {
                             break;
                         }
                     }
-                    Ok(WorkerResponse::State { loop_state }) => {
-                        instance.persisted.lock().await.loop_state = loop_state
+                    Ok(WorkerResponse::State { state }) => {
+                        match state.decode("xiaoo", STATE_SCHEMA_VERSION) {
+                            Ok(loop_state) => {
+                                instance.persisted.lock().await.loop_state = loop_state
+                            }
+                            Err(error) => {
+                                let _ = tx.send(worker_error_event(error)).await;
+                                break;
+                            }
+                        }
                     }
-                    Ok(WorkerResponse::Error { message }) => {
+                    Ok(WorkerResponse::Error { error }) => {
+                        let _ = tx.send(worker_error_event(error)).await;
+                        break;
+                    }
+                    Ok(WorkerResponse::Ready | WorkerResponse::Unknown) => {}
+                    Err(error) => {
                         let _ = tx
-                            .send(RuntimeEvent::Failed {
-                                error: RuntimeFailure {
-                                    code: "xiaoo_worker_error".into(),
-                                    message,
-                                    retryable: false,
-                                    details: Value::Null,
-                                },
-                                usage: SessionUsage::default(),
-                            })
+                            .send(worker_error_event(RuntimeError::WorkerUnavailable {
+                                message: format!("invalid xiaoO worker response: {error}"),
+                                retryable: true,
+                            }))
                             .await;
                         break;
                     }
-                    _ => {}
                 }
             }
             instance.active_turn.lock().await.take();
@@ -425,14 +440,8 @@ impl RuntimeAdapter for XiaooRuntime {
         }
         pending.remove(&input.interaction_id);
         drop(pending);
-        self.send_worker(
-            &instance,
-            WorkerRequest::Answer {
-                interaction_id: input.interaction_id,
-                answer: input.answer,
-            },
-        )
-        .await
+        self.send_worker(&instance, WorkerRequest::AnswerInteraction(input))
+            .await
     }
 
     async fn cancel(
@@ -446,7 +455,14 @@ impl RuntimeAdapter for XiaooRuntime {
             .as_deref()
             .is_some_and(|active| turn_id.is_none() || turn_id == Some(active))
         {
-            self.send_worker(&instance, WorkerRequest::Cancel).await?;
+            self.send_worker(
+                &instance,
+                WorkerRequest::Cancel(RuntimeCancelRequest {
+                    runtime_id: runtime_id.into(),
+                    turn_id: turn_id.map(str::to_owned),
+                }),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -475,9 +491,10 @@ impl RuntimeAdapter for XiaooRuntime {
         validate_persisted_llm(&persisted.llm)?;
         self.send_worker(
             &instance,
-            WorkerRequest::LoadState {
-                loop_state: persisted.loop_state.clone(),
-            },
+            WorkerRequest::LoadState(
+                RuntimeStateSnapshot::try_new("xiaoo", STATE_SCHEMA_VERSION, &persisted.loop_state)
+                    .map_err(map_runtime_error)?,
+            ),
         )
         .await?;
         *instance.persisted.lock().await = persisted;

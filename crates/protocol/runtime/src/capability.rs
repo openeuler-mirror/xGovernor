@@ -10,4 +10,6 @@ pub enum RuntimeCapability {
     StateExport,
     ModelOverride,
     ReasoningControl,
+    #[serde(other)]
+    Unknown,
 }

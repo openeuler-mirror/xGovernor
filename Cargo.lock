@@ -45,9 +45,11 @@ dependencies = [
 name = "agent-runtime-protocol"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "session-protocol",
+ "tokio",
 ]
 
 [[package]]
@@ -3384,6 +3386,7 @@ dependencies = [
 name = "xgovernor-runtime-pi"
 version = "0.1.0"
 dependencies = [
+ "agent-runtime-protocol",
  "async-trait",
  "axum",
  "backend",
@@ -3407,6 +3410,7 @@ name = "xgovernor-runtime-xiaoo"
 version = "0.1.0"
 dependencies = [
  "agent-contracts",
+ "agent-runtime-protocol",
  "agent-types",
  "async-trait",
  "backend",

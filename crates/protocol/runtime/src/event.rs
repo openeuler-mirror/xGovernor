@@ -43,4 +43,13 @@ pub enum RuntimeEvent {
         namespace: String,
         payload: Value,
     },
+    /// A newer worker event that this host does not understand yet.
+    #[serde(other)]
+    Unknown,
+}
+
+impl RuntimeEvent {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed { .. } | Self::Failed { .. })
+    }
 }

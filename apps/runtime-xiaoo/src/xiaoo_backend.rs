@@ -1,10 +1,11 @@
+use agent_runtime_protocol::{decode_worker_response, RuntimeError, WorkerResponse};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, process::Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use xgovernor_core::{RuntimeEvent, SessionDomainError};
+use xgovernor_core::SessionDomainError;
 use xiaoo_core::LoopStateSnapshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,15 +15,6 @@ pub struct PersistedLlm {
     pub(crate) api_key_env: String,
     #[serde(default)]
     pub(crate) api_base: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum WorkerResponse {
-    Event { event: RuntimeEvent },
-    State { loop_state: LoopStateSnapshot },
-    Ready,
-    Error { message: String },
 }
 
 #[derive(Serialize)]
@@ -467,9 +459,16 @@ pub async fn spawn_worker_process(
         .map_err(|error| SessionDomainError::Unavailable {
             message: format!("failed to read xiaoO worker readiness: {error}"),
         })?;
-    match serde_json::from_str::<WorkerResponse>(ready.trim()) {
+    match decode_worker_response(&ready) {
         Ok(WorkerResponse::Ready) => Ok((child, stdin, stdout)),
-        Ok(WorkerResponse::Error { message }) => Err(SessionDomainError::Unavailable { message }),
+        Ok(WorkerResponse::Error { error }) => Err(SessionDomainError::Unavailable {
+            message: match error {
+                RuntimeError::WorkerUnavailable { message, .. }
+                | RuntimeError::StateCorrupt { message }
+                | RuntimeError::Internal { message } => message,
+                other => format!("xiaoO worker startup failed: {other:?}"),
+            },
+        }),
         Ok(other) => Err(SessionDomainError::Unavailable {
             message: format!("xiaoO worker sent unexpected readiness response: {other:?}"),
         }),

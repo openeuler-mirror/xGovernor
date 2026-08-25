@@ -16,6 +16,7 @@ uuid.workspace = true
 session-protocol = { path = "../../crates/protocol/session" }
 provider-protocol = { path = "../../crates/protocol/provider" }
 operation-protocol = { path = "../../crates/protocol/operation" }
+agent-runtime-protocol = { path = "../../crates/protocol/runtime" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }

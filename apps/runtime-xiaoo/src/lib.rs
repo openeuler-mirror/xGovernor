@@ -10,9 +10,7 @@ use operation_protocol::capability::exec::ExecRequest;
 use provider_protocol::ProviderControlError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use session_protocol::{
-    SessionInteractionAnswer, SessionToolActivityPhase, SessionToolActivityStatus, SessionUsage,
-};
+use session_protocol::{SessionToolActivityPhase, SessionToolActivityStatus, SessionUsage};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -58,26 +56,6 @@ pub(crate) struct XiaooPersistedState {
     provider_options: Value,
     llm: PersistedLlm,
     loop_state: LoopStateSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum WorkerRequest {
-    Run {
-        turn_id: String,
-        text: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-    },
-    Answer {
-        interaction_id: String,
-        answer: SessionInteractionAnswer,
-    },
-    LoadState {
-        loop_state: LoopStateSnapshot,
-    },
-    Cancel,
-    Shutdown,
 }
 
 pub struct XiaooSessionEnvironment {

@@ -39,6 +39,7 @@ fn capability(capability: RuntimeCapability) -> Option<SessionRuntimeCapability>
         RuntimeCapability::StateExport => SessionRuntimeCapability::StateExport,
         RuntimeCapability::ModelOverride => SessionRuntimeCapability::ModelOverride,
         RuntimeCapability::ReasoningControl => SessionRuntimeCapability::ReasoningControl,
+        RuntimeCapability::Unknown => return None,
     })
 }
 

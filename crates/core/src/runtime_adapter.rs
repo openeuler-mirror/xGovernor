@@ -223,5 +223,11 @@ pub fn project_runtime_event(
             namespace,
             payload,
         },
+        RuntimeEvent::Unknown => SessionEvent::Extension {
+            runtime_id: runtime_id.into(),
+            turn_id: Some(turn_id.into()),
+            namespace: "runtime.unknown".into(),
+            payload: serde_json::Value::Null,
+        },
     }
 }
