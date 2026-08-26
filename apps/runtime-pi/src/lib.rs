@@ -1,8 +1,12 @@
 pub mod bridge;
 mod session_file;
+pub mod worker;
+
+pub use worker::run_worker_from_env;
 
 use agent_runtime_protocol::{
-    worker_error_event, RuntimeCancelRequest, RuntimeError, WorkerRequest, WorkerResponse,
+    decode_worker_response, encode_worker_request, worker_error_event, RuntimeCancelRequest,
+    RuntimeError, WorkerRequest, WorkerResponse,
 };
 use async_trait::async_trait;
 use bridge::Bridge;
@@ -12,23 +16,20 @@ use provider_protocol::{BackendId, ProviderControlError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_protocol::{
-    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionInteractionOption,
-    SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
-    SessionTurnOutcome, SessionUsage,
+    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionRuntimeCapability,
+    SessionUsage,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{
     enforce_workspace_axiom, CheckpointPayload, IsolationBoundary, IsolationFacts,
     NetworkIsolation, NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm,
-    RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver, RuntimeFailure, RuntimeInteractionInput,
+    RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver, RuntimeInteractionInput,
     RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput, SandboxCapability, SecurityContext,
     SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess, WorkspaceFacts,
 };
@@ -91,7 +92,7 @@ const E2B_BACKEND_ID: &str = "e2b";
 const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
 const PI_LLM_STATE_FILE: &str = ".xgovernor-llm.json";
 const PI_MODEL_COMMAND: &str = "xgovernor-model";
-const PI_RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const PI_WORKER_ENV: &str = "XGOVERNOR_PI_WORKER";
 
 /// Fully resolved, per-session Pi model configuration. This is deliberately
 /// provider-neutral: `provider` and `model` are passed through exactly as the
@@ -578,53 +579,20 @@ fn map_provider_error(error: ProviderControlError) -> SessionDomainError {
     }
 }
 
-/// The turn `submit_turn` most recently accepted for a given [`PiInstance`],
-/// still tracked here until an `agent_settled` (or process exit) resolves it.
-/// A `pi` process only ever drives one turn at a time in this adapter's usage
-/// (`submit_turn` rejects a second concurrent submission — see its impl), so
-/// a single `Option` slot, not a map keyed by `turn_id`, is enough.
+/// Supervisor-side metadata for the single turn currently owned by a worker.
+/// Pi-native state and event sequencing live exclusively in `pi-worker`.
 struct CurrentTurn {
     turn_id: String,
-    tx: mpsc::Sender<WorkerResponse>,
-    /// Set by `cancel()` right before it sends `abort` to the process. Read
-    /// by the `agent_settled` handler to decide whether the terminal event
-    /// should report `Cancelled` or `Complete` — using our own request
-    /// rather than trying to parse Pi's `stopReason` back out, since we
-    /// already know unambiguously whether we asked for an abort.
-    aborted: bool,
-    /// `interaction_id` -> Pi dialog `method`, so `answer_interaction` knows
-    /// how to shape the `extension_ui_response` value it sends back.
     pending_interactions: HashMap<String, String>,
-    /// Monotonic counter backing `OutputDelta.sequence`. Deliberately not
-    /// derived from Pi's own `contentIndex` (which resets per content
-    /// block/message) since `RuntimeEvent::OutputDelta.sequence` is meant to
-    /// be strictly increasing across the whole turn.
-    output_sequence: u64,
 }
 
-impl CurrentTurn {
-    fn next_output_sequence(&mut self) -> u64 {
-        let sequence = self.output_sequence;
-        self.output_sequence += 1;
-        sequence
-    }
-
-    async fn send_event(&self, event: RuntimeEvent) {
-        let _ = self.tx.send(WorkerResponse::Event { event }).await;
-    }
-}
-
-/// One running `pi --mode rpc` subprocess and the plumbing needed to write
-/// commands to its stdin and correlate its stdout events back to whichever
-/// turn is currently in flight.
+/// One running `pi-worker` subprocess. The worker owns the nested
+/// `pi --mode rpc` process and translates its native protocol.
 struct PiInstance {
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
+    stdout: Mutex<BufReader<ChildStdout>>,
     current_turn: Mutex<Option<CurrentTurn>>,
-    /// Correlates the small number of RPC commands for which the adapter must
-    /// observe acceptance before continuing (currently per-turn model
-    /// selection). Normal prompts keep their existing asynchronous contract.
-    pending_responses: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     /// Bearer token this instance's backend is registered under on the
     /// shared [`Bridge`]. `stop()` unregisters it so a dangling token can't
     /// keep proxying to a backend whose sandbox is about to be torn down.
@@ -639,23 +607,22 @@ struct PiInstance {
     /// a restart — see [`PiPersistedState`]. Immutable snapshot taken at
     /// `start()` time; `export_state()` just clones and re-wraps it.
     persisted_state: PiPersistedState,
-    session_dir: PathBuf,
     activity: Arc<tokio::sync::RwLock<()>>,
 }
 
-/// `RuntimeAdapter` backed by real `pi --mode rpc` subprocesses, one per
-/// started `runtime_id`. Composes one `InstanceManager` per provider
+/// `RuntimeAdapter` backed by one `pi-worker` subprocess per `runtime_id`.
+/// Each worker owns one nested `pi --mode rpc` process. Composes one
+/// `InstanceManager` per provider
 /// `backend_id` this runtime is willing to provision sandboxes against
 /// (`managers`), plus a single shared [`Bridge`] HTTP server (bound once at
 /// construction, alive for this `PiRuntime`'s entire lifetime) that proxies
 /// Pi's tool calls to whichever backend `start()` attached for that session.
-/// See the module doc for why the `pi` process's own RPC control channel is
-/// still `tokio::process`, not `operation-protocol`.
 pub struct PiRuntime {
     managers: HashMap<String, Arc<InstanceManager>>,
     bridge: Arc<Bridge>,
     instances: RwLock<HashMap<String, Arc<PiInstance>>>,
     pi_session_root: PathBuf,
+    worker_executable: PathBuf,
 }
 
 impl PiRuntime {
@@ -679,12 +646,27 @@ impl PiRuntime {
         managers: HashMap<String, Arc<InstanceManager>>,
         pi_session_root: PathBuf,
     ) -> std::io::Result<Self> {
+        let worker_executable = std::env::var_os(PI_WORKER_ENV)
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_exe().ok())
+            .unwrap_or_else(|| PathBuf::from("pi-worker"));
+        Self::new_with_worker(managers, pi_session_root, worker_executable)
+    }
+
+    /// Constructs a supervisor with an explicit worker binary. Integration
+    /// tests use this to launch Cargo's standalone `pi-worker` artifact.
+    pub fn new_with_worker(
+        managers: HashMap<String, Arc<InstanceManager>>,
+        pi_session_root: PathBuf,
+        worker_executable: PathBuf,
+    ) -> std::io::Result<Self> {
         let bridge = Bridge::spawn()?;
         Ok(Self {
             managers,
             bridge,
             instances: RwLock::new(HashMap::new()),
             pi_session_root,
+            worker_executable,
         })
     }
 
@@ -954,177 +936,27 @@ struct PreparedStart {
     destroy_sandbox_on_spawn_failure: bool,
 }
 
-async fn write_command(instance: &PiInstance, command: &Value) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(command).expect("command must serialize to JSON");
-    line.push('\n');
-    let mut stdin = instance.stdin.lock().await;
-    stdin.write_all(line.as_bytes()).await?;
-    stdin.flush().await
-}
-
-/// Last-mile translation from the shared worker contract to Pi's native RPC.
-/// Keeping this private means the adapter surface no longer depends on Pi's
-/// command vocabulary, while the Pi process and extension remain unchanged.
 async fn send_worker_request(
     instance: &PiInstance,
     request: WorkerRequest,
 ) -> Result<(), SessionDomainError> {
-    let (command, write_error_context) = match request {
-        WorkerRequest::SubmitTurn(request) => (
-            json!({
-                "type": "prompt",
-                "id": request.turn_id,
-                "message": request.text,
-            }),
-            "failed to send prompt to pi process",
-        ),
-        WorkerRequest::AnswerInteraction(request) => {
-            let method = {
-                let mut guard = instance.current_turn.lock().await;
-                let turn = guard
-                    .as_mut()
-                    .ok_or_else(|| SessionDomainError::InvalidRequest {
-                        message: format!("no active turn for runtime '{}'", request.runtime_id),
-                    })?;
-                if turn.turn_id != request.turn_id {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: format!(
-                            "turn '{}' is not the active turn for runtime '{}'",
-                            request.turn_id, request.runtime_id
-                        ),
-                    });
-                }
-                turn.pending_interactions
-                    .remove(&request.interaction_id)
-                    .ok_or_else(|| SessionDomainError::InvalidRequest {
-                        message: format!(
-                            "no pending interaction '{}' for runtime '{}'",
-                            request.interaction_id, request.runtime_id
-                        ),
-                    })?
-            };
-            let value = map_answer_to_pi_value(&method, &request.answer)?;
-            (
-                json!({
-                    "type": "extension_ui_response",
-                    "id": request.interaction_id,
-                    "value": value,
-                }),
-                "failed to send extension_ui_response to pi process",
-            )
-        }
-        WorkerRequest::Cancel(request) => {
-            let mut guard = instance.current_turn.lock().await;
-            let Some(turn) = guard.as_mut() else {
-                return Ok(());
-            };
-            if request
-                .turn_id
-                .as_deref()
-                .is_some_and(|turn_id| turn_id != turn.turn_id)
-            {
-                return Ok(());
-            }
-            turn.aborted = true;
-            (
-                json!({ "type": "abort" }),
-                "failed to send abort to pi process",
-            )
-        }
-        WorkerRequest::Shutdown => return Ok(()),
-        WorkerRequest::LoadState(_) => {
-            return Err(SessionDomainError::UnsupportedCapability {
-                family: xgovernor_core::CapabilityFamily::Runtime,
-                capability: "state_export".into(),
-            });
-        }
-    };
-
-    write_command(instance, &command)
+    let line = encode_worker_request(&request).map_err(|error| SessionDomainError::Internal {
+        message: format!("failed to encode Pi worker request: {error}"),
+        source: None,
+    })?;
+    let mut stdin = instance.stdin.lock().await;
+    stdin
+        .write_all(line.as_bytes())
         .await
         .map_err(|error| SessionDomainError::Unavailable {
-            message: format!("{write_error_context}: {error}"),
-        })
-}
-
-async fn write_command_for_response(
-    instance: &PiInstance,
-    command: Value,
-) -> Result<Value, SessionDomainError> {
-    let id = command
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| SessionDomainError::Internal {
-            message: "correlated pi RPC command is missing an id".to_string(),
-            source: None,
-        })?
-        .to_string();
-    let (tx, rx) = oneshot::channel();
-    instance
-        .pending_responses
-        .lock()
-        .await
-        .insert(id.clone(), tx);
-    if let Err(error) = write_command(instance, &command).await {
-        instance.pending_responses.lock().await.remove(&id);
-        return Err(SessionDomainError::Unavailable {
-            message: format!("failed to write correlated pi RPC command: {error}"),
-        });
-    }
-    let response = timeout(PI_RPC_RESPONSE_TIMEOUT, rx)
-        .await
-        .map_err(|_| SessionDomainError::Timeout {
-            operation: "pi_rpc_response".to_string(),
-            timeout_ms: PI_RPC_RESPONSE_TIMEOUT.as_millis() as u64,
-        })?
-        .map_err(|_| SessionDomainError::Unavailable {
-            message: "pi process exited before replying to RPC command".to_string(),
+            message: format!("Pi worker write failed: {error}"),
         })?;
-    if !response
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(SessionDomainError::InvalidRequest {
-            message: response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("pi rejected model configuration")
-                .to_string(),
-        });
-    }
-    Ok(response)
-}
-
-async fn configure_instance_llm(
-    instance: &PiInstance,
-    config: &PiLlmConfig,
-) -> Result<(), SessionDomainError> {
-    use base64::Engine as _;
-
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(config).expect("PiLlmConfig always serializes"));
-    let id = format!("xgovernor-model-{}", Uuid::new_v4());
-    write_command_for_response(
-        instance,
-        json!({
-            "id": id,
-            "type": "prompt",
-            "message": format!("/{PI_MODEL_COMMAND} {encoded}"),
-        }),
-    )
-    .await?;
-    write_command_for_response(
-        instance,
-        json!({
-            "id": format!("xgovernor-set-model-{}", Uuid::new_v4()),
-            "type": "set_model",
-            "provider": config.provider,
-            "modelId": config.model,
-        }),
-    )
-    .await?;
-    persist_llm_config(&instance.session_dir, config).await
+    stdin
+        .flush()
+        .await
+        .map_err(|error| SessionDomainError::Unavailable {
+            message: format!("Pi worker flush failed: {error}"),
+        })
 }
 
 fn map_answer_to_pi_value(
@@ -1179,358 +1011,73 @@ fn extract_usage(message: &Value) -> SessionUsage {
     }
 }
 
-async fn handle_response(instance: &PiInstance, message: &Value) {
-    if let Some(id) = message.get("id").and_then(Value::as_str) {
-        if let Some(waiter) = instance.pending_responses.lock().await.remove(id) {
-            let _ = waiter.send(message.clone());
-            return;
-        }
-    }
-    let command = message.get("command").and_then(Value::as_str).unwrap_or("");
-    let success = message
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    // Only the `prompt` command's rejection matters here: it means the turn
-    // `submit_turn` thought it had accepted never actually started, so the
-    // caller needs a terminal `Failed` event rather than silence. `abort`'s
-    // response is not surfaced — a failed abort is not actionable beyond
-    // what already happens (the turn simply keeps running to its own
-    // terminal state).
-    if command != "prompt" || success {
-        return;
-    }
-    let error_text = message
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| "pi rejected the prompt command".to_string());
-
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.take() else { return };
-    drop(guard);
-    turn.send_event(RuntimeEvent::Failed {
-        error: RuntimeFailure {
-            code: "pi_prompt_rejected".to_string(),
-            message: error_text,
-            retryable: false,
-            details: message.clone(),
-        },
-        usage: SessionUsage::default(),
-    })
-    .await;
-}
-
-async fn handle_message_update(instance: &PiInstance, message: &Value) {
-    // Real pi RPC shape (verified against pi 0.84.2 on the wire): text
-    // streamed during a turn arrives as `message_update` with the delta
-    // under `assistantMessageEvent: {"type": "text_delta"|"thinking_delta",
-    // "delta": "..."}` — there is no top-level `delta` field. `text_start`/
-    // `text_end`/`thinking_start`/`thinking_end` carry no per-chunk text
-    // (the `_end` variants repeat the full content, which the deltas already
-    // covered), so only the two `*_delta` types are mapped.
-    let Some(assistant_event) = message.get("assistantMessageEvent") else {
-        return;
-    };
-    let delta_type = assistant_event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let text = match delta_type {
-        "text_delta" | "thinking_delta" => assistant_event.get("delta").and_then(Value::as_str),
-        // `toolcall_delta` (incremental tool-call argument streaming) has no
-        // `OutputDelta` equivalent in the normalized vocabulary; the
-        // completed call is instead surfaced via `tool_execution_start`/
-        // `tool_execution_end` below as a `ToolActivity` pair.
-        _ => None,
-    };
-    let Some(text) = text else { return };
-    let stream_id = if delta_type == "thinking_delta" {
-        "thinking"
-    } else {
-        "assistant"
-    };
-
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.as_mut() else { return };
-    let sequence = turn.next_output_sequence();
-    turn.send_event(RuntimeEvent::OutputDelta {
-        stream_id: stream_id.to_string(),
-        sequence,
-        delta: text.to_string(),
-    })
-    .await;
-}
-
-async fn handle_tool_execution_start(instance: &PiInstance, message: &Value) {
-    let Some(activity_id) = message.get("toolCallId").and_then(Value::as_str) else {
-        return;
-    };
-    let name = message
-        .get("toolName")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
-    let summary = message.get("input").map(|value| value.to_string());
-
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.as_mut() else { return };
-    turn.send_event(RuntimeEvent::ToolActivity {
-        activity_id: activity_id.to_string(),
-        phase: SessionToolActivityPhase::Begin,
-        name,
-        status: SessionToolActivityStatus::Running,
-        summary,
-        ext: Default::default(),
-    })
-    .await;
-}
-
-async fn handle_tool_execution_end(instance: &PiInstance, message: &Value) {
-    let Some(activity_id) = message.get("toolCallId").and_then(Value::as_str) else {
-        return;
-    };
-    let name = message
-        .get("toolName")
-        .and_then(Value::as_str)
-        .unwrap_or("tool")
-        .to_string();
-    let is_error = message
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let status = if is_error {
-        SessionToolActivityStatus::Failed
-    } else {
-        SessionToolActivityStatus::Succeeded
-    };
-    let summary = message.get("result").map(|value| value.to_string());
-
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.as_mut() else { return };
-    turn.send_event(RuntimeEvent::ToolActivity {
-        activity_id: activity_id.to_string(),
-        phase: SessionToolActivityPhase::End,
-        name,
-        status,
-        summary,
-        ext: Default::default(),
-    })
-    .await;
-}
-
-async fn handle_extension_ui_request(instance: &PiInstance, message: &Value) {
-    let Some(id) = message.get("id").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return;
-    };
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-
-    if !DIALOG_METHODS.contains(&method) {
-        // Fire-and-forget UI directive: no `extension_ui_response` is
-        // expected, so this cannot be modeled as `InteractionRequested`
-        // (which implies the runtime is blocked awaiting
-        // `answer_interaction`). Surface it through the `Extension` escape
-        // hatch instead of silently dropping it.
-        let mut guard = instance.current_turn.lock().await;
-        if let Some(turn) = guard.as_mut() {
-            turn.send_event(RuntimeEvent::Extension {
-                namespace: "pi.ui".to_string(),
-                payload: json!({ "method": method, "params": params }),
-            })
-            .await;
-        }
-        return;
-    }
-
-    let prompt = params
-        .get("message")
-        .or_else(|| params.get("prompt"))
-        .and_then(Value::as_str)
-        .unwrap_or(method)
-        .to_string();
-
-    let options: Vec<SessionInteractionOption> = params
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .enumerate()
-                .filter_map(|(index, option)| match option {
-                    Value::String(text) => Some(SessionInteractionOption {
-                        id: text.clone(),
-                        label: text.clone(),
-                        description: None,
-                        value: option.clone(),
-                    }),
-                    Value::Object(_) => {
-                        let id = option
-                            .get("id")
-                            .or_else(|| option.get("value"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .unwrap_or_else(|| index.to_string());
-                        let label = option
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        Some(SessionInteractionOption {
-                            id,
-                            label,
-                            description: None,
-                            value: option.clone(),
-                        })
-                    }
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.as_mut() else {
-        // No active turn to attach this interaction to — should not happen
-        // in practice, since Pi only emits UI requests while driving a turn
-        // this adapter submitted. Nothing to do but drop it.
-        return;
-    };
-    turn.pending_interactions
-        .insert(id.to_string(), method.to_string());
-    turn.send_event(RuntimeEvent::InteractionRequested {
-        interaction_id: id.to_string(),
-        interaction_kind: method.to_string(),
-        prompt,
-        options,
-        ext: Default::default(),
-    })
-    .await;
-}
-
-async fn handle_agent_settled(instance: &PiInstance, message: &Value) {
-    let mut guard = instance.current_turn.lock().await;
-    let Some(turn) = guard.take() else { return };
-    drop(guard);
-
-    let usage = extract_usage(message);
-
-    if let Some(error) = message.get("error").filter(|value| !value.is_null()) {
-        turn.send_event(RuntimeEvent::Failed {
-            error: RuntimeFailure {
-                code: "pi_agent_error".to_string(),
-                message: error
-                    .as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| error.to_string()),
-                retryable: false,
-                details: error.clone(),
-            },
-            usage,
-        })
-        .await;
-        return;
-    }
-
-    let outcome = if turn.aborted {
-        SessionTurnOutcome::Cancelled
-    } else {
-        SessionTurnOutcome::Complete
-    };
-    turn.send_event(RuntimeEvent::Completed { outcome, usage })
-        .await;
-}
-
-async fn handle_pi_message(instance: &PiInstance, message: Value) {
-    let Some(kind) = message.get("type").and_then(Value::as_str) else {
-        tracing::warn!(?message, "pi rpc event missing 'type'");
-        return;
-    };
-
-    match kind {
-        "response" => handle_response(instance, &message).await,
-        "message_update" => handle_message_update(instance, &message).await,
-        "tool_execution_start" => handle_tool_execution_start(instance, &message).await,
-        "tool_execution_end" => handle_tool_execution_end(instance, &message).await,
-        "extension_ui_request" => handle_extension_ui_request(instance, &message).await,
-        "agent_settled" => handle_agent_settled(instance, &message).await,
-        // `agent_start`/`message_start`/`message_end`/`turn_start`/
-        // `turn_end`/`tool_execution_update`/`agent_end`: no direct
-        // `RuntimeEvent` mapping in this minimal-closed-loop scope.
-        // `agent_end` may carry `willRetry: true`, meaning `agent_settled`
-        // (the true terminal point, per Pi's own docs) has not fired yet —
-        // deliberately not treated as terminal here.
-        _ => {}
-    }
-}
-
-async fn forward_worker_responses(
-    mut worker_rx: mpsc::Receiver<WorkerResponse>,
+async fn read_worker_turn(
+    instance: Arc<PiInstance>,
+    turn_id: String,
     output: mpsc::Sender<RuntimeEvent>,
 ) {
-    while let Some(response) = worker_rx.recv().await {
-        let event = match response {
-            WorkerResponse::Event { event } => event,
-            WorkerResponse::Error { error } => worker_error_event(error),
-            WorkerResponse::Ready | WorkerResponse::State { .. } | WorkerResponse::Unknown => {
-                continue
+    let mut terminal_sent = false;
+    while !terminal_sent {
+        let mut line = String::new();
+        let read = instance.stdout.lock().await.read_line(&mut line).await;
+        let stream_closed = !matches!(read, Ok(count) if count > 0);
+        let response = match read {
+            Ok(0) => Err(RuntimeError::WorkerUnavailable {
+                message: "Pi worker event stream closed".into(),
+                retryable: true,
+            }),
+            Ok(_) => {
+                decode_worker_response(&line).map_err(|error| RuntimeError::WorkerUnavailable {
+                    message: format!("invalid Pi worker response: {error}"),
+                    retryable: true,
+                })
             }
+            Err(error) => Err(RuntimeError::WorkerUnavailable {
+                message: format!("failed to read Pi worker response: {error}"),
+                retryable: true,
+            }),
         };
-        let terminal = event.is_terminal();
-        if output.send(event).await.is_err() || terminal {
+
+        let event = match response {
+            Ok(WorkerResponse::Event { event }) => Some(event),
+            Ok(WorkerResponse::Error { error }) => Some(worker_error_event(error)),
+            Ok(WorkerResponse::Ready | WorkerResponse::State { .. } | WorkerResponse::Unknown) => {
+                None
+            }
+            Err(error) => Some(worker_error_event(error)),
+        };
+
+        if let Some(event) = event {
+            if let RuntimeEvent::InteractionRequested {
+                interaction_id,
+                interaction_kind,
+                ..
+            } = &event
+            {
+                let mut current = instance.current_turn.lock().await;
+                if let Some(turn) = current
+                    .as_mut()
+                    .filter(|current| current.turn_id == turn_id)
+                {
+                    turn.pending_interactions
+                        .insert(interaction_id.clone(), interaction_kind.clone());
+                }
+            }
+            terminal_sent = event.is_terminal();
+            let _ = output.send(event).await;
+        }
+
+        if stream_closed {
             break;
         }
     }
-}
 
-async fn read_events(instance: Arc<PiInstance>, stdout: ChildStdout) {
-    let mut lines = BufReader::new(stdout).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(parsed) => handle_pi_message(&instance, parsed).await,
-                    Err(error) => {
-                        tracing::warn!(%error, %line, "failed to parse pi rpc event line");
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                tracing::warn!(%error, "error reading pi rpc stdout");
-                break;
-            }
-        }
-    }
-
-    let pending = std::mem::take(&mut *instance.pending_responses.lock().await);
-    drop(pending);
-
-    // The process ended (or its stdout pipe broke) while a turn was still in
-    // flight: surface a terminal `Failed` event so the caller does not hang
-    // forever waiting for one that will never come.
-    if let Some(turn) = instance.current_turn.lock().await.take() {
-        let _ = turn
-            .tx
-            .send(WorkerResponse::Error {
-                error: RuntimeError::WorkerUnavailable {
-                    message: "Pi worker exited before the turn reached a terminal state".into(),
-                    retryable: true,
-                },
-            })
-            .await;
-    }
-}
-
-async fn log_stderr(runtime_id: String, stderr: ChildStderr) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(runtime_id = %runtime_id, "pi stderr: {line}");
+    let mut current = instance.current_turn.lock().await;
+    if current
+        .as_ref()
+        .is_some_and(|current| current.turn_id == turn_id)
+    {
+        current.take();
     }
 }
 
@@ -1610,83 +1157,40 @@ impl RuntimeAdapter for PiRuntime {
             Arc::clone(&activity),
         );
 
-        let mut command = Command::new(&executable);
-        command
-            .arg("--mode")
-            .arg("rpc")
-            .arg("-e")
-            .arg(&extension_dir)
-            .arg("--session-dir")
-            .arg(&session_dir)
-            .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
-            .env("XGOVERNOR_BRIDGE_TOKEN", &bridge_token)
-            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0);
-        // Root the `pi` process in the sandbox workspace directory so pi's
-        // session cwd (and thus the "Current working directory" line pi writes
-        // into its system prompt) matches the workspace the model actually
-        // operates against. Only the `local` backend's workspace root is a
-        // real directory on this daemon host; the `e2b` backend's root
-        // (`/home/user/workspace`) lives on the remote sandbox, so the process
-        // cannot chdir into it from here and keeps the host cwd.
-        if persisted_state.backend_id == LOCAL_BACKEND_ID {
-            command.current_dir(&workspace_root.0);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Restoration only (`prepare_resume` set this): point `pi` at the
-        // exact session file it should reload, on top of `--session-dir`
-        // (`docs/pi_session_restore_plan.md` §1.2).
-        if let Some(session_file) = &resume_session_file {
-            command.arg("--session").arg(session_file);
-        }
-        if let Err(error) = configure_pi_launch(&mut command, &session_dir, llm.as_ref()).await {
-            self.bridge.unregister(&bridge_token);
-            if destroy_sandbox_on_spawn_failure {
-                let _ = manager.stop_instance(&request.runtime_id).await;
-            }
-            return Err(error);
-        }
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                // Compensating cleanup: the bridge registration must not
-                // outlive the process that was supposed to use it. The
-                // sandbox itself is only ours to tear down on a cold start —
-                // see `PreparedStart::destroy_sandbox_on_spawn_failure`'s doc.
-                self.bridge.unregister(&bridge_token);
-                if destroy_sandbox_on_spawn_failure {
-                    let _ = manager.stop_instance(&request.runtime_id).await;
-                }
-                return Err(SessionDomainError::Unavailable {
-                    message: format!("failed to spawn pi executable '{executable}': {error}"),
-                });
-            }
+        let worker_config = worker::PiWorkerConfig {
+            runtime_id: request.runtime_id.clone(),
+            executable,
+            extension_dir,
+            session_dir: session_dir.clone(),
+            resume_session_file,
+            bridge_url: self.bridge.base_url(),
+            bridge_token: bridge_token.clone(),
+            workspace_root: workspace_root.0.clone(),
+            use_workspace_cwd: persisted_state.backend_id == LOCAL_BACKEND_ID,
+            llm,
         };
-
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take();
+        let (child, stdin, stdout) =
+            match worker::spawn_worker_process(&self.worker_executable, &worker_config).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.bridge.unregister(&bridge_token);
+                    if destroy_sandbox_on_spawn_failure {
+                        let _ = manager.stop_instance(&request.runtime_id).await;
+                    }
+                    return Err(error);
+                }
+            };
 
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
+            stdout: Mutex::new(stdout),
             current_turn: Mutex::new(None),
-            pending_responses: Mutex::new(HashMap::new()),
             bridge_token,
             manager,
             persisted_state,
-            session_dir,
             activity,
         });
-
-        tokio::spawn(read_events(Arc::clone(&instance), stdout));
-        if let Some(stderr) = stderr {
-            tokio::spawn(log_stderr(request.runtime_id.clone(), stderr));
-        }
 
         self.instances
             .write()
@@ -1705,13 +1209,14 @@ impl RuntimeAdapter for PiRuntime {
                 runtime_id: runtime_id.to_string(),
             });
         };
+        let _ = send_worker_request(&instance, WorkerRequest::Shutdown).await;
         {
             let mut child = instance.child.lock().await;
             if let Err(error) = child.start_kill() {
                 // Already exited is fine; anything else is worth logging but
                 // not worth failing `stop` over — the registry entry is
                 // already gone.
-                tracing::debug!(runtime_id = %runtime_id, %error, "start_kill on pi process failed");
+                tracing::debug!(runtime_id = %runtime_id, %error, "start_kill on Pi worker failed");
             }
             let _ = child.wait().await;
         }
@@ -1821,64 +1326,40 @@ impl RuntimeAdapter for PiRuntime {
             workspace_root.clone(),
             Arc::clone(&activity),
         );
-        let mut command = Command::new(executable);
-        command
-            .arg("--mode")
-            .arg("rpc")
-            .arg("-e")
-            .arg(extension_dir)
-            .arg("--session-dir")
-            .arg(&session_dir)
-            .env("XGOVERNOR_BRIDGE_URL", self.bridge.base_url())
-            .env("XGOVERNOR_BRIDGE_TOKEN", &token)
-            .env("XGOVERNOR_WORKSPACE_ROOT", &workspace_root.0);
-        if state.backend_id == LOCAL_BACKEND_ID {
-            command.current_dir(&workspace_root.0);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Ok(file) = session_file::latest_complete_turn_file(&session_dir) {
-            command.arg("--session").arg(file);
-        }
-        if let Err(error) = configure_pi_launch(&mut command, &session_dir, llm.as_ref()).await {
-            self.bridge.unregister(&token);
-            let _ = manager.stop_instance(&request.new_runtime_id).await;
-            return Err(error);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                self.bridge.unregister(&token);
-                let _ = manager.stop_instance(&request.new_runtime_id).await;
-                return Err(SessionDomainError::Unavailable {
-                    message: format!("failed to spawn pi from checkpoint: {error}"),
-                });
-            }
+        let worker_config = worker::PiWorkerConfig {
+            runtime_id: request.new_runtime_id.clone(),
+            executable,
+            extension_dir,
+            session_dir: session_dir.clone(),
+            resume_session_file: session_file::latest_complete_turn_file(&session_dir).ok(),
+            bridge_url: self.bridge.base_url(),
+            bridge_token: token.clone(),
+            workspace_root: workspace_root.0.clone(),
+            use_workspace_cwd: state.backend_id == LOCAL_BACKEND_ID,
+            llm,
         };
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take();
+        let (child, stdin, stdout) =
+            match worker::spawn_worker_process(&self.worker_executable, &worker_config).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.bridge.unregister(&token);
+                    let _ = manager.stop_instance(&request.new_runtime_id).await;
+                    return Err(error);
+                }
+            };
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
+            stdout: Mutex::new(stdout),
             current_turn: Mutex::new(None),
-            pending_responses: Mutex::new(HashMap::new()),
             bridge_token: token,
             manager,
             persisted_state: PiPersistedState {
                 pi_session_dir: session_dir.to_string_lossy().into_owned(),
                 ..state
             },
-            session_dir,
             activity,
         });
-        tokio::spawn(read_events(Arc::clone(&instance), stdout));
-        if let Some(stderr) = stderr {
-            tokio::spawn(log_stderr(request.new_runtime_id.clone(), stderr));
-        }
         self.instances
             .write()
             .await
@@ -1935,8 +1416,10 @@ impl RuntimeAdapter for PiRuntime {
         &self,
         input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, SessionDomainError> {
+        // Keep malformed model overrides as synchronous API errors. The
+        // worker performs the actual Pi model reconfiguration.
+        resolve_llm(input.llm.as_ref())?;
         let instance = self.instance_for(&input.runtime_id).await?;
-        let (worker_tx, worker_rx) = mpsc::channel(32);
         let (tx, rx) = mpsc::channel(32);
 
         {
@@ -1951,33 +1434,17 @@ impl RuntimeAdapter for PiRuntime {
             }
             *guard = Some(CurrentTurn {
                 turn_id: input.turn_id.clone(),
-                tx: worker_tx,
-                aborted: false,
                 pending_interactions: HashMap::new(),
-                output_sequence: 0,
             });
         }
 
-        tokio::spawn(forward_worker_responses(worker_rx, tx));
-
-        if let Some(config) = resolve_llm(input.llm.as_ref())? {
-            if let Err(error) = configure_instance_llm(&instance, &config).await {
-                instance.current_turn.lock().await.take();
-                return Err(error);
-            }
-        }
-
-        // Contract (`RuntimeAdapter::submit_turn`'s doc comment): this write
-        // is the only synchronous prep work done before returning `rx` — it
-        // hands the prompt to the already-running `pi` process and returns
-        // immediately, without waiting for the turn to actually run. All
-        // subsequent progress arrives asynchronously through the reader task
-        // `start()` spawned, which is already draining this process's
-        // stdout.
-        if let Err(error) = send_worker_request(&instance, WorkerRequest::SubmitTurn(input)).await {
+        if let Err(error) =
+            send_worker_request(&instance, WorkerRequest::SubmitTurn(input.clone())).await
+        {
             instance.current_turn.lock().await.take();
             return Err(error);
         }
+        tokio::spawn(read_worker_turn(Arc::clone(&instance), input.turn_id, tx));
 
         Ok(rx)
     }
@@ -1987,6 +1454,28 @@ impl RuntimeAdapter for PiRuntime {
         input: RuntimeInteractionInput,
     ) -> Result<(), SessionDomainError> {
         let instance = self.instance_for(&input.runtime_id).await?;
+        let method = {
+            let mut current = instance.current_turn.lock().await;
+            let turn = current
+                .as_mut()
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: format!("runtime '{}' has no active turn", input.runtime_id),
+                })?;
+            if turn.turn_id != input.turn_id {
+                return Err(SessionDomainError::Conflict {
+                    message: format!(
+                        "interaction '{}' belongs to active turn '{}', not '{}'",
+                        input.interaction_id, turn.turn_id, input.turn_id
+                    ),
+                });
+            }
+            turn.pending_interactions
+                .remove(&input.interaction_id)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: format!("interaction '{}' is not pending", input.interaction_id),
+                })?
+        };
+        map_answer_to_pi_value(&method, &input.answer)?;
         send_worker_request(&instance, WorkerRequest::AnswerInteraction(input)).await
     }
 
@@ -1996,6 +1485,14 @@ impl RuntimeAdapter for PiRuntime {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let instance = self.instance_for(runtime_id).await?;
+        let active = instance.current_turn.lock().await;
+        let should_cancel = active
+            .as_ref()
+            .is_some_and(|active| turn_id.is_none() || turn_id == Some(active.turn_id.as_str()));
+        drop(active);
+        if !should_cancel {
+            return Ok(());
+        }
         send_worker_request(
             &instance,
             WorkerRequest::Cancel(RuntimeCancelRequest {

@@ -9,7 +9,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync", "process", "io-util", "rt", "net"] }
+tokio = { workspace = true, features = ["sync", "process", "io-util", "io-std", "rt", "net"] }
 axum.workspace = true
 base64.workspace = true
 uuid.workspace = true
@@ -25,3 +25,7 @@ xgovernor-manager = { path = "../../crates/manager" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 reqwest.workspace = true
+
+[[bin]]
+name = "pi-worker"
+path = "src/worker_main.rs"

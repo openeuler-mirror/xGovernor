@@ -32,6 +32,10 @@ pub fn fake_pi_path() -> String {
     env!("CARGO_BIN_EXE_fake_pi").to_string()
 }
 
+pub fn pi_worker_path() -> std::path::PathBuf {
+    env!("CARGO_BIN_EXE_pi-worker").into()
+}
+
 /// `backend_id` these tests register their sandbox under, matching
 /// [`build_managers`]'s single `"local"` entry.
 pub const LOCAL_BACKEND_ID: &str = "local";
@@ -74,7 +78,8 @@ pub fn new_pi_runtime() -> PiRuntime {
     let session_root = TempDir::new()
         .expect("tempdir for pi session-dir root")
         .keep();
-    PiRuntime::new(build_managers(), session_root).expect("bridge http listener must bind")
+    PiRuntime::new_with_worker(build_managers(), session_root, pi_worker_path())
+        .expect("bridge http listener must bind")
 }
 
 pub fn workspace_facts(root: &str) -> WorkspaceFacts {

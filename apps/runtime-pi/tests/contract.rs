@@ -409,6 +409,46 @@ async fn submit_turn_returns_without_waiting_for_the_turn_to_finish() {
     runtime.stop("runtime-1").await.ok();
 }
 
+#[tokio::test]
+async fn native_pi_crash_is_reported_as_worker_unavailable() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = started_runtime(workspace.path().to_str().unwrap()).await;
+
+    let mut events = runtime
+        .submit_turn(RuntimeTurnInput {
+            runtime_id: "runtime-1".into(),
+            turn_id: "turn-1".into(),
+            text: "trigger-worker-crash".into(),
+            entry: no_entry(),
+            llm: None,
+            reasoning_effort: None,
+            ext: Default::default(),
+        })
+        .await
+        .expect("submit_turn must be accepted before the nested Pi process exits");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.recv().await {
+            if event.is_terminal() {
+                return Some(event);
+            }
+        }
+        None
+    })
+    .await
+    .expect("worker failure must not leave the event stream hanging")
+    .expect("worker failure must emit a terminal event");
+
+    match terminal {
+        RuntimeEvent::Failed { error, .. } => {
+            assert_eq!(error.code, "worker_unavailable");
+            assert!(error.retryable);
+        }
+        other => panic!("Pi crash must fail the turn, got {other:?}"),
+    }
+    runtime.stop("runtime-1").await.ok();
+}
+
 /// Pins down `RuntimeAdapter::cancel`'s "real interrupt semantics" contract
 /// against a real subprocess: calling `cancel` must make the fake pi process
 /// actually stop short, not just eventually report `Cancelled` after

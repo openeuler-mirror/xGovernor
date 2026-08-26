@@ -94,8 +94,12 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
     // "Daemon A": open the session (cold start) exactly like a pre-restart
     // daemon would have.
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(
+            managers.clone(),
+            session_root.clone(),
+            support::pi_worker_path(),
+        )
+        .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
             repository.clone(),
@@ -137,8 +141,12 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
 
     // "Daemon B": fresh `PiRuntime` sharing the same managers/session root,
     // with no in-memory instance for "runtime-1" at all.
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+    let runtime_b = PiRuntime::new_with_worker(
+        managers.clone(),
+        session_root.clone(),
+        support::pi_worker_path(),
+    )
+    .expect("bridge must bind");
     let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
 
     let submission = app_b
@@ -222,8 +230,12 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
     let ctx = SecurityContext::admin("test");
 
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(
+            managers.clone(),
+            session_root.clone(),
+            support::pi_worker_path(),
+        )
+        .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
             repository.clone(),
@@ -255,8 +267,12 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
         .await
         .expect("stop_instance must succeed while the sandbox is still registered");
 
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+    let runtime_b = PiRuntime::new_with_worker(
+        managers.clone(),
+        session_root.clone(),
+        support::pi_worker_path(),
+    )
+    .expect("bridge must bind");
     let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
 
     // `SessionSubmission` (the `Ok` type) does not implement `Debug`, so
@@ -313,8 +329,12 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
     let ctx = SecurityContext::admin("test");
 
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(
+            managers.clone(),
+            session_root.clone(),
+            support::pi_worker_path(),
+        )
+        .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
             repository.clone(),
@@ -339,8 +359,12 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
         "sanity: the cold start must have created the session dir"
     );
 
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+    let runtime_b = PiRuntime::new_with_worker(
+        managers.clone(),
+        session_root.clone(),
+        support::pi_worker_path(),
+    )
+    .expect("bridge must bind");
     let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
 
     let response = app_b

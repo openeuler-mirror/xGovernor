@@ -435,6 +435,13 @@ where
 
 #[tokio::main]
 async fn main() {
+    if std::env::args_os().any(|arg| arg == "--pi-worker") {
+        if let Err(error) = xgovernor_runtime_pi::run_worker_from_env().await {
+            eprintln!("Pi worker failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args_os().any(|arg| arg == "--worker") {
         if let Err(error) = xgovernor_runtime_xiaoo::worker::run_worker_from_env().await {
             eprintln!("xiaoo worker failed: {error}");
