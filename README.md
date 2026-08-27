@@ -29,11 +29,11 @@ xGovernor is a server-side control plane that opens, governs, and observes **age
    │  · environment normalization              │     capability gates, projections,
    │  · lease table / orphan reaper            │     lease & reaper
    └───────┬───────────────────────────┬───────┘
-           │ per-session spawn          │ provider SPI
-           ▼                            ▼
-   pi --mode rpc 子进程          InstanceManager (local / e2b)
-   + TS extension (tools)        ← crates/manager: per-owner quota,
-           │  tool calls, local HTTP              global ceiling, idempotent
+           │ shared worker NDJSON        │ provider SPI
+           ▼                             ▼
+   pi-worker → pi --mode rpc      InstanceManager (local / e2b)
+   + TS extension (tools)         ← crates/manager: per-owner quota,
+           │  tool calls, local HTTP               global ceiling, idempotent
            │  bridge (per-session token)          create, compensating delete,
            ▼                                      pending-release retry
    ┌──────────── Bridge ────────────┐             startup reconcile
@@ -43,7 +43,7 @@ xGovernor is a server-side control plane that opens, governs, and observes **age
          sandbox (host dir / E2B remote VM)
 ```
 
-How a real turn flows today (verified end-to-end on 2026-08 with pi 0.84.2 + DeepSeek + E2B): the client opens a session via the session API; the server spawns a per-session `pi --mode rpc` child process loaded with a TypeScript extension (`apps/runtime-pi/extension`) that overrides pi's seven built-in tools (read/write/edit/bash/ls/find/grep); every tool call goes over a local HTTP bridge (one bearer token per session) into the sandbox selected by `ext.runtime_pi.backend_id` — a host directory (`local`) or a remote E2B VM (`e2b`). The RPC control channel itself stays on the daemon host by design; only tool *execution* crosses into the sandbox. Multiple sessions are fully independent: separate pi processes, separate bridge tokens, separate sandboxes — only LLM API quota and E2B concurrency limits are shared.
+How a real turn flows today (verified end-to-end on 2026-08 with pi 0.84.2 + DeepSeek + E2B): the client opens a session via the session API; the server spawns a per-session `pi-worker` and talks to it through the same `agent-runtime-protocol` NDJSON envelope used by xiaoO. The worker owns the nested `pi --mode rpc` process and translates Pi's native JSON-RPC events. Pi loads the TypeScript extension in `apps/runtime-pi/extension`, which routes its seven built-in tools (read/write/edit/bash/ls/find/grep) over a local HTTP bridge into the sandbox selected by `ext.runtime_pi.backend_id` — a host directory (`local`) or a remote E2B VM (`e2b`). Worker and Pi control processes stay on the daemon host; only tool *execution* crosses into the sandbox. Multiple sessions remain independent: separate workers, Pi processes, bridge tokens, and sandboxes.
 
 The system is organized around explicit boundaries, each owned by a contract crate:
 
@@ -56,7 +56,7 @@ The system is organized around explicit boundaries, each owned by a contract cra
 | `crates/backend` | Provider implementations shared by adapters: local directory sandbox, E2B remote sandbox, SQLite provider-instance ledger. |
 | `crates/manager` | `InstanceManager`: unified provider-instance orchestration — per-owner quota + global ceiling, per-runtime_id create idempotency, attach-failure compensating delete, delete-failure pending-release retry queue, create-path semaphore admission with backoff, startup reconcile against the ledger. |
 | `apps/runtime-mock` | A mock runtime adapter over **real** local and E2B providers (dispatched by `ext.runtime_mock.backend_id`) — proves the full plumbing, including in-sandbox `git clone` for git workspaces, without pretending to be an LLM. |
-| `apps/runtime-pi` | The **real** pi runtime adapter: spawns `pi --mode rpc` per session, drives it over line-delimited JSON, and routes tool execution through the bridge into sandboxes (`local` / `e2b`). |
+| `apps/runtime-pi` | The **real** Pi runtime adapter and worker: the adapter supervises a per-session worker over shared NDJSON; the worker owns Pi's native RPC process; tools route through the bridge into `local` / `e2b`. |
 | `apps/server` | The runnable daemon (`xgovernor-server`): two listeners (admin loopback + tenant), HTTP/SSE transport, SQLite session repository, assembly. |
 
 Design rules that hold everywhere: the wire core stays runtime-neutral (any single runtime's concept lives in `ext`); runtime internal state is quarantined as an opaque, versioned blob; capabilities come in two families (sandbox vs runtime) and gate requests before they reach a runtime; every error leaves through one projected wire vocabulary; on the tenant surface, sessions are only admitted with a git workspace (https) and a sandboxed provider — fail-closed.
@@ -69,7 +69,7 @@ Honest edition: the control plane **closed loop is proven against the real thing
 
 What ships today:
 
-- **Real pi runtime adapter** (`apps/runtime-pi`) — per-session `pi --mode rpc` child + bridge extension; tool execution lands in a real sandbox, never the daemon host filesystem.
+- **Real Pi runtime adapter** (`apps/runtime-pi`) — per-session worker + nested `pi --mode rpc` + bridge extension; tool execution lands in a real sandbox, never the daemon host filesystem.
 - **Two sandbox providers** — `local` (host directory) and `e2b` (remote VM, optional via `E2B_API_KEY`), behind the same provider SPI and quota plumbing; `InstanceManager` gives per-owner quota (default 20), a global ceiling (default 1024), create idempotency, compensating deletes, and a pending-release retry queue.
 - **Durable state** — SQLite session repository + provider-instance ledger in one WAL-mode file (`~/.xgovernor/xgovernor.db`, override with `XGOVERNOR_DATA_DIR`); startup reconcile re-attaches to surviving sandboxes after a restart, and pi sessions get **lazy restoration**: the per-session state needed to re-spawn `pi` is persisted into the opaque `SessionRecord.runtime` slot at open, so after a daemon restart the same `runtime_id` transparently resumes its conversation (verified end-to-end with `kill -9` on 2026-08-17, see the demo's §10.5).
 - **Two listening surfaces** — loopback-only admin (`XGOVERNOR_BIND_ADDR`) and tenant (`XGOVERNOR_TENANT_BIND_ADDR`); both require tokens at startup; tenant sessions are admitted only as git-workspace + sandboxed-provider (`e2b`), with https-only URL hygiene.

@@ -1,7 +1,7 @@
 //! Assembly crate: wires real [`backend::local::LocalProvider`] /
 //! [`backend::e2b::E2bProvider`] sandbox plumbing behind the
-//! `xgovernor_core::RuntimeAdapter` seam, dispatching between them by
-//! `ext.runtime_mock.backend_id` at `start()` time.
+//! `agent_runtime_protocol::AgentRuntime` seam. The host owns provider
+//! selection and injects the selected operation backend at `start()` time.
 //!
 //! This is deliberately *not* an agent execution engine: xGovernor's product
 //! scope is managing other agent runtimes via their own SDKs/APIs, not
@@ -25,31 +25,30 @@
 //! to pin down, so this merge additionally drops the tests that had become
 //! pure duplicates of that suite.
 //!
-//! The merge folds both into one [`MockRuntime`] that composes an
-//! `InstanceManager` *per* `backend_id` (`managers: HashMap<String,
-//! Arc<InstanceManager>>`) and dispatches on `ext.runtime_mock.backend_id` at
-//! `start()`, exactly mirroring how the real `apps/runtime-pi::PiRuntime`
-//! selects between its own `"local"`/`"e2b"` managers. That makes
-//! `backend_id` do what it always claimed to do, and gives this crate the
-//! same shape a reader would see in the real adapter.
+//! The merge folds both into one [`MockRuntime`]. Provider managers are
+//! exposed as construction helpers for the host, never retained by runtime.
 
+use agent_runtime_protocol::{
+    AgentRuntime, RuntimeCancelRequest, RuntimeCapability, RuntimeError, RuntimeEvent,
+    RuntimeEventReceiver, RuntimeExecutionContext,
+    RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeStartRequest,
+    RuntimeTurnRequest as RuntimeTurnInput,
+};
 use async_trait::async_trait;
 use backend::e2b::E2bProvider;
 use backend::local::LocalProvider;
 use backend::{OperationAttach, ProviderInstanceLedger, SqliteProviderInstanceLedger};
 use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
-use provider_protocol::{BackendId, ProviderControlError, ProviderKind, ProviderLifecycle};
+use provider_protocol::{ProviderKind, ProviderLifecycle};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use xgovernor_core::{
-    enforce_workspace_axiom, CancelSignal, CapabilityFamily, IsolationBoundary, IsolationFacts,
-    NetworkIsolation, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEvent,
-    RuntimeEventReceiver, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-    SandboxCapability, SecurityContext, SessionDomainError, SessionEnvironmentNormalizer,
-    TurnCancellationRegistry, WorkspaceAccess, WorkspaceFacts,
+    enforce_workspace_axiom, CancelSignal, IsolationBoundary, IsolationFacts, NetworkIsolation,
+    NormalizedSessionEnvironment, SandboxCapability, SecurityContext, SessionDomainError,
+    SessionEnvironmentNormalizer, TurnCancellationRegistry, WorkspaceAccess, WorkspaceFacts,
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 
@@ -89,42 +88,6 @@ const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
 /// so the clone lands in the same directory e2b's own envd bootstrap already
 /// created (empty, ready to clone into).
 const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
-
-#[derive(Debug, Clone, Deserialize)]
-struct MockRuntimeExt {
-    backend_id: String,
-}
-
-fn read_backend_id_ext(
-    ext: &session_protocol::SessionExtensions,
-) -> Result<MockRuntimeExt, SessionDomainError> {
-    let value = ext
-        .get(EXT_NAMESPACE)
-        .ok_or_else(|| SessionDomainError::InvalidRequest {
-            message: format!("missing required '{EXT_NAMESPACE}' ext payload (backend_id)"),
-        })?;
-    serde_json::from_value(value.clone()).map_err(|error| SessionDomainError::InvalidRequest {
-        message: format!("invalid '{EXT_NAMESPACE}' ext payload: {error}"),
-    })
-}
-
-fn map_provider_error(error: ProviderControlError) -> SessionDomainError {
-    match error {
-        ProviderControlError::NotFound { resource_ref } => SessionDomainError::NotFound {
-            runtime_id: resource_ref,
-        },
-        ProviderControlError::InvalidRequest { message } => {
-            SessionDomainError::InvalidRequest { message }
-        }
-        ProviderControlError::ResourceLimitExceeded { .. } => SessionDomainError::Unavailable {
-            message: error.to_string(),
-        },
-        other => SessionDomainError::Internal {
-            message: other.to_string(),
-            source: None,
-        },
-    }
-}
 
 /// Wire shape carried through `RuntimeStartRequest.workspace.metadata`
 /// (`docs/tenancy_design.md` §7 step 3) from
@@ -209,6 +172,24 @@ fn in_memory_local_manager(max_per_owner: usize) -> Arc<InstanceManager> {
     ))
 }
 
+pub fn local_provider_managers() -> HashMap<String, Arc<InstanceManager>> {
+    [(
+        LOCAL_BACKEND_ID.to_string(),
+        in_memory_local_manager(DEFAULT_MAX_SANDBOXES_PER_OWNER),
+    )]
+    .into_iter()
+    .collect()
+}
+
+pub fn local_and_e2b_provider_managers() -> HashMap<String, Arc<InstanceManager>> {
+    let mut managers = local_provider_managers();
+    managers.insert(
+        E2B_BACKEND_ID.to_string(),
+        in_memory_e2b_manager(DEFAULT_MAX_SANDBOXES_PER_OWNER),
+    );
+    managers
+}
+
 fn in_memory_e2b_manager(max_per_owner: usize) -> Arc<InstanceManager> {
     let ledger: Arc<dyn ProviderInstanceLedger> = Arc::new(
         SqliteProviderInstanceLedger::open_in_memory()
@@ -226,20 +207,14 @@ fn in_memory_e2b_manager(max_per_owner: usize) -> Arc<InstanceManager> {
     ))
 }
 
-/// Mock `RuntimeAdapter` composing one [`InstanceManager`] per `backend_id`
+/// Mock `AgentRuntime` using the operation backend injected by the host.
 /// it is willing to provision sandboxes against, selected at `start()` by
 /// `ext.runtime_mock.backend_id` — the same shape the real
 /// `apps/runtime-pi::PiRuntime` uses for its own `managers` field.
 pub struct MockRuntime {
-    managers: HashMap<String, Arc<InstanceManager>>,
-    /// Which manager each started `runtime_id` was provisioned against —
-    /// needed because `stop`/`attach`/`submit_turn` only receive a
-    /// `runtime_id`, not the `backend_id` that was used at `start()` time.
-    /// Mirrors `apps/runtime-pi`'s `PiInstance::manager` field, which solves
-    /// the identical problem for the real adapter.
-    instances: tokio::sync::RwLock<HashMap<String, Arc<InstanceManager>>>,
+    instances: tokio::sync::RwLock<HashMap<String, Arc<dyn OperationBackend>>>,
     /// Backs the `submit_turn`/`cancel` contract (see their doc comments on
-    /// `RuntimeAdapter`): `submit_turn` spawns a background task to drive the
+    /// `AgentRuntime`): `submit_turn` spawns a background task to drive the
     /// turn and registers it here so a later `cancel` call can actually
     /// reach and interrupt it, instead of `cancel` being a no-op because
     /// `submit_turn` already ran the whole turn to completion synchronously
@@ -248,16 +223,8 @@ pub struct MockRuntime {
 }
 
 impl MockRuntime {
-    /// Primary constructor: takes already-built managers, one per
-    /// `backend_id` this runtime should accept in `ext.runtime_mock.
-    /// backend_id`. Mirrors `apps/runtime-pi::PiRuntime::new`'s injection
-    /// pattern — a real deployment builds each `InstanceManager` with a
-    /// durable (`SqliteProviderInstanceLedger::open`) ledger and whatever
-    /// per-manager caps it needs, the same way `apps/server/src/main.rs`
-    /// would for `PiRuntime`.
-    pub fn new(managers: HashMap<String, Arc<InstanceManager>>) -> Self {
+    pub fn new() -> Self {
         Self {
-            managers,
             instances: tokio::sync::RwLock::new(HashMap::new()),
             cancellation: Arc::new(TurnCancellationRegistry::new()),
         }
@@ -266,148 +233,113 @@ impl MockRuntime {
     /// Test/demo convenience: a single `"local"` backend over a real
     /// `LocalProvider`, in-memory ledger, default sandbox caps.
     pub fn local_only() -> Self {
-        let mut managers = HashMap::new();
-        managers.insert(
-            LOCAL_BACKEND_ID.to_string(),
-            in_memory_local_manager(DEFAULT_MAX_SANDBOXES_PER_OWNER),
-        );
-        Self::new(managers)
+        Self::new()
     }
 
     /// Test/demo convenience: both `"local"` and `"e2b"` backends
     /// registered, each with its own in-memory ledger and default sandbox
     /// caps.
     pub fn local_and_e2b() -> Self {
-        let mut managers = HashMap::new();
-        managers.insert(
-            LOCAL_BACKEND_ID.to_string(),
-            in_memory_local_manager(DEFAULT_MAX_SANDBOXES_PER_OWNER),
-        );
-        managers.insert(
-            E2B_BACKEND_ID.to_string(),
-            in_memory_e2b_manager(DEFAULT_MAX_SANDBOXES_PER_OWNER),
-        );
-        Self::new(managers)
+        Self::new()
     }
 
-    fn manager_for(&self, backend_id: &str) -> Result<Arc<InstanceManager>, SessionDomainError> {
-        self.managers
-            .get(backend_id)
-            .cloned()
-            .ok_or_else(|| SessionDomainError::InvalidRequest {
-                message: format!(
-                    "no InstanceManager configured for backend_id '{backend_id}'; configured \
-                     backends: {:?}",
-                    self.managers.keys().collect::<Vec<_>>()
-                ),
-            })
-    }
-
-    async fn manager_for_runtime(
+    async fn backend_for_runtime(
         &self,
         runtime_id: &str,
-    ) -> Result<Arc<InstanceManager>, SessionDomainError> {
+    ) -> Result<Arc<dyn OperationBackend>, RuntimeError> {
         self.instances
             .read()
             .await
             .get(runtime_id)
             .cloned()
-            .ok_or_else(|| SessionDomainError::NotFound {
+            .ok_or_else(|| RuntimeError::NotFound {
                 runtime_id: runtime_id.to_string(),
             })
     }
 }
 
+impl Default for MockRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
-impl RuntimeAdapter for MockRuntime {
-    fn kind(&self) -> &str {
+impl AgentRuntime for MockRuntime {
+    fn runtime_kind(&self) -> &str {
         "mock"
     }
-    async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-        Ok(true)
+    async fn check_alive(&self, runtime_id: &str) -> Result<bool, RuntimeError> {
+        Ok(self.instances.read().await.contains_key(runtime_id))
     }
 
-    fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
+    fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
         BTreeSet::new()
     }
 
-    async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-        let ext = read_backend_id_ext(&request.ext)?;
-        let manager = self.manager_for(&ext.backend_id)?;
-
-        // `allow_internet_access: true` is static/create-time-only, and only
-        // meaningful to the e2b provider — the local provider ignores extra
-        // `provider_options` keys it doesn't recognize, but there is no
-        // reason to send it a key it has no use for.
-        let mut provider_options = json!({ "workspace_root": request.workspace.root });
-        if ext.backend_id == E2B_BACKEND_ID {
-            provider_options["allow_internet_access"] = json!(true);
-        }
-
-        let backend = manager
-            .start_instance(
-                request.runtime_id.clone(),
-                BackendId(ext.backend_id.clone()),
-                request.owner_ref.clone(),
-                provider_options,
-            )
-            .await
-            .map_err(map_provider_error)?;
-
+    async fn start(
+        &self,
+        request: RuntimeStartRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        let backend = context.operation_backend;
         if request.workspace.metadata != Value::Null {
             let git: GitWorkspaceMetadata =
                 serde_json::from_value(request.workspace.metadata.clone()).map_err(|error| {
-                    SessionDomainError::InvalidRequest {
+                    RuntimeError::InvalidRequest {
+                        code: "invalid_workspace_metadata".into(),
                         message: format!("invalid workspace_metadata for git clone: {error}"),
                     }
                 })?;
 
-            if let Err(error) =
-                clone_git_workspace(backend.as_ref(), &git, &request.workspace.root).await
-            {
-                // Roll back the sandbox we just created rather than leaving
-                // an orphaned instance registered with no usable workspace.
-                let _ = manager.stop_instance(&request.runtime_id).await;
-                return Err(error);
-            }
+            clone_git_workspace(backend.as_ref(), &git, &request.workspace.root)
+                .await
+                .map_err(|error| RuntimeError::Internal {
+                    message: error.to_string(),
+                })?;
         }
 
         self.instances
             .write()
             .await
-            .insert(request.runtime_id.clone(), manager);
+            .insert(request.runtime_id.clone(), backend);
         Ok(())
     }
 
-    async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
-        let manager = self.manager_for_runtime(runtime_id).await?;
-        manager
-            .stop_instance(runtime_id)
+    async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        self.instances
+            .write()
             .await
-            .map_err(map_provider_error)?;
-        self.instances.write().await.remove(runtime_id);
-        Ok(())
+            .remove(runtime_id)
+            .map(|_| ())
+            .ok_or_else(|| RuntimeError::NotFound {
+                runtime_id: runtime_id.into(),
+            })
     }
 
-    async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
-        let manager = self.manager_for_runtime(runtime_id).await?;
-        manager
-            .backend_for(runtime_id)
-            .map(|_| ())
-            .map_err(map_provider_error)
+    async fn attach(
+        &self,
+        runtime_id: &str,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        let mut instances = self.instances.write().await;
+        if !instances.contains_key(runtime_id) {
+            return Err(RuntimeError::NotFound {
+                runtime_id: runtime_id.into(),
+            });
+        }
+        instances.insert(runtime_id.into(), context.operation_backend);
+        Ok(())
     }
 
     async fn submit_turn(
         &self,
         input: RuntimeTurnInput,
-    ) -> Result<RuntimeEventReceiver, SessionDomainError> {
-        let manager = self.manager_for_runtime(&input.runtime_id).await?;
-        let backend = manager
-            .backend_for(&input.runtime_id)
-            .map_err(map_provider_error)?;
+    ) -> Result<RuntimeEventReceiver, RuntimeError> {
+        let backend = self.backend_for_runtime(&input.runtime_id).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(4);
 
-        // Contract (`RuntimeAdapter::submit_turn`'s doc comment): register
+        // Contract (`AgentRuntime::submit_turn`): register
         // the cancel signal and spawn the background task *before*
         // returning — this call must hand back `rx` without waiting for the
         // turn to run, so a `cancel` that arrives the instant this returns
@@ -431,18 +363,13 @@ impl RuntimeAdapter for MockRuntime {
     async fn answer_interaction(
         &self,
         _input: RuntimeInteractionInput,
-    ) -> Result<(), SessionDomainError> {
-        Err(SessionDomainError::UnsupportedCapability {
-            family: CapabilityFamily::Runtime,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::UnsupportedCapability {
             capability: "interaction".to_string(),
         })
     }
 
-    async fn cancel(
-        &self,
-        runtime_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<(), SessionDomainError> {
+    async fn cancel(&self, request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
         // Fires the cancel signal `run_mock_turn`'s `tokio::select!` is
         // racing the exec future against. A stale/mismatched `turn_id` is a
         // silent no-op (see `TurnCancellationRegistry::fire`'s doc) rather
@@ -450,7 +377,8 @@ impl RuntimeAdapter for MockRuntime {
         // active, if anything" contract. No manager lookup needed here: the
         // cancellation registry is keyed by `runtime_id`/`turn_id`
         // directly, independent of which backend provisioned the sandbox.
-        self.cancellation.fire(runtime_id, turn_id);
+        self.cancellation
+            .fire(&request.runtime_id, request.turn_id.as_deref());
         Ok(())
     }
 }
@@ -547,7 +475,7 @@ async fn run_mock_turn(
             .await
             .ok();
             tx.send(RuntimeEvent::Failed {
-                error: xgovernor_core::RuntimeFailure {
+                error: agent_runtime_protocol::RuntimeFailure {
                     code: "exec_failed".to_string(),
                     message: error.to_string(),
                     retryable: false,
@@ -805,61 +733,6 @@ mod tests {
             .expect("admin git workspace must be admitted");
     }
 
-    // ---- ext validation ----
-
-    #[tokio::test]
-    async fn start_without_ext_namespace_is_rejected() {
-        let runtime = MockRuntime::local_only();
-        let error = runtime
-            .start(RuntimeStartRequest {
-                runtime_id: "runtime-x".into(),
-                conversation_id: "conversation-x".into(),
-                sender_id: "sender-x".into(),
-                workspace: CoreWorkspaceFacts {
-                    workspace_id: "workspace-x".into(),
-                    root: "/tmp".into(),
-                    access: CoreWorkspaceAccess::ReadWrite,
-                    revision: None,
-                    metadata: Value::Null,
-                },
-                state: None,
-                llm: None,
-                owner_ref: "admin".into(),
-                ext: Default::default(),
-            })
-            .await
-            .expect_err("missing ext namespace must be rejected");
-        assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
-    }
-
-    #[tokio::test]
-    async fn start_with_unregistered_backend_id_is_rejected() {
-        // `local_only()` never registers an `"e2b"` manager — dispatch must
-        // reject it up front rather than falling through to some default
-        // manager.
-        let runtime = MockRuntime::local_only();
-        let error = runtime
-            .start(RuntimeStartRequest {
-                runtime_id: "runtime-x".into(),
-                conversation_id: "conversation-x".into(),
-                sender_id: "sender-x".into(),
-                workspace: CoreWorkspaceFacts {
-                    workspace_id: "workspace-x".into(),
-                    root: "/tmp".into(),
-                    access: CoreWorkspaceAccess::ReadWrite,
-                    revision: None,
-                    metadata: Value::Null,
-                },
-                state: None,
-                llm: None,
-                owner_ref: "admin".into(),
-                ext: e2b_runtime_ext(),
-            })
-            .await
-            .expect_err("an unregistered backend_id must be rejected");
-        assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
-    }
-
     #[tokio::test]
     async fn submit_turn_for_an_unknown_runtime_id_is_not_found() {
         let runtime = MockRuntime::local_only();
@@ -868,7 +741,7 @@ mod tests {
                 runtime_id: "never-started".into(),
                 turn_id: "turn-1".into(),
                 text: "hello".into(),
-                entry: xgovernor_core::RuntimeEntryContext {
+                entry: agent_runtime_protocol::RuntimeEntryContext {
                     kind: None,
                     instance_id: None,
                     message_id: None,
@@ -880,7 +753,7 @@ mod tests {
             })
             .await
             .expect_err("submit_turn against a runtime_id that was never started must fail");
-        assert!(matches!(error, SessionDomainError::NotFound { .. }));
+        assert!(matches!(error, RuntimeError::NotFound { .. }));
     }
 
     // ---- full application-level flow against a real local sandbox ----
@@ -975,6 +848,7 @@ mod tests {
 
         let application = SessionApplication::new(
             StdArc::new(MockRuntime::local_only()),
+            local_provider_managers(),
             StdArc::new(MemoryRepository::default()),
             StdArc::new(FixedIds),
             StdArc::new(FixedIds),
@@ -1060,29 +934,43 @@ mod tests {
     /// provisioned the sandbox.
     async fn started_runtime(workspace_root: &str) -> MockRuntime {
         let runtime = MockRuntime::local_only();
+        let manager = local_provider_managers().remove(LOCAL_BACKEND_ID).unwrap();
+        let backend = manager
+            .start_instance(
+                "runtime-1".into(),
+                provider_protocol::BackendId(LOCAL_BACKEND_ID.into()),
+                "admin".into(),
+                json!({"workspace_root": workspace_root}),
+            )
+            .await
+            .unwrap();
         runtime
-            .start(RuntimeStartRequest {
-                runtime_id: "runtime-1".into(),
-                conversation_id: "conversation-1".into(),
-                sender_id: "sender-1".into(),
-                workspace: CoreWorkspaceFacts {
-                    workspace_id: "workspace-1".into(),
-                    root: workspace_root.into(),
-                    access: CoreWorkspaceAccess::ReadWrite,
-                    revision: None,
-                    metadata: Value::Null,
+            .start(
+                RuntimeStartRequest {
+                    runtime_id: "runtime-1".into(),
+                    conversation_id: "conversation-1".into(),
+                    sender_id: "sender-1".into(),
+                    workspace: CoreWorkspaceFacts {
+                        workspace_id: "workspace-1".into(),
+                        root: workspace_root.into(),
+                        access: CoreWorkspaceAccess::ReadWrite,
+                        revision: None,
+                        metadata: Value::Null,
+                    },
+                    state: None,
+                    llm: None,
+                    ext: backend_ext(LOCAL_BACKEND_ID),
                 },
-                state: None,
-                llm: None,
-                owner_ref: "admin".into(),
-                ext: backend_ext(LOCAL_BACKEND_ID),
-            })
+                RuntimeExecutionContext {
+                    operation_backend: backend,
+                },
+            )
             .await
             .expect("start must succeed");
         runtime
     }
 
-    /// Pins down the `RuntimeAdapter::submit_turn` contract documented on the
+    /// Pins down the `AgentRuntime::submit_turn` contract documented on the
     /// trait itself: the receiver must come back *before* the turn has
     /// produced anything, because the turn runs in a background task the
     /// call spawns rather than inline. This is deterministic, not a timing
@@ -1100,7 +988,7 @@ mod tests {
                 runtime_id: "runtime-1".into(),
                 turn_id: "turn-1".into(),
                 text: "hello".into(),
-                entry: xgovernor_core::RuntimeEntryContext {
+                entry: agent_runtime_protocol::RuntimeEntryContext {
                     kind: None,
                     instance_id: None,
                     message_id: None,
@@ -1123,7 +1011,7 @@ mod tests {
         );
     }
 
-    /// Pins down `RuntimeAdapter::cancel`'s "real interrupt semantics"
+    /// Pins down `AgentRuntime::cancel`'s "real interrupt semantics"
     /// contract: calling `cancel` must make an in-flight turn reach
     /// `Completed { outcome: Cancelled }`, not let it run to its original
     /// completion unaffected. Also deterministic rather than a timing race:
@@ -1141,7 +1029,7 @@ mod tests {
                 runtime_id: "runtime-1".into(),
                 turn_id: "turn-1".into(),
                 text: "hello".into(),
-                entry: xgovernor_core::RuntimeEntryContext {
+                entry: agent_runtime_protocol::RuntimeEntryContext {
                     kind: None,
                     instance_id: None,
                     message_id: None,
@@ -1155,7 +1043,10 @@ mod tests {
             .expect("submit_turn must be accepted");
 
         runtime
-            .cancel("runtime-1", Some("turn-1"))
+            .cancel(RuntimeCancelRequest {
+                runtime_id: "runtime-1".into(),
+                turn_id: Some("turn-1".into()),
+            })
             .await
             .expect("cancel must be accepted");
 

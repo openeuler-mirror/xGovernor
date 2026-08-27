@@ -4,16 +4,16 @@
 
 pub mod application;
 pub mod domain;
-pub mod memory_automation;
 pub mod orphan_reaper;
 pub mod projection;
 pub mod prompt_utils;
 pub mod reclaim_sweeper;
-pub mod runtime_adapter;
 pub mod security;
 pub mod session_lease;
 pub mod sqlite_repository;
 pub mod turn_cancellation;
+
+pub use agent_runtime_protocol as runtime_protocol;
 
 pub use application::{
     enforce_workspace_axiom, CheckpointListEntry, CheckpointListPage, Clock,
@@ -22,11 +22,6 @@ pub use application::{
     TurnIdGenerator,
 };
 pub use domain::*;
-pub use memory_automation::{
-    CompletedTurnIngest, DurableIngestQueue, DurableIngestWorker, MemoryAutomationConfig,
-    MemoryAutomationError, MemoryAutomationHealth, RecallMemory, TurnMemoryAutomation,
-    TurnMemoryContext,
-};
 pub use orphan_reaper::{spawn_orphan_reaper, spawn_orphan_reaper_with_config, OrphanReaperConfig};
 pub use projection::{project_session, project_session_error, project_session_summary};
 pub use prompt_utils::{
@@ -35,7 +30,6 @@ pub use prompt_utils::{
 pub use reclaim_sweeper::{
     spawn_reclaim_sweeper, spawn_reclaim_sweeper_with_config, ReclaimSweeperConfig,
 };
-pub use runtime_adapter::*;
 pub use security::{Role, SecurityContext, TenantQuota, ADMIN_OWNER_REF};
 // NOTE: `session_lease::SessionLease` (the operational, heartbeat-bearing
 // lease-table entry: client_id/pid/hostname + last_heartbeat_ms + is_stale())

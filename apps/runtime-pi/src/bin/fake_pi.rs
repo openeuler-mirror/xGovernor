@@ -125,6 +125,10 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
         return;
     }
 
+    if message == "trigger-worker-crash" {
+        std::process::exit(23);
+    }
+
     if message == "trigger-interaction" {
         run_interaction_scenario(&id, rx);
     } else {

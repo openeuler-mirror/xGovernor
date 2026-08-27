@@ -1,4 +1,5 @@
 use agent_contracts::tool::{DiscoveredTool, ToolRegistryBuilder, ToolSource};
+use agent_runtime_protocol::RuntimeEvent;
 use agent_types::common::ids::{AgentId, ToolName};
 use agent_types::context::TokenBudgetConfig;
 use agent_types::interaction::{InteractionRequest, InteractionResponse};
@@ -7,18 +8,15 @@ use agent_types::tool::{ToolRegistryConfig, ToolVisibilityConfig};
 use async_trait::async_trait;
 use compact::{build_context_manager, CompactionPolicy};
 use operation_protocol::capability::exec::ExecRequest;
-use provider_protocol::ProviderControlError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use session_protocol::{
-    SessionInteractionAnswer, SessionToolActivityPhase, SessionToolActivityStatus, SessionUsage,
-};
+use session_protocol::{SessionToolActivityPhase, SessionToolActivityStatus, SessionUsage};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use xgovernor_core::{
     enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
-    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, RuntimeEvent, SandboxCapability,
+    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, SandboxCapability,
     SecurityContext, SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess,
 };
 use xiaoo_api::events::{LoopEndSummary, LoopEventSink, ToolResultEvent};
@@ -58,26 +56,6 @@ pub(crate) struct XiaooPersistedState {
     provider_options: Value,
     llm: PersistedLlm,
     loop_state: LoopStateSnapshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum WorkerRequest {
-    Run {
-        turn_id: String,
-        text: String,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-    },
-    Answer {
-        interaction_id: String,
-        answer: SessionInteractionAnswer,
-    },
-    LoadState {
-        loop_state: LoopStateSnapshot,
-    },
-    Cancel,
-    Shutdown,
 }
 
 pub struct XiaooSessionEnvironment {
@@ -242,20 +220,6 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
             }),
             lease: None,
         })
-    }
-}
-
-pub(crate) fn map_provider_error(error: ProviderControlError) -> SessionDomainError {
-    match error {
-        ProviderControlError::NotFound { resource_ref } => SessionDomainError::NotFound {
-            runtime_id: resource_ref,
-        },
-        ProviderControlError::InvalidRequest { message } => {
-            SessionDomainError::InvalidRequest { message }
-        }
-        other => SessionDomainError::Unavailable {
-            message: other.to_string(),
-        },
     }
 }
 

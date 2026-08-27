@@ -1,10 +1,13 @@
 use crate::{
-    project_runtime_event, project_session, project_session_summary, CheckpointLineage,
-    EffectiveCapabilities, IsolationBoundary, IsolationFacts, LeaseCheckFailure,
-    OpaqueRuntimeState, RuntimeAdapter, RuntimeCapability, RuntimeEntryContext,
-    RuntimeInteractionInput, RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput,
+    project_session, project_session_summary, CheckpointLineage, EffectiveCapabilities,
+    IsolationBoundary, IsolationFacts, LeaseCheckFailure, OpaqueRuntimeState, RuntimeCapability,
     SecurityContext, SessionDomainError, SessionLease, SessionLeaseTable, SessionRecord,
     SessionStatus, WorkspaceFacts,
+};
+use agent_runtime_protocol::{
+    AgentRuntime, RuntimeCancelRequest, RuntimeEntryContext, RuntimeError, RuntimeEvent,
+    RuntimeExecutionContext, RuntimeFailure, RuntimeInteractionRequest as RuntimeInteractionInput,
+    RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
 };
 use session_protocol::{
     SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointListResponse,
@@ -17,6 +20,223 @@ use session_protocol::{
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use xgovernor_manager::InstanceManager;
+
+fn map_provider_error(error: provider_protocol::ProviderControlError) -> SessionDomainError {
+    match error {
+        provider_protocol::ProviderControlError::NotFound { resource_ref } => {
+            SessionDomainError::NotFound {
+                runtime_id: resource_ref,
+            }
+        }
+        provider_protocol::ProviderControlError::InvalidRequest { message } => {
+            SessionDomainError::InvalidRequest { message }
+        }
+        provider_protocol::ProviderControlError::UnsupportedCapability { capability, .. } => {
+            SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Sandbox,
+                capability,
+            }
+        }
+        error => SessionDomainError::Unavailable {
+            message: error.to_string(),
+        },
+    }
+}
+
+fn map_runtime_error(error: RuntimeError) -> SessionDomainError {
+    match error {
+        RuntimeError::InvalidRequest { message, .. } => {
+            SessionDomainError::InvalidRequest { message }
+        }
+        RuntimeError::NotFound { runtime_id } => SessionDomainError::NotFound { runtime_id },
+        RuntimeError::Conflict { message, .. } => SessionDomainError::Conflict { message },
+        RuntimeError::UnsupportedCapability { capability } => {
+            SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability,
+            }
+        }
+        RuntimeError::WorkerUnavailable { message, .. } => {
+            SessionDomainError::Unavailable { message }
+        }
+        RuntimeError::StateCorrupt { message } => SessionDomainError::InvalidRequest { message },
+        RuntimeError::Internal { message } => SessionDomainError::Internal {
+            message,
+            source: None,
+        },
+    }
+}
+
+fn runtime_capability(
+    capability: agent_runtime_protocol::RuntimeCapability,
+) -> Option<session_protocol::SessionRuntimeCapability> {
+    Some(match capability {
+        agent_runtime_protocol::RuntimeCapability::Interaction => {
+            session_protocol::SessionRuntimeCapability::Interaction
+        }
+        agent_runtime_protocol::RuntimeCapability::Steering => {
+            session_protocol::SessionRuntimeCapability::Steering
+        }
+        agent_runtime_protocol::RuntimeCapability::StateExport => {
+            session_protocol::SessionRuntimeCapability::StateExport
+        }
+        agent_runtime_protocol::RuntimeCapability::ModelOverride => {
+            session_protocol::SessionRuntimeCapability::ModelOverride
+        }
+        agent_runtime_protocol::RuntimeCapability::ReasoningControl => {
+            session_protocol::SessionRuntimeCapability::ReasoningControl
+        }
+        agent_runtime_protocol::RuntimeCapability::Unknown => return None,
+    })
+}
+
+fn project_runtime_event(runtime_id: &str, turn_id: &str, event: RuntimeEvent) -> SessionEvent {
+    match event {
+        RuntimeEvent::OutputDelta {
+            stream_id,
+            sequence,
+            delta,
+        } => SessionEvent::OutputDelta {
+            runtime_id: runtime_id.into(),
+            turn_id: turn_id.into(),
+            stream_id,
+            sequence,
+            delta,
+        },
+        RuntimeEvent::ToolActivity {
+            activity_id,
+            phase,
+            name,
+            status,
+            summary,
+            ext,
+        } => SessionEvent::ToolActivity {
+            runtime_id: runtime_id.into(),
+            turn_id: turn_id.into(),
+            activity_id,
+            phase,
+            name,
+            status,
+            summary,
+            ext,
+        },
+        RuntimeEvent::InteractionRequested {
+            interaction_id,
+            interaction_kind,
+            prompt,
+            options,
+            ext,
+        } => SessionEvent::InteractionRequested {
+            runtime_id: runtime_id.into(),
+            turn_id: turn_id.into(),
+            interaction_id,
+            interaction_kind,
+            prompt,
+            sensitive: false,
+            options,
+            ext,
+        },
+        RuntimeEvent::Completed { outcome, usage } => SessionEvent::TurnCompleted {
+            runtime_id: runtime_id.into(),
+            turn_id: turn_id.into(),
+            outcome,
+            usage,
+        },
+        RuntimeEvent::Failed { error, usage } => SessionEvent::TurnFailed {
+            runtime_id: runtime_id.into(),
+            turn_id: turn_id.into(),
+            error: session_protocol::SessionTurnFailure {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+                details: error.details,
+            },
+            usage,
+        },
+        RuntimeEvent::Extension { namespace, payload } => SessionEvent::Extension {
+            runtime_id: runtime_id.into(),
+            turn_id: Some(turn_id.into()),
+            namespace,
+            payload,
+        },
+        RuntimeEvent::Unknown => SessionEvent::Extension {
+            runtime_id: runtime_id.into(),
+            turn_id: Some(turn_id.into()),
+            namespace: "runtime.unknown".into(),
+            payload: serde_json::Value::Null,
+        },
+    }
+}
+
+fn provider_id_from_metadata(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("backend_id")
+        .or_else(|| metadata.get("tool_backend_id"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn provider_for_request(
+    registration: &RuntimeRegistration,
+    request: &SessionOpenRequest,
+) -> Result<(String, Arc<InstanceManager>), SessionDomainError> {
+    let provider_id = request
+        .ext
+        .values()
+        .find_map(provider_id_from_metadata)
+        .map(str::to_owned)
+        .or_else(|| {
+            (registration.providers.len() == 1)
+                .then(|| registration.providers.keys().next().unwrap().clone())
+        })
+        .ok_or_else(|| SessionDomainError::InvalidRequest {
+            message: "runtime extension must specify backend_id".into(),
+        })?;
+    let manager = registration
+        .providers
+        .get(&provider_id)
+        .cloned()
+        .ok_or_else(|| SessionDomainError::InvalidRequest {
+            message: format!("provider backend_id '{provider_id}' is not registered"),
+        })?;
+    Ok((provider_id, manager))
+}
+
+fn provider_for_isolation(
+    registration: &RuntimeRegistration,
+    isolation: &IsolationFacts,
+) -> Result<(String, Arc<InstanceManager>), SessionDomainError> {
+    let provider_id = provider_id_from_metadata(&isolation.metadata)
+        .map(str::to_owned)
+        .or_else(|| {
+            (registration.providers.len() == 1)
+                .then(|| registration.providers.keys().next().unwrap().clone())
+        })
+        .ok_or_else(|| SessionDomainError::Internal {
+            message: "persisted session is missing provider backend_id".into(),
+            source: None,
+        })?;
+    let manager = registration
+        .providers
+        .get(&provider_id)
+        .cloned()
+        .ok_or_else(|| SessionDomainError::InvalidRequest {
+            message: format!("provider backend_id '{provider_id}' is not registered"),
+        })?;
+    Ok((provider_id, manager))
+}
+
+fn provider_options(
+    workspace: &WorkspaceFacts,
+    _isolation: &IsolationFacts,
+    provider_id: &str,
+) -> serde_json::Value {
+    let mut options = serde_json::json!({"workspace_root": workspace.root});
+    if provider_id == "e2b" {
+        options["allow_internet_access"] = serde_json::json!(true);
+    }
+    options
+}
 
 pub struct SessionSubmission {
     pub receipt: SessionSubmitReceipt,
@@ -32,19 +252,30 @@ pub struct SessionSubmission {
 /// started by xiaoO.
 #[derive(Clone)]
 pub struct RuntimeRegistration {
-    pub adapter: Arc<dyn RuntimeAdapter>,
+    pub runtime: Arc<dyn AgentRuntime>,
+    pub providers: Arc<HashMap<String, Arc<InstanceManager>>>,
     pub environment: Arc<dyn SessionEnvironmentNormalizer>,
 }
 
 impl RuntimeRegistration {
     pub fn new(
-        adapter: Arc<dyn RuntimeAdapter>,
+        runtime: Arc<dyn AgentRuntime>,
+        providers: HashMap<String, Arc<InstanceManager>>,
         environment: Arc<dyn SessionEnvironmentNormalizer>,
     ) -> Self {
         Self {
-            adapter,
+            runtime,
+            providers: Arc::new(providers),
             environment,
         }
+    }
+
+    pub fn with_providers(
+        runtime: Arc<dyn AgentRuntime>,
+        providers: HashMap<String, Arc<InstanceManager>>,
+        environment: Arc<dyn SessionEnvironmentNormalizer>,
+    ) -> Self {
+        Self::new(runtime, providers, environment)
     }
 }
 
@@ -157,17 +388,18 @@ pub struct SessionApplication {
 
 impl SessionApplication {
     pub fn new(
-        runtime: Arc<dyn RuntimeAdapter>,
+        runtime: Arc<dyn AgentRuntime>,
+        providers: HashMap<String, Arc<InstanceManager>>,
         records: Arc<dyn SessionRepository>,
         turn_ids: Arc<dyn TurnIdGenerator>,
         runtime_ids: Arc<dyn RuntimeIdGenerator>,
         environment: Arc<dyn SessionEnvironmentNormalizer>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let default_runtime_kind = runtime.kind().to_string();
+        let default_runtime_kind = runtime.runtime_kind().to_string();
         Self::with_runtime_registry(
             default_runtime_kind,
-            [RuntimeRegistration::new(runtime, environment)],
+            [RuntimeRegistration::new(runtime, providers, environment)],
             records,
             turn_ids,
             runtime_ids,
@@ -191,15 +423,15 @@ impl SessionApplication {
         let default_runtime_kind = default_runtime_kind.into();
         let mut runtimes = BTreeMap::new();
         for registration in registrations {
-            let kind = registration.adapter.kind().trim().to_string();
+            let kind = registration.runtime.runtime_kind().trim().to_string();
             if kind.is_empty() {
                 return Err(SessionDomainError::InvalidRequest {
-                    message: "runtime adapter kind must not be empty".into(),
+                    message: "runtime kind must not be empty".into(),
                 });
             }
             if runtimes.insert(kind.clone(), registration).is_some() {
                 return Err(SessionDomainError::InvalidRequest {
-                    message: format!("duplicate runtime adapter kind: {kind}"),
+                    message: format!("duplicate runtime kind: {kind}"),
                 });
             }
         }
@@ -356,7 +588,7 @@ impl SessionApplication {
             .as_deref()
             .unwrap_or(&self.default_runtime_kind);
         let registration = self.registration(runtime_kind)?;
-        let runtime = Arc::clone(&registration.adapter);
+        let runtime = Arc::clone(&registration.runtime);
         let normalized = registration.environment.normalize(ctx, &request).await?;
 
         // Fail-closed second gate (`docs/tenancy_design.md` §0/§7 step 2):
@@ -386,7 +618,20 @@ impl SessionApplication {
             }
         }
 
-        let runtime_wire_capabilities = runtime.capabilities_for_request(&request);
+        let mut runtime_wire_capabilities: std::collections::BTreeSet<_> = runtime
+            .capabilities_for_context(&agent_runtime_protocol::RuntimeCapabilityContext {
+                ext: request.ext.clone(),
+            })
+            .into_iter()
+            .filter_map(runtime_capability)
+            .collect();
+        if normalized
+            .sandbox_capabilities
+            .contains(&crate::SandboxCapability::Snapshot)
+        {
+            runtime_wire_capabilities
+                .insert(session_protocol::SessionRuntimeCapability::Checkpoint);
+        }
         for requested in &request.requested_capabilities.sandbox {
             if !normalized
                 .sandbox_capabilities
@@ -417,19 +662,44 @@ impl SessionApplication {
         }
 
         let now = self.clock.now_ms();
-        if let Err(error) = runtime
-            .start(RuntimeStartRequest {
-                runtime_id: runtime_id.clone(),
-                conversation_id: request.conversation_id.clone(),
-                sender_id: request.sender_id.clone(),
-                workspace: normalized.workspace.clone(),
-                state: None,
-                llm: request.llm.clone(),
-                owner_ref: ctx.owner_ref(),
-                ext: request.ext.clone(),
-            })
+        let (provider_id, manager) = provider_for_request(registration, &request)?;
+        let backend = match manager
+            .start_instance(
+                runtime_id.clone(),
+                provider_protocol::BackendId(provider_id.clone()),
+                ctx.owner_ref(),
+                provider_options(&normalized.workspace, &normalized.isolation, &provider_id),
+            )
             .await
+            .map_err(map_provider_error)
         {
+            Ok(backend) => backend,
+            Err(error) => {
+                if let Some(tenant_id) = &tenant_id_for_quota {
+                    self.release_tenant_session(tenant_id);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = runtime
+            .start(
+                RuntimeStartRequest {
+                    runtime_id: runtime_id.clone(),
+                    conversation_id: request.conversation_id.clone(),
+                    sender_id: request.sender_id.clone(),
+                    workspace: normalized.workspace.clone(),
+                    state: None,
+                    llm: request.llm.clone(),
+                    ext: request.ext.clone(),
+                },
+                RuntimeExecutionContext {
+                    operation_backend: backend,
+                },
+            )
+            .await
+            .map_err(map_runtime_error)
+        {
+            let _ = manager.stop_instance(&runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -437,15 +707,20 @@ impl SessionApplication {
         }
 
         // Reuse the pre-existing runtime-state quarantine slot
-        let runtime_state = match runtime.export_state(&runtime_id).await {
+        let runtime_state = match runtime
+            .export_state(&runtime_id)
+            .await
+            .map_err(map_runtime_error)
+        {
             Ok(state) => state,
             Err(SessionDomainError::UnsupportedCapability { .. }) => OpaqueRuntimeState {
-                runtime_kind: runtime.kind().into(),
+                runtime_kind: runtime.runtime_kind().into(),
                 schema_version: 1,
                 state: serde_json::Value::Null,
             },
             Err(error) => {
                 let _ = runtime.stop(&runtime_id).await;
+                let _ = manager.stop_instance(&runtime_id).await;
                 if let Some(tenant_id) = &tenant_id_for_quota {
                     self.release_tenant_session(tenant_id);
                 }
@@ -479,6 +754,7 @@ impl SessionApplication {
         };
         if let Err(error) = self.records.save(record.clone()).await {
             let _ = runtime.stop(&record.runtime_id).await;
+            let _ = manager.stop_instance(&record.runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -507,7 +783,8 @@ impl SessionApplication {
     ) -> Result<SessionSubmission, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
         self.ensure_runtime_attached(ctx, &record).await?;
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
         if request.llm.is_some()
@@ -571,7 +848,8 @@ impl SessionApplication {
                 reasoning_effort: request.reasoning_effort,
                 ext: request.ext,
             })
-            .await;
+            .await
+            .map_err(map_runtime_error);
         let mut runtime_events = match submitted {
             Ok(events) => events,
             Err(error) => {
@@ -601,7 +879,7 @@ impl SessionApplication {
             while let Some(mut event) = runtime_events.recv().await {
                 let terminal = matches!(
                     event,
-                    crate::RuntimeEvent::Completed { .. } | crate::RuntimeEvent::Failed { .. }
+                    RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
                 );
                 // A terminal event is the durability boundary: persist the
                 // runtime's latest opaque state before allowing a client to
@@ -610,7 +888,11 @@ impl SessionApplication {
                 // implements state export.
                 if terminal {
                     let persisted = async {
-                        let state = match state_runtime.export_state(&event_runtime_id).await {
+                        let state = match state_runtime
+                            .export_state(&event_runtime_id)
+                            .await
+                            .map_err(map_runtime_error)
+                        {
                             Ok(state) => Some(state),
                             Err(SessionDomainError::UnsupportedCapability { .. }) => None,
                             Err(error) => return Err(error),
@@ -625,8 +907,8 @@ impl SessionApplication {
                             record.runtime = state;
                         }
                         record.status = match &event {
-                            crate::RuntimeEvent::Completed { .. } => SessionStatus::Idle,
-                            crate::RuntimeEvent::Failed { .. } => SessionStatus::Failed,
+                            RuntimeEvent::Completed { .. } => SessionStatus::Idle,
+                            RuntimeEvent::Failed { .. } => SessionStatus::Failed,
                             _ => unreachable!("guarded by terminal match"),
                         };
                         record.updated_at_ms = clock.now_ms();
@@ -634,8 +916,8 @@ impl SessionApplication {
                     }
                     .await;
                     if let Err(error) = persisted {
-                        event = crate::RuntimeEvent::Failed {
-                            error: crate::RuntimeFailure {
+                        event = RuntimeEvent::Failed {
+                            error: RuntimeFailure {
                                 code: "runtime_state_persist_failed".into(),
                                 message: error.to_string(),
                                 retryable: true,
@@ -668,7 +950,10 @@ impl SessionApplication {
                 // stop the orphaned work best-effort so it doesn't run (and
                 // bill) to completion for nobody.
                 let _ = cancel_runtime
-                    .cancel(&event_runtime_id, Some(&event_turn_id))
+                    .cancel(RuntimeCancelRequest {
+                        runtime_id: event_runtime_id.clone(),
+                        turn_id: Some(event_turn_id.clone()),
+                    })
                     .await;
                 // Drain the runtime's stream to its end so the adapter is
                 // never blocked on a channel nobody reads, then fall through
@@ -732,7 +1017,8 @@ impl SessionApplication {
         {
             return Err(unsupported_runtime_capability("interaction"));
         }
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
         runtime
             .answer_interaction(RuntimeInteractionInput {
                 runtime_id: request.runtime_id.clone(),
@@ -741,7 +1027,8 @@ impl SessionApplication {
                 answer: request.answer,
                 ext: request.ext,
             })
-            .await?;
+            .await
+            .map_err(map_runtime_error)?;
         Ok(SessionSubmitReceipt {
             runtime_id: request.runtime_id,
             turn_id: request.turn_id,
@@ -779,7 +1066,7 @@ impl SessionApplication {
     }
 
     /// System-forced counterpart to `close`: called only by the reclaim
-    /// sweep (`reclaim_sweeper.rs`) once `RuntimeAdapter::check_alive` has
+    /// sweep (`reclaim_sweeper.rs`) once `AgentRuntime::check_alive` has
     /// already confirmed the provider-side sandbox is gone. Deliberately
     /// skips `check_lease_holder` — unlike `close`, there is no live runtime
     /// left for a lease to protect, so a fresh/active lease must not block
@@ -837,23 +1124,17 @@ impl SessionApplication {
         runtime_id: &str,
         note: Option<String>,
     ) -> Result<SessionControlResponse, SessionDomainError> {
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
-        match runtime.stop(runtime_id).await {
-            Ok(()) => {}
-            Err(SessionDomainError::NotFound { .. })
-                if record.runtime.state != serde_json::Value::Null =>
-            {
-                // §1.4 close special case: no in-memory adapter instance to
-                // stop (a daemon restart happened since this session was
-                // last touched) but persisted runtime state is available —
-                // destroy whatever it references directly instead of paying
-                // for a full restore-then-kill round trip through
-                // `ensure_runtime_attached` just to close it right back down.
-                runtime
-                    .cleanup_from_state(runtime_id, &record.runtime)
-                    .await?;
-            }
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        match runtime.stop(runtime_id).await.map_err(map_runtime_error) {
+            Ok(()) | Err(SessionDomainError::NotFound { .. }) => {}
             Err(error) => return Err(error),
+        }
+        if let Ok((_, manager)) = provider_for_isolation(registration, &record.isolation) {
+            manager
+                .destroy_by_runtime_id(runtime_id)
+                .await
+                .map_err(map_provider_error)?;
         }
 
         let now = self.clock.now_ms();
@@ -886,7 +1167,7 @@ impl SessionApplication {
 
     /// Best-effort platform-liveness probe for the reclaim sweep
     /// (`reclaim_sweeper.rs`) — resolves `runtime_id`'s current record and
-    /// runtime adapter, then delegates to `RuntimeAdapter::check_alive`. Not
+    /// runtime, then delegates to `AgentRuntime::check_alive`. Not
     /// audit-logged (unlike `close`/`reclaim`): this is a read-only probe, not
     /// a state-changing control operation.
     pub async fn check_alive(
@@ -895,8 +1176,19 @@ impl SessionApplication {
         runtime_id: &str,
     ) -> Result<bool, SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
-        runtime.check_alive(runtime_id).await
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        let runtime_alive = runtime
+            .check_alive(runtime_id)
+            .await
+            .map_err(map_runtime_error)?;
+        let (_, manager) = provider_for_isolation(registration, &record.isolation)?;
+        let provider_alive = match manager.inspect_instance(runtime_id).await {
+            Ok(_) => true,
+            Err(provider_protocol::ProviderControlError::NotFound { .. }) => false,
+            Err(error) => return Err(map_provider_error(error)),
+        };
+        Ok(runtime_alive && provider_alive)
     }
 
     /// Release `lease.client_id`'s write lease without stopping the runtime,
@@ -1017,14 +1309,21 @@ impl SessionApplication {
     ) -> Result<(), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
         self.ensure_runtime_attached(ctx, &record).await?;
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
-        runtime.cancel(runtime_id, turn_id).await
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .cancel(RuntimeCancelRequest {
+                runtime_id: runtime_id.to_string(),
+                turn_id: turn_id.map(str::to_string),
+            })
+            .await
+            .map_err(map_runtime_error)
     }
 
     /// Export `request.parent_runtime_id`'s state and start a new runtime
     /// from it. Not lease-gated (forking off a parent does not mutate it).
     /// `runtime.export_state` defaults to `UnsupportedCapability` on every
-    /// `RuntimeAdapter` that hasn't opted in — today that is every adapter —
+    /// `AgentRuntime` that hasn't opted in —
     /// so this correctly fails closed rather than faking a feature no
     /// adapter implements yet. Thin audit-logging wrapper
     /// (`docs/tenancy_design.md` §6) around [`Self::fork_impl`] — see
@@ -1053,7 +1352,8 @@ impl SessionApplication {
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
-        let runtime = Arc::clone(&self.registration_for_record(&record)?.adapter);
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
         if !record
             .capabilities
             .runtime
@@ -1068,15 +1368,24 @@ impl SessionApplication {
                 capability: "checkpoint".into(),
             });
         }
-        let payload = runtime.checkpoint(&request.runtime_id).await?;
-        let checkpoint_id = payload.checkpoint_id.clone();
+        let runtime_state = runtime
+            .export_state(&request.runtime_id)
+            .await
+            .map_err(map_runtime_error)?;
+        let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
+        let provider_snapshot = manager
+            .checkpoint_instance(&request.runtime_id)
+            .await
+            .map_err(map_provider_error)?;
+        let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
         let created_at_ms = self.clock.now_ms();
-        self.records
+        if let Err(error) = self
+            .records
             .save_checkpoint(crate::CheckpointRecord {
                 checkpoint_id: checkpoint_id.clone(),
                 source_runtime_id: request.runtime_id.clone(),
-                provider_snapshot_id: payload.provider_snapshot_id,
-                runtime_state: payload.runtime_state,
+                provider_snapshot_id: provider_snapshot.snapshot_id.0.clone(),
+                runtime_state,
                 workspace: record.workspace,
                 isolation: record.isolation,
                 capabilities: record.capabilities,
@@ -1085,7 +1394,16 @@ impl SessionApplication {
                 created_by: Some(ctx.principal.clone()),
                 created_at_ms,
             })
-            .await?;
+            .await
+        {
+            let _ = manager
+                .delete_snapshot(
+                    provider_protocol::BackendId(provider_id),
+                    provider_snapshot.snapshot_id,
+                )
+                .await;
+            return Err(error);
+        }
         Ok(SessionCheckpointResult {
             checkpoint_id,
             runtime_id: request.runtime_id,
@@ -1138,11 +1456,8 @@ impl SessionApplication {
             .ok_or_else(|| SessionDomainError::NotFound {
                 runtime_id: request.checkpoint_id.clone(),
             })?;
-        let runtime = Arc::clone(
-            &self
-                .registration(&checkpoint.runtime_state.runtime_kind)?
-                .adapter,
-        );
+        let registration = self.registration(&checkpoint.runtime_state.runtime_kind)?;
+        let runtime = Arc::clone(&registration.runtime);
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
         if let Some(tenant_id) = &tenant_id_for_quota {
             self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
@@ -1151,16 +1466,51 @@ impl SessionApplication {
                     limit,
                 })?;
         }
-        if let Err(error) = runtime
-            .load_from_checkpoint(RuntimeLoadRequest {
-                new_runtime_id: runtime_id.clone(),
-                owner_ref: ctx.owner_ref(),
-                provider_snapshot_id: checkpoint.provider_snapshot_id.clone(),
-                runtime_state: checkpoint.runtime_state.clone(),
-                llm: request.llm,
-            })
+        let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
+        let backend = match manager
+            .load_instance_from_snapshot(
+                runtime_id.clone(),
+                provider_protocol::BackendId(provider_id.clone()),
+                ctx.owner_ref(),
+                provider_protocol::ProviderSnapshotId(checkpoint.provider_snapshot_id.clone()),
+                provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id),
+            )
             .await
+            .map_err(map_provider_error)
         {
+            Ok(backend) => backend,
+            Err(error) => {
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = runtime
+            .start(
+                RuntimeStartRequest {
+                    runtime_id: runtime_id.clone(),
+                    conversation_id: request
+                        .conversation_id
+                        .clone()
+                        .unwrap_or_else(|| checkpoint.source_runtime_id.clone()),
+                    sender_id: request
+                        .sender_id
+                        .clone()
+                        .unwrap_or_else(|| ctx.principal.clone()),
+                    workspace: checkpoint.workspace.clone(),
+                    state: Some(checkpoint.runtime_state.clone()),
+                    llm: request.llm.clone(),
+                    ext: Default::default(),
+                },
+                RuntimeExecutionContext {
+                    operation_backend: backend,
+                },
+            )
+            .await
+            .map_err(map_runtime_error)
+        {
+            let _ = manager.stop_instance(&runtime_id).await;
             if let Some(id) = &tenant_id_for_quota {
                 self.release_tenant_session(id);
             }
@@ -1192,6 +1542,7 @@ impl SessionApplication {
         };
         if let Err(error) = self.records.save(record.clone()).await {
             let _ = runtime.stop(&runtime_id).await;
+            let _ = manager.stop_instance(&runtime_id).await;
             if let Some(id) = &tenant_id_for_quota {
                 self.release_tenant_session(id);
             }
@@ -1270,17 +1621,15 @@ impl SessionApplication {
         // External resources first, metadata last. If provider/archive
         // cleanup fails, keeping the SQLite row makes the operation
         // discoverable and retryable rather than silently orphaning it.
-        let runtime = Arc::clone(
-            &self
-                .registration(&checkpoint.runtime_state.runtime_kind)?
-                .adapter,
-        );
-        runtime
-            .delete_checkpoint(
-                checkpoint.runtime_state.clone(),
-                checkpoint.provider_snapshot_id.clone(),
+        let registration = self.registration(&checkpoint.runtime_state.runtime_kind)?;
+        let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
+        manager
+            .delete_snapshot(
+                provider_protocol::BackendId(provider_id),
+                provider_protocol::ProviderSnapshotId(checkpoint.provider_snapshot_id.clone()),
             )
-            .await?;
+            .await
+            .map_err(map_provider_error)?;
         self.records
             .delete_checkpoint(&request.checkpoint_id)
             .await?;
@@ -1298,8 +1647,12 @@ impl SessionApplication {
         let parent = self
             .require_session(ctx, &request.parent_runtime_id)
             .await?;
-        let runtime = Arc::clone(&self.registration_for_record(&parent)?.adapter);
-        let exported = runtime.export_state(&request.parent_runtime_id).await?;
+        let registration = self.registration_for_record(&parent)?;
+        let runtime = Arc::clone(&registration.runtime);
+        let exported = runtime
+            .export_state(&request.parent_runtime_id)
+            .await
+            .map_err(map_runtime_error)?;
 
         let runtime_id = request
             .runtime_id
@@ -1327,19 +1680,46 @@ impl SessionApplication {
                 })?;
         }
 
-        if let Err(error) = runtime
-            .start(RuntimeStartRequest {
-                runtime_id: runtime_id.clone(),
-                conversation_id: conversation_id.clone(),
-                sender_id: sender_id.clone(),
-                workspace: parent.workspace.clone(),
-                state: Some(exported.clone()),
-                llm: None,
-                owner_ref: ctx.owner_ref(),
-                ext: Default::default(),
-            })
+        let (provider_id, manager) = provider_for_isolation(registration, &parent.isolation)?;
+        let snapshot = manager
+            .checkpoint_instance(&request.parent_runtime_id)
             .await
+            .map_err(map_provider_error)?;
+        let backend = manager
+            .load_instance_from_snapshot(
+                runtime_id.clone(),
+                provider_protocol::BackendId(provider_id.clone()),
+                ctx.owner_ref(),
+                snapshot.snapshot_id.clone(),
+                provider_options(&parent.workspace, &parent.isolation, &provider_id),
+            )
+            .await
+            .map_err(map_provider_error)?;
+        let _ = manager
+            .delete_snapshot(
+                provider_protocol::BackendId(provider_id),
+                snapshot.snapshot_id,
+            )
+            .await;
+        if let Err(error) = runtime
+            .start(
+                RuntimeStartRequest {
+                    runtime_id: runtime_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    sender_id: sender_id.clone(),
+                    workspace: parent.workspace.clone(),
+                    state: Some(exported.clone()),
+                    llm: None,
+                    ext: Default::default(),
+                },
+                RuntimeExecutionContext {
+                    operation_backend: backend,
+                },
+            )
+            .await
+            .map_err(map_runtime_error)
         {
+            let _ = manager.stop_instance(&runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -1369,6 +1749,7 @@ impl SessionApplication {
         };
         if let Err(error) = self.records.save(record.clone()).await {
             let _ = runtime.stop(&record.runtime_id).await;
+            let _ = manager.stop_instance(&record.runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -1442,11 +1823,37 @@ impl SessionApplication {
     /// falls back to `idle`.
     async fn ensure_runtime_attached(
         &self,
-        ctx: &SecurityContext,
+        _ctx: &SecurityContext,
         record: &SessionRecord,
     ) -> Result<(), SessionDomainError> {
-        let runtime = Arc::clone(&self.registration_for_record(record)?.adapter);
-        match runtime.attach(&record.runtime_id).await {
+        let registration = self.registration_for_record(record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        match runtime
+            .check_alive(&record.runtime_id)
+            .await
+            .map_err(map_runtime_error)
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) | Err(SessionDomainError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let (_, manager) = provider_for_isolation(registration, &record.isolation)?;
+        let operation_backend = match manager
+            .backend_for(&record.runtime_id)
+            .map_err(map_provider_error)
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.mark_restoration_failed(record, &error).await;
+                return Err(error);
+            }
+        };
+        let context = RuntimeExecutionContext { operation_backend };
+        match runtime
+            .attach(&record.runtime_id, context.clone())
+            .await
+            .map_err(map_runtime_error)
+        {
             Ok(()) => return Ok(()),
             Err(SessionDomainError::NotFound { .. }) => {}
             Err(error) => return Err(error),
@@ -1459,27 +1866,34 @@ impl SessionApplication {
         }
 
         if let Err(error) = runtime
-            .start(RuntimeStartRequest {
-                runtime_id: record.runtime_id.clone(),
-                conversation_id: record.conversation_id.clone(),
-                sender_id: record.sender_id.clone(),
-                workspace: record.workspace.clone(),
-                state: Some(record.runtime.clone()),
-                // `RuntimeStartRequest.llm` is a caller-supplied *override*
-                // hint (`LlmOverrideRequest`), not the already-resolved
-                // `record.llm: Option<ResolvedLlm>` — a replay has no fresh
-                // override to offer, same as `fork_impl`'s `llm: None`.
-                llm: None,
-                owner_ref: ctx.owner_ref(),
-                ext: Default::default(),
-            })
+            .start(
+                RuntimeStartRequest {
+                    runtime_id: record.runtime_id.clone(),
+                    conversation_id: record.conversation_id.clone(),
+                    sender_id: record.sender_id.clone(),
+                    workspace: record.workspace.clone(),
+                    state: Some(record.runtime.clone()),
+                    // `RuntimeStartRequest.llm` is a caller-supplied *override*
+                    // hint (`LlmOverrideRequest`), not the already-resolved
+                    // `record.llm: Option<ResolvedLlm>` — a replay has no fresh
+                    // override to offer, same as `fork_impl`'s `llm: None`.
+                    llm: None,
+                    ext: Default::default(),
+                },
+                context.clone(),
+            )
             .await
+            .map_err(map_runtime_error)
         {
             self.mark_restoration_failed(record, &error).await;
             return Err(error);
         }
 
-        if let Err(error) = runtime.attach(&record.runtime_id).await {
+        if let Err(error) = runtime
+            .attach(&record.runtime_id, context)
+            .await
+            .map_err(map_runtime_error)
+        {
             self.mark_restoration_failed(record, &error).await;
             return Err(error);
         }
@@ -1693,7 +2107,7 @@ pub trait SessionEnvironmentNormalizer: Send + Sync {
 /// (Tenant, _,          _      ) => reject
 /// ```
 ///
-/// `provider_is_sandbox` names whether the caller's `RuntimeAdapter`/normalizer
+/// `provider_is_sandbox` names whether the caller's runtime/normalizer
 /// pair actually provides an isolation boundary (container/VM/remote) rather
 /// than running on the host directly. A normalizer backing a host-only
 ///
@@ -1866,2317 +2280,5 @@ fn audit_log<T>(
                 error = %error,
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{RuntimeEvent, RuntimeStartRequest, TenantQuota, STALE_LEASE_THRESHOLD_MS};
-    use async_trait::async_trait;
-    use session_protocol::{SessionAcceptedInputKind, SessionLifecycleStatus, SessionUsage};
-    use std::collections::BTreeSet;
-    use tokio::sync::Mutex;
-
-    fn admin_ctx() -> SecurityContext {
-        SecurityContext::admin("test")
-    }
-
-    fn tenant_ctx() -> SecurityContext {
-        SecurityContext::tenant("tenant-a", "test")
-    }
-
-    /// Shared `list_active` logic for the in-memory test doubles below
-    /// ([`MemoryRepository`], [`MapRepository`]) so each one only has to
-    /// supply its records; the filter/sort/cap semantics stay in one place
-    /// rather than being duplicated per double.
-    fn select_active(
-        records: impl Iterator<Item = SessionRecord>,
-        tenant_id: Option<&str>,
-        limit: usize,
-    ) -> SessionListPage {
-        let mut matching: Vec<SessionRecord> = records
-            .filter(|record| {
-                matches!(
-                    record.status,
-                    SessionStatus::Opening
-                        | SessionStatus::Idle
-                        | SessionStatus::Running
-                        | SessionStatus::Paused
-                )
-            })
-            .filter(|record| match tenant_id {
-                None => true,
-                Some(id) => record.tenant_id.as_deref() == Some(id),
-            })
-            .collect();
-        matching.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
-        let total_active = matching.len() as u32;
-        matching.truncate(limit);
-        SessionListPage {
-            sessions: matching,
-            total_active,
-        }
-    }
-
-    struct EmptyRepository;
-
-    #[async_trait]
-    impl SessionRepository for EmptyRepository {
-        async fn get(
-            &self,
-            _runtime_id: &str,
-        ) -> Result<Option<SessionRecord>, SessionDomainError> {
-            Ok(Some(test_record()))
-        }
-
-        async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn list_active(
-            &self,
-            _tenant_id: Option<&str>,
-            _limit: usize,
-        ) -> Result<SessionListPage, SessionDomainError> {
-            Ok(SessionListPage {
-                sessions: Vec::new(),
-                total_active: 0,
-            })
-        }
-    }
-
-    fn test_record() -> SessionRecord {
-        SessionRecord {
-            runtime_id: "runtime-1".into(),
-            conversation_id: "conversation-1".into(),
-            sender_id: "sender-1".into(),
-            status: crate::SessionStatus::Idle,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            workspace: crate::WorkspaceFacts {
-                workspace_id: "workspace-1".into(),
-                root: ".".into(),
-                access: crate::WorkspaceAccess::ReadWrite,
-                revision: None,
-                metadata: serde_json::Value::Null,
-            },
-            isolation: crate::IsolationFacts {
-                boundary: crate::IsolationBoundary::Host,
-                workspace_access: crate::WorkspaceAccess::ReadWrite,
-                network: crate::NetworkIsolation::None,
-                metadata: serde_json::Value::Null,
-            },
-            capabilities: crate::EffectiveCapabilities {
-                sandbox: Default::default(),
-                runtime: [
-                    crate::RuntimeCapability::ModelOverride,
-                    crate::RuntimeCapability::ReasoningControl,
-                    crate::RuntimeCapability::Interaction,
-                ]
-                .into_iter()
-                .collect(),
-            },
-            runtime: crate::OpaqueRuntimeState {
-                runtime_kind: "test".into(),
-                schema_version: 1,
-                state: serde_json::Value::Null,
-            },
-            llm: None,
-            lease: None,
-            lineage: None,
-            last_error: None,
-            tenant_id: None,
-            created_by: "test".to_string(),
-        }
-    }
-
-    struct FixedTurnId;
-
-    impl TurnIdGenerator for FixedTurnId {
-        fn next_turn_id(&self) -> String {
-            "turn-fixed".into()
-        }
-    }
-
-    impl RuntimeIdGenerator for FixedTurnId {
-        fn next_runtime_id(&self) -> String {
-            "runtime-fixed".into()
-        }
-    }
-
-    impl Clock for FixedTurnId {
-        fn now_ms(&self) -> u64 {
-            42
-        }
-    }
-
-    struct UnusedEnvironment;
-
-    #[async_trait]
-    impl SessionEnvironmentNormalizer for UnusedEnvironment {
-        async fn normalize(
-            &self,
-            _ctx: &SecurityContext,
-            _request: &SessionOpenRequest,
-        ) -> Result<NormalizedSessionEnvironment, SessionDomainError> {
-            unreachable!("turn submission does not normalize an open request")
-        }
-    }
-
-    struct TestEnvironment;
-
-    #[async_trait]
-    impl SessionEnvironmentNormalizer for TestEnvironment {
-        async fn normalize(
-            &self,
-            _ctx: &SecurityContext,
-            _request: &SessionOpenRequest,
-        ) -> Result<NormalizedSessionEnvironment, SessionDomainError> {
-            Ok(NormalizedSessionEnvironment {
-                workspace: crate::WorkspaceFacts {
-                    workspace_id: "workspace-normalized".into(),
-                    root: "/normalized".into(),
-                    access: crate::WorkspaceAccess::ReadWrite,
-                    revision: None,
-                    metadata: serde_json::Value::Null,
-                },
-                isolation: crate::IsolationFacts {
-                    boundary: crate::IsolationBoundary::Container,
-                    workspace_access: crate::WorkspaceAccess::ReadWrite,
-                    network: crate::NetworkIsolation::Restricted,
-                    metadata: serde_json::Value::Null,
-                },
-                sandbox_capabilities: [crate::SandboxCapability::Exec].into_iter().collect(),
-                llm: None,
-                lease: None,
-            })
-        }
-    }
-
-    /// Simulates a buggy normalizer that ignores `ctx` entirely and always
-    /// grants a host isolation boundary — i.e. it does *not* call
-    /// `enforce_workspace_axiom` itself. Used to prove the fail-closed second
-    /// gate in `SessionApplication::open` (§0/§7 step 2) rejects a tenant
-    /// session on its own, without depending on the normalizer having gotten
-    /// the `(role, workspace, provider)` check right.
-    struct BuggyHostBoundaryEnvironment;
-
-    #[async_trait]
-    impl SessionEnvironmentNormalizer for BuggyHostBoundaryEnvironment {
-        async fn normalize(
-            &self,
-            _ctx: &SecurityContext,
-            _request: &SessionOpenRequest,
-        ) -> Result<NormalizedSessionEnvironment, SessionDomainError> {
-            Ok(NormalizedSessionEnvironment {
-                workspace: crate::WorkspaceFacts {
-                    workspace_id: "workspace-buggy".into(),
-                    root: "/buggy".into(),
-                    access: crate::WorkspaceAccess::ReadWrite,
-                    revision: None,
-                    metadata: serde_json::Value::Null,
-                },
-                isolation: crate::IsolationFacts {
-                    boundary: crate::IsolationBoundary::Host,
-                    workspace_access: crate::WorkspaceAccess::ReadWrite,
-                    network: crate::NetworkIsolation::None,
-                    metadata: serde_json::Value::Null,
-                },
-                sandbox_capabilities: [crate::SandboxCapability::Exec].into_iter().collect(),
-                llm: None,
-                lease: None,
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct MemoryRepository(Mutex<Option<SessionRecord>>);
-
-    #[async_trait]
-    impl SessionRepository for MemoryRepository {
-        async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
-            Ok(self
-                .0
-                .lock()
-                .await
-                .clone()
-                .filter(|record| record.runtime_id == runtime_id))
-        }
-
-        async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
-            *self.0.lock().await = Some(record);
-            Ok(())
-        }
-
-        async fn list_active(
-            &self,
-            tenant_id: Option<&str>,
-            limit: usize,
-        ) -> Result<SessionListPage, SessionDomainError> {
-            Ok(select_active(
-                self.0.lock().await.clone().into_iter(),
-                tenant_id,
-                limit,
-            ))
-        }
-    }
-
-    #[derive(Default)]
-    struct CompletingRuntime {
-        started: Mutex<Option<RuntimeStartRequest>>,
-        submitted: Mutex<Option<RuntimeTurnInput>>,
-        stopped: Mutex<bool>,
-        checkpoint_delete_fails: bool,
-    }
-
-    #[async_trait]
-    impl RuntimeAdapter for CompletingRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            *self.started.lock().await = Some(request);
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            *self.stopped.lock().await = true;
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            *self.submitted.lock().await = Some(input);
-            let (tx, rx) = mpsc::channel(2);
-            tx.send(RuntimeEvent::Completed {
-                outcome: session_protocol::SessionTurnOutcome::Complete,
-                usage: SessionUsage::default(),
-            })
-            .await
-            .unwrap();
-            Ok(rx)
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn delete_checkpoint(
-            &self,
-            _runtime_state: OpaqueRuntimeState,
-            _provider_snapshot_id: String,
-        ) -> Result<(), SessionDomainError> {
-            if self.checkpoint_delete_fails {
-                Err(SessionDomainError::Unavailable {
-                    message: "snapshot delete failed".into(),
-                })
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn receipt_and_stream_share_the_server_assigned_turn_id() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let submission = application
-            .submit_turn(
-                &admin_ctx(),
-                SessionTurnRequest {
-                    runtime_id: "runtime-1".into(),
-                    text: "hello".into(),
-                    entry: Default::default(),
-                    llm: None,
-                    reasoning_effort: None,
-                    client_request_id: None,
-                    ext: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(submission.receipt.turn_id, "turn-fixed");
-        assert_eq!(
-            submission.receipt.accepted_kind,
-            SessionAcceptedInputKind::Turn
-        );
-        let mut events = submission.events.expect("new turn carries an event stream");
-        let event = events.recv().await.unwrap();
-        let event = serde_json::to_value(event).unwrap();
-        assert_eq!(event["runtime_id"], submission.receipt.runtime_id);
-        assert_eq!(event["turn_id"], submission.receipt.turn_id);
-        assert_eq!(event["kind"], "turn_completed");
-    }
-
-    #[tokio::test]
-    async fn open_normalizes_intent_and_persists_opaque_runtime_state() {
-        let repository = Arc::new(MemoryRepository::default());
-        let runtime = Arc::new(CompletingRuntime::default());
-        let application = SessionApplication::new(
-            runtime.clone(),
-            repository.clone(),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let response = application
-            .open(
-                &admin_ctx(),
-                SessionOpenRequest {
-                    runtime_id: None,
-                    runtime_kind: None,
-                    conversation_id: "conversation".into(),
-                    sender_id: "sender".into(),
-                    workspace: Default::default(),
-                    deployment: Default::default(),
-                    requested_capabilities: Default::default(),
-                    llm: None,
-                    ext: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.runtime_id, "runtime-fixed");
-        assert_eq!(response.runtime_kind, "test");
-        assert_eq!(response.workspace.root, "/normalized");
-        let stored = repository.0.lock().await.clone().unwrap();
-        assert_eq!(stored.runtime.runtime_kind, "test");
-        assert_eq!(stored.runtime.schema_version, 1);
-        assert_eq!(stored.runtime.state, serde_json::Value::Null);
-        let started = runtime.started.lock().await.clone().unwrap();
-        assert_eq!(started.conversation_id, "conversation");
-        assert_eq!(started.sender_id, "sender");
-    }
-
-    #[tokio::test]
-    async fn runtime_registry_uses_default_and_explicit_kinds() {
-        #[derive(Default)]
-        struct XiaooTestRuntime(CompletingRuntime);
-
-        #[async_trait]
-        impl RuntimeAdapter for XiaooTestRuntime {
-            fn kind(&self) -> &str {
-                "xiaoo"
-            }
-            fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-                BTreeSet::new()
-            }
-            async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-                self.0.start(request).await
-            }
-            async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
-                self.0.stop(runtime_id).await
-            }
-            async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
-                self.0.attach(runtime_id).await
-            }
-            async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-                Ok(true)
-            }
-            async fn submit_turn(
-                &self,
-                input: RuntimeTurnInput,
-            ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-                self.0.submit_turn(input).await
-            }
-            async fn answer_interaction(
-                &self,
-                input: RuntimeInteractionInput,
-            ) -> Result<(), SessionDomainError> {
-                self.0.answer_interaction(input).await
-            }
-            async fn cancel(
-                &self,
-                runtime_id: &str,
-                turn_id: Option<&str>,
-            ) -> Result<(), SessionDomainError> {
-                self.0.cancel(runtime_id, turn_id).await
-            }
-        }
-
-        let pi = Arc::new(CompletingRuntime::default());
-        let xiaoo = Arc::new(XiaooTestRuntime::default());
-        let application = SessionApplication::with_runtime_registry(
-            "test",
-            [
-                RuntimeRegistration::new(pi.clone(), Arc::new(TestEnvironment)),
-                RuntimeRegistration::new(xiaoo.clone(), Arc::new(TestEnvironment)),
-            ],
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-        )
-        .unwrap();
-
-        application
-            .open(&admin_ctx(), open_request(Default::default()))
-            .await
-            .unwrap();
-        assert!(pi.started.lock().await.is_some());
-
-        let unknown = application
-            .open(
-                &admin_ctx(),
-                SessionOpenRequest {
-                    runtime_id: Some("other".into()),
-                    runtime_kind: Some("unknown".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(unknown, SessionDomainError::InvalidRequest { .. }));
-
-        // Use a separate repository so the fixed id from the default-open
-        // branch cannot trigger re-attach instead of a fresh explicit open.
-        let explicit = SessionApplication::with_runtime_registry(
-            "test",
-            [
-                RuntimeRegistration::new(pi, Arc::new(TestEnvironment)),
-                RuntimeRegistration::new(xiaoo.clone(), Arc::new(TestEnvironment)),
-            ],
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-        )
-        .unwrap();
-        explicit
-            .open(
-                &admin_ctx(),
-                SessionOpenRequest {
-                    runtime_kind: Some("xiaoo".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap();
-        assert!(xiaoo.0.started.lock().await.is_some());
-    }
-
-    fn open_request(workspace: session_protocol::WorkspaceSpec) -> SessionOpenRequest {
-        SessionOpenRequest {
-            runtime_id: None,
-            runtime_kind: None,
-            conversation_id: "conversation".into(),
-            sender_id: "sender".into(),
-            workspace,
-            deployment: Default::default(),
-            requested_capabilities: Default::default(),
-            llm: None,
-            ext: Default::default(),
-            lease: Default::default(),
-        }
-    }
-
-    /// §0/§7 step 2, enforcement point 2: the fail-closed assertion in
-    /// `open()` must reject a non-admin session even when the normalizer
-    /// itself never checks `ctx` — this is the whole point of it being a
-    /// second, independent gate rather than trusting the normalizer alone.
-    #[tokio::test]
-    async fn open_fails_closed_when_a_buggy_normalizer_grants_host_boundary_to_a_tenant() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(BuggyHostBoundaryEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let error = application
-            .open(&tenant_ctx(), open_request(Default::default()))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
-    }
-
-    /// Same buggy normalizer, but an admin caller must still go through —
-    /// the fail-closed gate only fires for non-admin `ctx`, admin keeps its
-    /// "百无禁忌" bypass (`docs/tenancy_design.md` §0).
-    #[tokio::test]
-    async fn open_still_succeeds_for_admin_even_with_a_host_boundary_normalizer() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(BuggyHostBoundaryEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        application
-            .open(&admin_ctx(), open_request(Default::default()))
-            .await
-            .unwrap();
-    }
-
-    /// The second half of the §0 invariant — `workspace 来源 ≠ LocalPath` —
-    /// fires independently of the isolation-boundary check above, even when
-    /// the normalizer (here `TestEnvironment`, `Container` boundary) got the
-    /// boundary right.
-    #[tokio::test]
-    async fn open_fails_closed_when_a_tenant_requests_a_local_path_workspace() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let error = application
-            .open(
-                &tenant_ctx(),
-                open_request(session_protocol::WorkspaceSpec::LocalPath {
-                    path: "/etc".into(),
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
-    }
-
-    // --- enforce_workspace_axiom (§5.4 triple) -----------------------------
-
-    #[test]
-    fn axiom_admin_passes_regardless_of_workspace_or_provider() {
-        let workspace = session_protocol::WorkspaceSpec::LocalPath {
-            path: "/etc".into(),
-        };
-        assert!(enforce_workspace_axiom(&admin_ctx(), &workspace, false).is_ok());
-        assert!(enforce_workspace_axiom(&admin_ctx(), &workspace, true).is_ok());
-    }
-
-    #[test]
-    fn axiom_tenant_on_a_non_sandbox_provider_is_always_rejected() {
-        let local = session_protocol::WorkspaceSpec::LocalPath {
-            path: "/etc".into(),
-        };
-        let git = session_protocol::WorkspaceSpec::Git {
-            url: "https://example.com/repo.git".into(),
-            reference: None,
-            subdirectory: None,
-        };
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &local, false).is_err());
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &git, false).is_err());
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &Default::default(), false).is_err());
-    }
-
-    #[test]
-    fn axiom_tenant_on_a_sandbox_provider_requires_git() {
-        let local = session_protocol::WorkspaceSpec::LocalPath {
-            path: "/etc".into(),
-        };
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &local, true).is_err());
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &Default::default(), true).is_err());
-    }
-
-    #[test]
-    fn axiom_tenant_git_over_https_with_no_embedded_credentials_is_allowed() {
-        let git = session_protocol::WorkspaceSpec::Git {
-            url: "https://example.com/org/repo.git".into(),
-            reference: Some("main".into()),
-            subdirectory: None,
-        };
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &git, true).is_ok());
-    }
-
-    #[test]
-    fn axiom_tenant_git_rejects_non_https_schemes() {
-        for url in [
-            "http://example.com/repo.git",
-            "ssh://git@example.com/repo.git",
-            "git://example.com/repo.git",
-            "file:///etc/passwd",
-        ] {
-            let git = session_protocol::WorkspaceSpec::Git {
-                url: url.into(),
-                reference: None,
-                subdirectory: None,
-            };
-            assert!(
-                enforce_workspace_axiom(&tenant_ctx(), &git, true).is_err(),
-                "expected {url} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn axiom_tenant_git_rejects_embedded_credentials() {
-        let git = session_protocol::WorkspaceSpec::Git {
-            url: "https://user:secret@example.com/repo.git".into(),
-            reference: None,
-            subdirectory: None,
-        };
-        assert!(enforce_workspace_axiom(&tenant_ctx(), &git, true).is_err());
-    }
-
-    #[tokio::test]
-    async fn capability_gate_rejects_before_runtime_submission() {
-        let mut record = test_record();
-        record.capabilities.runtime.clear();
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(record))));
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let error = application
-            .submit_turn(
-                &admin_ctx(),
-                SessionTurnRequest {
-                    runtime_id: "runtime-1".into(),
-                    text: "hello".into(),
-                    entry: Default::default(),
-                    llm: Some(Default::default()),
-                    reasoning_effort: None,
-                    client_request_id: None,
-                    ext: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .err()
-            .expect("missing model override capability must fail");
-        assert!(matches!(
-            error,
-            SessionDomainError::UnsupportedCapability { capability, .. }
-                if capability == "model_override"
-        ));
-    }
-
-    #[tokio::test]
-    async fn turn_entry_is_projected_to_the_runtime_adapter() {
-        let runtime = Arc::new(CompletingRuntime::default());
-        let application = SessionApplication::new(
-            runtime.clone(),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        application
-            .submit_turn(
-                &admin_ctx(),
-                SessionTurnRequest {
-                    runtime_id: "runtime-1".into(),
-                    text: "hello".into(),
-                    entry: session_protocol::SessionEntryContext {
-                        entry_kind: Some("channel".into()),
-                        instance_id: Some("feishu-tenant-1".into()),
-                        message_id: Some("message-1".into()),
-                        reply_to_message_id: Some("message-0".into()),
-                    },
-                    llm: None,
-                    reasoning_effort: None,
-                    client_request_id: None,
-                    ext: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-
-        let input = runtime.submitted.lock().await.clone().unwrap();
-        assert_eq!(input.entry.kind.as_deref(), Some("channel"));
-        assert_eq!(input.entry.instance_id.as_deref(), Some("feishu-tenant-1"));
-        assert_eq!(input.entry.message_id.as_deref(), Some("message-1"));
-        assert_eq!(
-            input.entry.reply_to_message_id.as_deref(),
-            Some("message-0")
-        );
-    }
-
-    // -- Phase 2: lease-gated close/detach/heartbeat/cancel, and fork --------
-
-    /// A `RuntimeAdapter` that overrides `export_state` (unlike
-    /// `CompletingRuntime`), so `fork`'s happy path can be exercised without
-    /// stubbing out the entire adapter surface.
-    #[derive(Default)]
-    struct ForkableRuntime {
-        started: Mutex<Option<RuntimeStartRequest>>,
-    }
-
-    #[async_trait]
-    impl RuntimeAdapter for ForkableRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            *self.started.lock().await = Some(request);
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            _input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            unreachable!("the fork tests never submit a turn")
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn export_state(
-            &self,
-            _runtime_id: &str,
-        ) -> Result<OpaqueRuntimeState, SessionDomainError> {
-            Ok(OpaqueRuntimeState {
-                runtime_kind: "forkable".into(),
-                schema_version: 1,
-                state: serde_json::json!({"turns": 3}),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn submit_turn_rejects_when_another_client_holds_the_lease() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table);
-
-        let error = application
-            .submit_turn(
-                &admin_ctx(),
-                SessionTurnRequest {
-                    runtime_id: "runtime-1".into(),
-                    text: "hello".into(),
-                    entry: Default::default(),
-                    llm: None,
-                    reasoning_effort: None,
-                    client_request_id: None,
-                    ext: Default::default(),
-                    lease: SessionLeaseClaim {
-                        client_id: Some("client-b".into()),
-                        ..Default::default()
-                    },
-                },
-            )
-            .await
-            .err()
-            .expect("a different client's turn submission must be rejected");
-        assert!(matches!(
-            error,
-            SessionDomainError::LeaseConflict { holder_client_id, .. }
-                if holder_client_id.as_deref() == Some("client-a")
-        ));
-    }
-
-    #[tokio::test]
-    async fn close_rejects_when_another_client_holds_the_lease() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table);
-
-        let error = application
-            .close(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-b".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .err()
-            .expect("a different client's close must be rejected");
-        assert!(matches!(error, SessionDomainError::LeaseConflict { .. }));
-    }
-
-    #[tokio::test]
-    async fn close_by_the_lease_holder_stops_the_runtime_and_tombstones_the_record() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let runtime = Arc::new(CompletingRuntime::default());
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        let application = SessionApplication::new(
-            runtime.clone(),
-            repository.clone(),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table.clone());
-
-        let response = application
-            .close(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-a".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("the lease holder's close must succeed");
-        assert_eq!(response.status, SessionLifecycleStatus::Closed);
-        assert!(*runtime.stopped.lock().await, "close must stop the runtime");
-
-        let stored = repository.0.lock().await.clone().unwrap();
-        assert_eq!(
-            stored.status,
-            crate::SessionStatus::Closed,
-            "close tombstones the record instead of deleting it"
-        );
-        assert!(
-            lease_table.check_holder("runtime-1", None).await.is_ok(),
-            "close must remove the lease so a later open starts clean"
-        );
-    }
-
-    #[tokio::test]
-    async fn close_by_a_new_client_succeeds_once_the_prior_holders_lease_goes_stale() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        lease_table
-            .set_last_heartbeat_ms_for_test(
-                "runtime-1",
-                crate::session_lease::current_time_ms()
-                    .expect("wall clock")
-                    .saturating_sub(STALE_LEASE_THRESHOLD_MS + 1_000),
-            )
-            .await;
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table);
-
-        // `close` uses `check_holder` (read-only): a stale prior holder must
-        // not block a new client, mirroring
-        // `session_lease::check_holder_does_not_take_over_stale_lease`.
-        let response = application
-            .close(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-b".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("a stale prior holder must not block a new client's close");
-        assert_eq!(response.status, SessionLifecycleStatus::Closed);
-    }
-
-    #[tokio::test]
-    async fn detach_releases_only_the_callers_own_lease_and_leaves_the_runtime_running() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let runtime = Arc::new(CompletingRuntime::default());
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        let application = SessionApplication::new(
-            runtime.clone(),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table.clone());
-
-        // A different client's detach is a no-op (matches
-        // `SessionLeaseTable::detach`'s "only releases self lease" contract).
-        application
-            .detach(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-b".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("detach must succeed even when the caller does not hold the lease");
-        assert!(
-            lease_table
-                .check_holder("runtime-1", Some("client-b"))
-                .await
-                .is_err(),
-            "client-a must still hold the lease"
-        );
-
-        let response = application
-            .detach(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-a".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("the holder's detach must succeed");
-        assert_eq!(response.status, SessionLifecycleStatus::Idle);
-        assert!(
-            lease_table.check_holder("runtime-1", None).await.is_ok(),
-            "lease must be released after detach"
-        );
-        assert!(
-            !*runtime.stopped.lock().await,
-            "detach must not stop the runtime"
-        );
-    }
-
-    #[tokio::test]
-    async fn heartbeat_without_lease_enforcement_is_a_no_op_accept() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let response = application
-            .heartbeat(&admin_ctx(), "runtime-1", SessionLeaseClaim::default())
-            .await
-            .expect("heartbeat must be accepted when lease enforcement is off");
-        assert!(response.accepted);
-        assert_eq!(response.lease_expires_at_ms, None);
-    }
-
-    #[tokio::test]
-    async fn heartbeat_requires_a_client_id_when_lease_enforcement_is_on() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(Arc::new(SessionLeaseTable::new()));
-
-        let error = application
-            .heartbeat(&admin_ctx(), "runtime-1", SessionLeaseClaim::default())
-            .await
-            .err()
-            .expect("an anonymous heartbeat must be rejected once lease enforcement is on");
-        assert!(matches!(error, SessionDomainError::LeaseRequired { .. }));
-    }
-
-    #[tokio::test]
-    async fn heartbeat_auto_reacquires_when_no_lease_is_currently_held() {
-        // Mirrors `SessionLeaseTable::heartbeat`'s `None` arm: an empty table
-        // (e.g. after a `detach`, or a daemon restart) lets the next
-        // heartbeat re-acquire without a round trip through `open`.
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table.clone());
-
-        let response = application
-            .heartbeat(
-                &admin_ctx(),
-                "runtime-1",
-                SessionLeaseClaim {
-                    client_id: Some("client-a".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("heartbeat on an unheld session must auto-acquire");
-        assert!(response.accepted);
-        assert!(response.lease_expires_at_ms.is_some());
-
-        // client-a is now the recorded holder; a different client's
-        // heartbeat must fail against it.
-        let error = lease_table
-            .heartbeat("runtime-1", "client-b", None, None)
-            .await
-            .err()
-            .expect("a different client must not be able to heartbeat client-a's lease");
-        assert!(matches!(
-            error,
-            LeaseCheckFailure::Busy { holder_client_id, .. } if holder_client_id == "client-a"
-        ));
-    }
-
-    #[tokio::test]
-    async fn cancel_delegates_to_the_runtime_without_a_lease_check() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let lease_table = Arc::new(SessionLeaseTable::new());
-        lease_table
-            .acquire("runtime-1", "client-a", None, None)
-            .await;
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        )
-        .with_lease_table(lease_table);
-
-        // client-b does not hold the lease, but cancel is not lease-gated.
-        application
-            .cancel(&admin_ctx(), "runtime-1", Some("turn-1"))
-            .await
-            .expect("cancel must not require holding the write lease");
-    }
-
-    #[tokio::test]
-    async fn fork_fails_with_unsupported_capability_when_the_adapter_has_not_implemented_export_state(
-    ) {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let error = application
-            .fork(
-                &admin_ctx(),
-                SessionForkRequest {
-                    parent_runtime_id: "runtime-1".into(),
-                    runtime_id: None,
-                    conversation_id: None,
-                    sender_id: None,
-                    workspace: None,
-                    deployment: None,
-                    requested_capabilities: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .err()
-            .expect("fork must fail when the adapter has not implemented export_state");
-        assert!(matches!(
-            error,
-            SessionDomainError::UnsupportedCapability { capability, .. }
-                if capability == "state_export"
-        ));
-    }
-
-    #[tokio::test]
-    async fn fork_starts_a_new_runtime_from_the_parents_exported_state() {
-        let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
-        let runtime = Arc::new(ForkableRuntime::default());
-        let application = SessionApplication::new(
-            runtime.clone(),
-            repository.clone(),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let response = application
-            .fork(
-                &admin_ctx(),
-                SessionForkRequest {
-                    parent_runtime_id: "runtime-1".into(),
-                    runtime_id: None,
-                    conversation_id: None,
-                    sender_id: None,
-                    workspace: None,
-                    deployment: None,
-                    requested_capabilities: Default::default(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .expect("fork must succeed against an adapter that implements export_state");
-
-        assert_eq!(response.runtime_id, "runtime-fixed");
-        assert_eq!(response.conversation_id, "conversation-1");
-
-        let stored = repository.0.lock().await.clone().unwrap();
-        assert_eq!(
-            stored
-                .lineage
-                .as_ref()
-                .and_then(|lineage| lineage.parent_runtime_id.as_deref()),
-            Some("runtime-1"),
-            "the forked record must carry lineage back to its parent"
-        );
-        assert_eq!(stored.runtime.state, serde_json::json!({"turns": 3}));
-
-        let started = runtime.started.lock().await.clone().unwrap();
-        assert_eq!(started.runtime_id, "runtime-fixed");
-        assert_eq!(
-            started.state.unwrap().state,
-            serde_json::json!({"turns": 3})
-        );
-    }
-
-    fn plain_turn_request(client_request_id: Option<&str>) -> SessionTurnRequest {
-        SessionTurnRequest {
-            runtime_id: "runtime-1".into(),
-            text: "hello".into(),
-            entry: Default::default(),
-            llm: None,
-            reasoning_effort: None,
-            client_request_id: client_request_id.map(str::to_string),
-            ext: Default::default(),
-            lease: Default::default(),
-        }
-    }
-
-    /// Retry a submission until the turn gate frees up (the forwarding task
-    /// releases it asynchronously after the terminal event), failing the test
-    /// if it stays occupied well past any plausible forwarding delay.
-    async fn submit_when_gate_frees(
-        application: &SessionApplication,
-        request: SessionTurnRequest,
-    ) -> SessionSubmission {
-        for _ in 0..200 {
-            match application.submit_turn(&admin_ctx(), request.clone()).await {
-                Ok(submission) => return submission,
-                Err(SessionDomainError::Conflict { .. }) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(other) => panic!("unexpected submit error while waiting for gate: {other:?}"),
-            }
-        }
-        panic!("turn gate was never released");
-    }
-
-    /// Runtime whose turns stay open until the test completes them through
-    /// the stashed sender.
-    #[derive(Default)]
-    struct HoldingRuntime {
-        turn_sender: Mutex<Option<mpsc::Sender<crate::RuntimeEvent>>>,
-    }
-
-    #[async_trait]
-    impl RuntimeAdapter for HoldingRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            _input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            let (tx, rx) = mpsc::channel(4);
-            *self.turn_sender.lock().await = Some(tx);
-            Ok(rx)
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn second_submit_while_a_turn_is_active_is_rejected_with_conflict() {
-        let runtime = Arc::new(HoldingRuntime::default());
-        let application = SessionApplication::new(
-            runtime.clone(),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let mut first = application
-            .submit_turn(&admin_ctx(), plain_turn_request(None))
-            .await
-            .expect("first submission must be accepted");
-
-        let error = application
-            .submit_turn(&admin_ctx(), plain_turn_request(None))
-            .await
-            .err()
-            .expect("second submission must be rejected while the first turn is active");
-        assert!(
-            matches!(error, SessionDomainError::Conflict { ref message }
-                if message.contains(&first.receipt.turn_id)),
-            "conflict must name the active turn: {error:?}"
-        );
-
-        // Complete the first turn and drain it to its terminal event.
-        let sender = runtime.turn_sender.lock().await.take().unwrap();
-        sender
-            .send(crate::RuntimeEvent::Completed {
-                outcome: session_protocol::SessionTurnOutcome::Complete,
-                usage: SessionUsage::default(),
-            })
-            .await
-            .unwrap();
-        drop(sender);
-        let mut events = first.events.take().expect("new turn has an event stream");
-        while let Some(event) = events.recv().await {
-            if matches!(event, session_protocol::SessionEvent::TurnCompleted { .. }) {
-                break;
-            }
-        }
-
-        // The gate frees once the forwarding task finishes.
-        submit_when_gate_frees(&application, plain_turn_request(None)).await;
-    }
-
-    /// Immediately-completing runtime that counts how many turns the adapter
-    /// actually received — the observable difference between a replayed
-    /// receipt and an accidentally restarted turn.
-    #[derive(Default)]
-    struct CountingRuntime {
-        submissions: std::sync::atomic::AtomicU32,
-    }
-
-    #[async_trait]
-    impl RuntimeAdapter for CountingRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            _input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            self.submissions
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let (tx, rx) = mpsc::channel(2);
-            tx.send(crate::RuntimeEvent::Completed {
-                outcome: session_protocol::SessionTurnOutcome::Complete,
-                usage: SessionUsage::default(),
-            })
-            .await
-            .unwrap();
-            Ok(rx)
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-    }
-
-    struct SequencedIds(std::sync::atomic::AtomicU32);
-
-    impl TurnIdGenerator for SequencedIds {
-        fn next_turn_id(&self) -> String {
-            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            format!("turn-{n}")
-        }
-    }
-
-    #[tokio::test]
-    async fn duplicate_client_request_id_replays_the_receipt_without_a_new_turn() {
-        let runtime = Arc::new(CountingRuntime::default());
-        let application = SessionApplication::new(
-            runtime.clone(),
-            Arc::new(EmptyRepository),
-            Arc::new(SequencedIds(std::sync::atomic::AtomicU32::new(1))),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let mut first = application
-            .submit_turn(&admin_ctx(), plain_turn_request(Some("req-1")))
-            .await
-            .expect("first submission must be accepted");
-        assert_eq!(first.receipt.turn_id, "turn-1");
-        let mut events = first.events.take().expect("new turn has an event stream");
-        while events.recv().await.is_some() {}
-
-        // Retry with the same key: same turn_id, no new stream, and — the
-        // load-bearing assertion — the adapter never saw a second turn.
-        let replay = submit_when_gate_frees(&application, plain_turn_request(Some("req-1"))).await;
-        assert_eq!(replay.receipt.turn_id, "turn-1");
-        assert!(
-            replay.events.is_none(),
-            "a replay must not open a new stream"
-        );
-        assert_eq!(
-            runtime
-                .submissions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-
-        // A different key is a genuinely new turn.
-        let second = submit_when_gate_frees(&application, plain_turn_request(Some("req-2"))).await;
-        assert_eq!(second.receipt.turn_id, "turn-2");
-        assert!(second.events.is_some());
-        assert_eq!(
-            runtime
-                .submissions
-                .load(std::sync::atomic::Ordering::SeqCst),
-            2
-        );
-    }
-
-    /// Runtime whose event stream closes without ever producing a terminal
-    /// event (a crashed runtime process, from the governor's point of view).
-    struct VanishingRuntime;
-
-    #[async_trait]
-    impl RuntimeAdapter for VanishingRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            _input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            let (tx, rx) = mpsc::channel(1);
-            drop(tx);
-            Ok(rx)
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn gate_is_released_after_a_stream_closes_without_a_terminal_event() {
-        let application = SessionApplication::new(
-            Arc::new(VanishingRuntime),
-            Arc::new(EmptyRepository),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let mut submission = application
-            .submit_turn(&admin_ctx(), plain_turn_request(None))
-            .await
-            .expect("submission must be accepted");
-        let mut events = submission
-            .events
-            .take()
-            .expect("new turn has an event stream");
-        let event = events.recv().await.expect("synthesized terminal event");
-        let event = serde_json::to_value(event).unwrap();
-        assert_eq!(event["kind"], "turn_failed");
-        assert_eq!(event["error"]["code"], "event_stream_closed");
-
-        // The synthesized failure must also release the single-turn slot.
-        submit_when_gate_frees(&application, plain_turn_request(None)).await;
-    }
-
-    // -- Phase 3: quota admission (§7 step 4) --------------------------------
-
-    fn quota_tenant_ctx(max_sessions: u32) -> SecurityContext {
-        SecurityContext::tenant("tenant-a", "test").with_quota(TenantQuota {
-            max_sessions: Some(max_sessions),
-            ..Default::default()
-        })
-    }
-
-    fn tenant_test_record() -> SessionRecord {
-        SessionRecord {
-            tenant_id: Some("tenant-a".to_string()),
-            ..test_record()
-        }
-    }
-
-    /// A `SessionRepository` keyed by `runtime_id`, unlike `MemoryRepository`
-    /// (single-slot — overwritten on every `save`). Needed for the fork quota
-    /// test, which must keep the parent record addressable while a distinct
-    /// child record is saved alongside it.
-    #[derive(Default)]
-    struct MapRepository(Mutex<HashMap<String, SessionRecord>>);
-
-    #[async_trait]
-    impl SessionRepository for MapRepository {
-        async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
-            Ok(self.0.lock().await.get(runtime_id).cloned())
-        }
-
-        async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
-            self.0
-                .lock()
-                .await
-                .insert(record.runtime_id.clone(), record);
-            Ok(())
-        }
-
-        async fn list_active(
-            &self,
-            tenant_id: Option<&str>,
-            limit: usize,
-        ) -> Result<SessionListPage, SessionDomainError> {
-            Ok(select_active(
-                self.0.lock().await.values().cloned(),
-                tenant_id,
-                limit,
-            ))
-        }
-
-        async fn active_session_counts_by_tenant(
-            &self,
-        ) -> Result<HashMap<String, usize>, SessionDomainError> {
-            let records = self.0.lock().await;
-            let mut counts = HashMap::new();
-            for record in records.values().filter(|record| {
-                record.tenant_id.is_some()
-                    && matches!(
-                        record.status,
-                        SessionStatus::Opening
-                            | SessionStatus::Idle
-                            | SessionStatus::Running
-                            | SessionStatus::Paused
-                    )
-            }) {
-                *counts.entry(record.tenant_id.clone().unwrap()).or_insert(0) += 1;
-            }
-            Ok(counts)
-        }
-    }
-
-    /// Fails `start` exactly once, then succeeds on every subsequent call —
-    /// lets a test observe that a failed `open`'s quota reservation was
-    /// rolled back, by immediately retrying and expecting success.
-    #[derive(Default)]
-    struct FirstStartFailsRuntime {
-        already_failed: Mutex<bool>,
-    }
-
-    #[async_trait]
-    impl RuntimeAdapter for FirstStartFailsRuntime {
-        fn kind(&self) -> &str {
-            "test"
-        }
-
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
-            BTreeSet::new()
-        }
-
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
-            let mut already_failed = self.already_failed.lock().await;
-            if !*already_failed {
-                *already_failed = true;
-                return Err(SessionDomainError::Internal {
-                    message: "boom".into(),
-                    source: None,
-                });
-            }
-            Ok(())
-        }
-
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
-            Ok(true)
-        }
-
-        async fn submit_turn(
-            &self,
-            _input: RuntimeTurnInput,
-        ) -> Result<crate::RuntimeEventReceiver, SessionDomainError> {
-            unreachable!("this test never submits a turn")
-        }
-
-        async fn answer_interaction(
-            &self,
-            _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn open_rejects_a_second_session_once_tenant_max_sessions_is_reached() {
-        let repository = Arc::new(MemoryRepository::default());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let ctx = quota_tenant_ctx(1);
-
-        application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r1".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .expect("first session is within quota");
-
-        let error = application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r2".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SessionDomainError::QuotaExceeded { scope, limit }
-                if scope == "sessions" && limit == 1
-        ));
-    }
-
-    #[tokio::test]
-    async fn restored_tenant_session_count_enforces_quota_after_restart() {
-        let repository = Arc::new(MapRepository::default());
-        repository
-            .0
-            .lock()
-            .await
-            .insert("existing".into(), tenant_test_record());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        application.restore_tenant_session_counts().await.unwrap();
-
-        let error = application
-            .open(
-                &quota_tenant_ctx(1),
-                SessionOpenRequest {
-                    runtime_id: Some("new".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SessionDomainError::QuotaExceeded { scope, limit }
-                if scope == "sessions" && limit == 1
-        ));
-    }
-
-    #[tokio::test]
-    async fn unlimited_session_tracking_cannot_decrement_a_restored_sessions_slot() {
-        let repository = Arc::new(MapRepository::default());
-        repository
-            .0
-            .lock()
-            .await
-            .insert("runtime-1".into(), tenant_test_record());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        application.restore_tenant_session_counts().await.unwrap();
-        application
-            .open(
-                &tenant_ctx(),
-                SessionOpenRequest {
-                    runtime_id: Some("unlimited".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap();
-        application
-            .close(&tenant_ctx(), "unlimited", Default::default())
-            .await
-            .unwrap();
-
-        let error = application
-            .open(
-                &quota_tenant_ctx(1),
-                SessionOpenRequest {
-                    runtime_id: Some("limited".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SessionDomainError::QuotaExceeded { limit: 1, .. }
-        ));
-    }
-
-    fn test_checkpoint_record() -> crate::CheckpointRecord {
-        let record = tenant_test_record();
-        crate::CheckpointRecord {
-            checkpoint_id: "checkpoint-1".into(),
-            source_runtime_id: record.runtime_id,
-            provider_snapshot_id: "snapshot-1".into(),
-            runtime_state: record.runtime,
-            workspace: record.workspace,
-            isolation: record.isolation,
-            capabilities: record.capabilities,
-            owner_ref: "tenant/tenant-a".into(),
-            tenant_id: Some("tenant-a".into()),
-            created_by: Some("test".into()),
-            created_at_ms: 1,
-        }
-    }
-
-    #[tokio::test]
-    async fn tenant_can_delete_own_checkpoint_and_metadata() {
-        let repository = Arc::new(crate::SqliteSessionRepository::open_in_memory().unwrap());
-        repository
-            .save_checkpoint(test_checkpoint_record())
-            .await
-            .unwrap();
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository.clone(),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-
-        let result = application
-            .delete_checkpoint(
-                &tenant_ctx(),
-                SessionCheckpointDeleteRequest {
-                    checkpoint_id: "checkpoint-1".into(),
-                    lease: Default::default(),
-                },
-            )
-            .await
-            .unwrap();
-        assert!(result.deleted);
-        assert_eq!(
-            repository.get_checkpoint("checkpoint-1").await.unwrap(),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_delete_failure_preserves_metadata_and_cross_tenant_is_hidden() {
-        let repository = Arc::new(crate::SqliteSessionRepository::open_in_memory().unwrap());
-        repository
-            .save_checkpoint(test_checkpoint_record())
-            .await
-            .unwrap();
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime {
-                checkpoint_delete_fails: true,
-                ..Default::default()
-            }),
-            repository.clone(),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let request = || SessionCheckpointDeleteRequest {
-            checkpoint_id: "checkpoint-1".into(),
-            lease: Default::default(),
-        };
-        let other = SecurityContext::tenant("tenant-b", "other");
-        assert!(matches!(
-            application.delete_checkpoint(&other, request()).await,
-            Err(SessionDomainError::NotFound { .. })
-        ));
-        assert!(matches!(
-            application
-                .delete_checkpoint(&tenant_ctx(), request())
-                .await,
-            Err(SessionDomainError::Unavailable { .. })
-        ));
-        assert!(repository
-            .get_checkpoint("checkpoint-1")
-            .await
-            .unwrap()
-            .is_some());
-    }
-
-    /// An admin `ctx` has no `tenant_id`, so `open` never even reads this
-    /// quota — admin bypasses tenant-scoped admission entirely regardless of
-    /// what happens to be attached (`docs/tenancy_design.md` §0: 百无禁忌).
-    #[tokio::test]
-    async fn open_admin_ignores_max_sessions_even_if_a_quota_is_attached() {
-        let repository = Arc::new(MemoryRepository::default());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let ctx = SecurityContext::admin("root").with_quota(TenantQuota {
-            max_sessions: Some(0),
-            ..Default::default()
-        });
-
-        application
-            .open(&ctx, open_request(Default::default()))
-            .await
-            .expect("admin is never subject to a tenant session quota");
-    }
-
-    #[tokio::test]
-    async fn close_releases_the_tenant_session_slot_so_a_new_open_can_reuse_it() {
-        let repository = Arc::new(MemoryRepository::default());
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let ctx = quota_tenant_ctx(1);
-
-        application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r1".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .expect("first session is within quota");
-
-        application
-            .close(&ctx, "r1", SessionLeaseClaim::default())
-            .await
-            .expect("close must succeed");
-
-        application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r2".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .expect("the freed slot must admit a new session");
-    }
-
-    #[tokio::test]
-    async fn open_rolls_back_the_reservation_when_runtime_start_fails() {
-        let repository = Arc::new(MemoryRepository::default());
-        let application = SessionApplication::new(
-            Arc::new(FirstStartFailsRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let ctx = quota_tenant_ctx(1);
-
-        application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r1".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .expect_err("runtime.start is rigged to fail on its first call");
-
-        // If the failed attempt's reservation had leaked, this second,
-        // independent open would incorrectly bounce off the quota even
-        // though no session actually exists yet.
-        application
-            .open(
-                &ctx,
-                SessionOpenRequest {
-                    runtime_id: Some("r2".into()),
-                    ..open_request(Default::default())
-                },
-            )
-            .await
-            .expect("the rolled-back slot must be available to a fresh attempt");
-    }
-
-    #[tokio::test]
-    async fn fork_counts_against_the_same_tenant_session_quota() {
-        let repository = Arc::new(MapRepository::default());
-        repository
-            .0
-            .lock()
-            .await
-            .insert("runtime-1".to_string(), tenant_test_record());
-        let application = SessionApplication::new(
-            Arc::new(ForkableRuntime::default()),
-            repository,
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(UnusedEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let ctx = quota_tenant_ctx(1);
-        let fork_request = || SessionForkRequest {
-            parent_runtime_id: "runtime-1".into(),
-            runtime_id: None,
-            conversation_id: None,
-            sender_id: None,
-            workspace: None,
-            deployment: None,
-            requested_capabilities: Default::default(),
-            lease: Default::default(),
-        };
-
-        application
-            .fork(&ctx, fork_request())
-            .await
-            .expect("first fork is within quota");
-
-        let error = application.fork(&ctx, fork_request()).await.unwrap_err();
-        assert!(matches!(
-            error,
-            SessionDomainError::QuotaExceeded { scope, limit }
-                if scope == "sessions" && limit == 1
-        ));
-    }
-
-    // ---- Phase 3b: audit logging (§6) -------------------------------
-    //
-    // No `tracing-subscriber` dependency exists in this workspace (only
-    // `tracing` itself), so this hand-rolls a capture harness — but a naive
-    // per-test `tracing::subscriber::set_default(...)` (thread-local guard)
-    // is genuinely racy here and was tried first: `tracing-core`'s callsite
-    // `Interest` cache and its companion global max-level hint are
-    // process-wide state, recomputed by *whichever* thread happens to
-    // construct a `Dispatch` at that moment (`Dispatch::new` registers +
-    // triggers a rebuild internally). While only one dispatcher has *ever*
-    // been registered process-wide, that rebuild resolves "the current
-    // subscriber" via `dispatcher::get_default()` on the *registering*
-    // thread — which, depending on scheduling, is not necessarily seeing
-    // the dispatch being constructed yet. Two of these tests each doing
-    // their own `set_default`/guard-drop dance were observed to
-    // intermittently clobber the global max-level hint back down while
-    // another, unrelated, concurrently-running test's events were in
-    // flight — reproduced empirically (a loop of 5 runs of `cargo test -p
-    // xgovernor-core application::` failed 3/5 times, a different test each
-    // time, even after adding an explicit `rebuild_interest_cache()` call).
-    //
-    // The fix: install exactly one subscriber, exactly once, as the true
-    // process-wide default (`set_global_default`, not the thread-local
-    // `set_default`) behind a `OnceLock` — so there is only ever one
-    // `Dispatch::new()` call in the whole test binary, and every thread's
-    // `dispatcher::get_default()` resolves to it directly with no per-test
-    // registration churn left to race on. Events are bucketed by the
-    // capturing thread's `ThreadId` so concurrently-running tests (each on
-    // its own OS thread — `cargo test` schedules one thread per test, and
-    // `#[tokio::test]` defaults to a current-thread runtime that never
-    // migrates a task mid-`.await`) don't see each other's events. Each
-    // test *drains* (not just reads) its own bucket, so a setup call earlier
-    // in the same test doesn't pollute the assertion.
-
-    #[derive(Default)]
-    struct FieldRecorder(HashMap<String, String>);
-
-    impl tracing::field::Visit for FieldRecorder {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .insert(field.name().to_string(), format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct AuditCapture(Arc<std::sync::Mutex<HashMap<std::thread::ThreadId, Vec<String>>>>);
-
-    impl AuditCapture {
-        /// Remove and return every "audit"-target event captured so far on
-        /// the calling thread, each rendered as a space-joined, key-sorted
-        /// `"field=value"` line so assertions can use plain `contains(...)`
-        /// checks instead of parsing. Draining (not cloning) means a call
-        /// made earlier in the same test (e.g. a setup `open()` before the
-        /// `close()` under test) doesn't leak into a later assertion.
-        fn drain_events_for_current_thread(&self) -> Vec<String> {
-            self.0
-                .lock()
-                .unwrap()
-                .remove(&std::thread::current().id())
-                .unwrap_or_default()
-        }
-    }
-
-    impl tracing::Subscriber for AuditCapture {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.target() == "audit"
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            if event.metadata().target() != "audit" {
-                return;
-            }
-            let mut recorder = FieldRecorder::default();
-            event.record(&mut recorder);
-            let mut fields: Vec<_> = recorder.0.into_iter().collect();
-            fields.sort();
-            let line = fields
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.0
-                .lock()
-                .unwrap()
-                .entry(std::thread::current().id())
-                .or_default()
-                .push(line);
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// The one-and-only `AuditCapture`, installed as the process's real
-    /// global default tracing subscriber on first call. Safe to call from
-    /// every test — `OnceLock` serializes the install to a single
-    /// execution; later calls just hand back the same handle.
-    fn audit_capture() -> AuditCapture {
-        static CAPTURE: std::sync::OnceLock<AuditCapture> = std::sync::OnceLock::new();
-        CAPTURE
-            .get_or_init(|| {
-                let capture = AuditCapture::default();
-                // `set_global_default` succeeds at most once per process;
-                // ignore `Err` from a second racing call (`OnceLock` already
-                // guarantees only one of them constructs `capture`, but the
-                // registration call itself races against no one once this
-                // closure runs, so this is defensive, not load-bearing).
-                let _ = tracing::subscriber::set_global_default(capture.clone());
-                // Force one recompute against the dispatch we just made the
-                // true global default, closing the narrow first-registration
-                // race described above for this one-time install too.
-                tracing::callsite::rebuild_interest_cache();
-                capture
-            })
-            .clone()
-    }
-
-    #[tokio::test]
-    async fn open_emits_an_audit_event_with_principal_tenant_and_runtime_id_on_success() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let capture = audit_capture();
-        capture.drain_events_for_current_thread();
-
-        application
-            .open(&tenant_ctx(), open_request(Default::default()))
-            .await
-            .expect("open must succeed");
-
-        let events = capture.drain_events_for_current_thread();
-        assert_eq!(
-            events.len(),
-            1,
-            "exactly one audit event per call: {events:?}"
-        );
-        let event = &events[0];
-        assert!(event.contains("operation=open"), "{event}");
-        assert!(event.contains("principal=test"), "{event}");
-        assert!(event.contains("tenant=tenant-a"), "{event}");
-        assert!(event.contains("result=ok"), "{event}");
-        assert!(
-            event.contains("runtime_id=runtime-fixed"),
-            "server-assigned runtime_id must be captured, not just the (absent) requested one: {event}"
-        );
-    }
-
-    #[tokio::test]
-    async fn open_emits_an_audit_event_with_the_error_on_a_rejected_request() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let capture = audit_capture();
-        capture.drain_events_for_current_thread();
-        let ctx = quota_tenant_ctx(0);
-
-        application
-            .open(&ctx, open_request(Default::default()))
-            .await
-            .expect_err("zero quota must reject the open");
-
-        let events = capture.drain_events_for_current_thread();
-        assert_eq!(events.len(), 1, "{events:?}");
-        let event = &events[0];
-        assert!(event.contains("operation=open"), "{event}");
-        assert!(event.contains("result=error"), "{event}");
-        assert!(event.contains("error="), "{event}");
-        assert!(
-            event.contains("runtime_id=-"),
-            "a rejected open never reaches the server-assigned id, and the \
-             request itself specified none: {event}"
-        );
-    }
-
-    #[tokio::test]
-    async fn close_emits_an_audit_event_using_the_caller_supplied_runtime_id() {
-        let application = SessionApplication::new(
-            Arc::new(CompletingRuntime::default()),
-            Arc::new(MemoryRepository::default()),
-            Arc::new(FixedTurnId),
-            Arc::new(FixedTurnId),
-            Arc::new(TestEnvironment),
-            Arc::new(FixedTurnId),
-        );
-        let capture = audit_capture();
-
-        application
-            .open(&admin_ctx(), open_request(Default::default()))
-            .await
-            .expect("open must succeed");
-        // Discard the `open`'s own audit event — only `close`'s is under test.
-        capture.drain_events_for_current_thread();
-
-        application
-            .close(&admin_ctx(), "runtime-fixed", SessionLeaseClaim::default())
-            .await
-            .expect("close must succeed");
-
-        let events = capture.drain_events_for_current_thread();
-        assert_eq!(events.len(), 1, "{events:?}");
-        let event = &events[0];
-        assert!(event.contains("operation=close"), "{event}");
-        assert!(event.contains("runtime_id=runtime-fixed"), "{event}");
-        assert!(event.contains("result=ok"), "{event}");
     }
 }

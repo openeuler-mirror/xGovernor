@@ -15,6 +15,7 @@ reqwest.workspace = true
 session-protocol = { path = "../../crates/protocol/session" }
 provider-protocol = { path = "../../crates/protocol/provider" }
 operation-protocol = { path = "../../crates/protocol/operation" }
+agent-runtime-protocol = { path = "../../crates/protocol/runtime" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }
 base64.workspace = true

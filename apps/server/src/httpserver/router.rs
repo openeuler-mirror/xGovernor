@@ -169,6 +169,11 @@ async fn health() -> Json<HealthResponse> {
 mod tests {
     use super::*;
     use crate::httpserver::session::SessionHttpState;
+    use agent_runtime_protocol::{
+        AgentRuntime, RuntimeCancelRequest, RuntimeCapability, RuntimeError, RuntimeEventReceiver,
+        RuntimeExecutionContext, RuntimeInteractionRequest as RuntimeInteractionInput,
+        RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
+    };
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -177,10 +182,9 @@ mod tests {
     use tower::ServiceExt;
     use xgovernor_core::application::{SessionRepository, TurnIdGenerator};
     use xgovernor_core::{
-        Clock, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEventReceiver,
-        RuntimeIdGenerator, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-        SecurityContext, SessionApplication, SessionDomainError, SessionEnvironmentNormalizer,
-        SessionListPage, SessionRecord,
+        Clock, NormalizedSessionEnvironment, RuntimeIdGenerator, SecurityContext,
+        SessionApplication, SessionDomainError, SessionEnvironmentNormalizer, SessionListPage,
+        SessionRecord,
     };
 
     struct EmptyRepository;
@@ -213,49 +217,53 @@ mod tests {
     struct UnusedRuntime;
 
     #[async_trait]
-    impl RuntimeAdapter for UnusedRuntime {
-        fn kind(&self) -> &str {
+    impl AgentRuntime for UnusedRuntime {
+        fn runtime_kind(&self) -> &str {
             "unused"
         }
 
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
+        fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
             BTreeSet::new()
         }
 
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
+        async fn start(
+            &self,
+            _request: RuntimeStartRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<(), RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
 
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
+        async fn stop(&self, _runtime_id: &str) -> Result<(), RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
 
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
+        async fn attach(
+            &self,
+            _runtime_id: &str,
+            _context: RuntimeExecutionContext,
+        ) -> Result<(), RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, RuntimeError> {
             Ok(true)
         }
 
         async fn submit_turn(
             &self,
             _input: RuntimeTurnInput,
-        ) -> Result<RuntimeEventReceiver, SessionDomainError> {
+        ) -> Result<RuntimeEventReceiver, RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
 
         async fn answer_interaction(
             &self,
             _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
+        ) -> Result<(), RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
 
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
+        async fn cancel(&self, _request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
             unreachable!("router tests never drive a real turn")
         }
     }
@@ -296,6 +304,7 @@ mod tests {
     fn test_application() -> SessionApplication {
         SessionApplication::new(
             Arc::new(UnusedRuntime),
+            std::collections::HashMap::new(),
             Arc::new(EmptyRepository),
             Arc::new(UnusedIds),
             Arc::new(UnusedIds),

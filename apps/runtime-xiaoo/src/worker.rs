@@ -1,6 +1,11 @@
-use crate::xiaoo_backend::{HttpOperationBackend, WorkerConfig, WorkerResponse};
-use crate::{build_runtime, usage_from_outcome, WorkerRequest};
+use crate::xiaoo_backend::{HttpOperationBackend, WorkerConfig};
+use crate::{build_runtime, usage_from_outcome, STATE_SCHEMA_VERSION};
 use agent_contracts::interaction::InteractionHandle;
+use agent_runtime_protocol::RuntimeFailure;
+use agent_runtime_protocol::{
+    decode_worker_request, encode_worker_response, RuntimeError, RuntimeEvent,
+    RuntimeStateSnapshot, WorkerRequest, WorkerResponse,
+};
 use agent_types::interaction::{InteractionRequest, InteractionResponse};
 use agent_types::outcome::AgentOutcome;
 use agent_types::AgentId;
@@ -13,7 +18,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xgovernor_core::{RuntimeEvent, RuntimeFailure};
 use xiaoo_api::runtime::{RuntimeInput, RuntimeOutput, RuntimeState};
 
 pub async fn run_worker_from_env() -> Result<(), String> {
@@ -25,35 +29,45 @@ pub async fn run_worker_from_env() -> Result<(), String> {
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
-    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<WorkerRequest>();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<Result<WorkerRequest, String>>();
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(request) = serde_json::from_str(&line) else {
-                break;
-            };
+            let request = decode_worker_request(&line).map_err(|error| error.to_string());
             if request_tx.send(request).is_err() {
                 break;
             }
         }
-        let _ = request_tx.send(WorkerRequest::Shutdown);
+        let _ = request_tx.send(Ok(WorkerRequest::Shutdown));
     });
 
     while let Some(request) = request_rx.recv().await {
+        let request = match request {
+            Ok(request) => request,
+            Err(message) => {
+                emit(&WorkerResponse::Error {
+                    error: RuntimeError::InvalidRequest {
+                        code: "invalid_worker_request".into(),
+                        message,
+                    },
+                })?;
+                continue;
+            }
+        };
         match request {
-            WorkerRequest::Run {
-                text,
-                model,
-                reasoning_effort,
-                ..
-            } => {
-                let effort = reasoning_effort
+            WorkerRequest::SubmitTurn(request) => {
+                let effort = request
+                    .reasoning_effort
                     .as_deref()
                     .unwrap_or("off")
                     .parse()
                     .map_err(|e| format!("invalid reasoning effort: {e}"))?;
-                let runtime = build_runtime(&config.llm, model.as_deref(), backend.clone())
-                    .await
-                    .map_err(|e| format!("failed to build xiaoO runtime: {e:?}"))?;
+                let runtime = build_runtime(
+                    &config.llm,
+                    request.llm.as_ref().and_then(|llm| llm.model.as_deref()),
+                    backend.clone(),
+                )
+                .await
+                .map_err(|e| format!("failed to build xiaoO runtime: {e:?}"))?;
                 state.cancel = CancellationToken::new();
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
                 let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -66,7 +80,7 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                 let mut run = Box::pin(
                     runtime.run(
                         &mut state,
-                        RuntimeInput::new(text)
+                        RuntimeInput::new(request.text)
                             .with_visible_tools(runtime.visible_tools())
                             .with_agent_id(AgentId("xiaoo".to_string()))
                             .with_event_sink(sink)
@@ -84,11 +98,11 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                             Ok(RuntimeOutput::Suspended(_)) => failed("xiaoo_suspended", "xiaoO suspended without a pending interaction"),
                             Err(error) => failed("xiaoo_runtime_error", &error.to_string()),
                         },
-                        Some(request) = request_rx.recv() => match request {
-                            WorkerRequest::Answer { interaction_id, answer } => {
-                                if let Some(waiter) = interaction_pending(&interaction, &interaction_id).await { let _ = waiter.send(interaction_answer_to_agent(answer)); }
+                        Some(Ok(request)) = request_rx.recv() => match request {
+                            WorkerRequest::AnswerInteraction(request) => {
+                                if let Some(waiter) = interaction_pending(&interaction, &request.interaction_id).await { let _ = waiter.send(interaction_answer_to_agent(request.answer)); }
                             }
-                            WorkerRequest::Cancel | WorkerRequest::Shutdown => cancel.cancel(),
+                            WorkerRequest::Cancel(_) | WorkerRequest::Shutdown => cancel.cancel(),
                             _ => {}
                         },
                         Some(event) = event_rx.recv() => { emit(&WorkerResponse::Event { event })?; }
@@ -99,23 +113,35 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                     emit(&WorkerResponse::Event { event })?;
                 }
                 emit(&WorkerResponse::State {
-                    loop_state: state.to_snapshot(),
+                    state: RuntimeStateSnapshot::try_new(
+                        "xiaoo",
+                        STATE_SCHEMA_VERSION,
+                        &state.to_snapshot(),
+                    )
+                    .map_err(|error| format!("failed to encode xiaoO state: {error:?}"))?,
                 })?;
                 emit(&WorkerResponse::Event { event: terminal })?;
             }
-            WorkerRequest::LoadState { loop_state } => {
-                state = RuntimeState::from_snapshot(loop_state, CancellationToken::new())
+            WorkerRequest::LoadState(snapshot) => {
+                match snapshot.decode("xiaoo", STATE_SCHEMA_VERSION) {
+                    Ok(loop_state) => {
+                        state = RuntimeState::from_snapshot(loop_state, CancellationToken::new())
+                    }
+                    Err(error) => emit(&WorkerResponse::Error { error })?,
+                }
             }
-            WorkerRequest::Shutdown | WorkerRequest::Answer { .. } | WorkerRequest::Cancel => {}
+            WorkerRequest::Shutdown
+            | WorkerRequest::AnswerInteraction(_)
+            | WorkerRequest::Cancel(_) => {}
         }
     }
     Ok(())
 }
 
 fn emit(response: &WorkerResponse) -> Result<(), String> {
-    println!(
+    print!(
         "{}",
-        serde_json::to_string(response).map_err(|e| e.to_string())?
+        encode_worker_response(response).map_err(|e| e.to_string())?
     );
     std::io::stdout().flush().map_err(|e| e.to_string())
 }

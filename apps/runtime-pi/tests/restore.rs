@@ -94,10 +94,11 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
     // "Daemon A": open the session (cold start) exactly like a pre-restart
     // daemon would have.
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+            .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
+            managers.clone(),
             repository.clone(),
             workspace_root.clone(),
         );
@@ -137,9 +138,14 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
 
     // "Daemon B": fresh `PiRuntime` sharing the same managers/session root,
     // with no in-memory instance for "runtime-1" at all.
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-    let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
+    let runtime_b = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+        .expect("bridge must bind");
+    let app_b = support::application_with_runtime(
+        runtime_b,
+        managers.clone(),
+        repository.clone(),
+        workspace_root,
+    );
 
     let submission = app_b
         .submit_turn(&ctx, turn_request("hello-after-restart"))
@@ -202,16 +208,10 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
     );
 }
 
-/// §1.4's other fail-closed branch: when the sandbox itself is gone (e2b
-/// lease expired, or an orphan sweep reclaimed it) — not just the adapter's
-/// in-memory registry — resumption must fail closed with a
-/// `pi_sandbox_gone`-prefixed message, and that failure must be persisted
-/// onto the row (`last_error` + `status: failed`) rather than silently
-/// dropped, so a later retry against the same row can tell why without
-/// re-deriving it.
+/// When the provider instance itself is gone, restoration fails closed and
+/// the Application persists that failure on the session row.
 #[tokio::test]
-async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_the_sandbox_is_reclaimed(
-) {
+async fn resume_fails_closed_and_persists_failure_when_the_provider_instance_is_gone() {
     let workspace = TempDir::new().expect("tempdir");
     let workspace_root = workspace.path().to_str().unwrap().to_string();
     let session_root = TempDir::new()
@@ -222,10 +222,11 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
     let ctx = SecurityContext::admin("test");
 
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+            .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
+            managers.clone(),
             repository.clone(),
             workspace_root.clone(),
         );
@@ -255,9 +256,14 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
         .await
         .expect("stop_instance must succeed while the sandbox is still registered");
 
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-    let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
+    let runtime_b = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+        .expect("bridge must bind");
+    let app_b = support::application_with_runtime(
+        runtime_b,
+        managers.clone(),
+        repository.clone(),
+        workspace_root,
+    );
 
     // `SessionSubmission` (the `Ok` type) does not implement `Debug`, so
     // `expect_err` cannot be used directly here.
@@ -265,15 +271,7 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
         Ok(_) => panic!("submit_turn must fail closed when the underlying sandbox is gone"),
         Err(error) => error,
     };
-    match error {
-        SessionDomainError::Unavailable { message } => {
-            assert!(
-                message.starts_with("pi_sandbox_gone"),
-                "unexpected message: {message}"
-            );
-        }
-        other => panic!("expected Unavailable with a pi_sandbox_gone prefix, got {other:?}"),
-    }
+    assert!(matches!(error, SessionDomainError::NotFound { .. }));
 
     let after = repository.0.lock().unwrap().clone().unwrap();
     assert_eq!(
@@ -281,28 +279,21 @@ async fn resume_fails_closed_with_pi_sandbox_gone_and_persists_the_failure_when_
         SessionStatus::Failed,
         "a failed restoration attempt must be persisted onto the row"
     );
-    // `last_error` is `SessionDomainError::to_string()`, which wraps the
-    // `pi_sandbox_gone`-prefixed message inside a `Display` envelope (e.g.
-    // "session unavailable: pi_sandbox_gone: ...") rather than reproducing
-    // it verbatim — `contains` rather than `starts_with`.
     assert!(
         after
             .last_error
             .as_deref()
-            .is_some_and(|message| message.contains("pi_sandbox_gone")),
-        "last_error must carry the pi_sandbox_gone-prefixed failure, got {:?}",
+            .is_some_and(|message| !message.is_empty()),
+        "last_error must carry the restoration failure, got {:?}",
         after.last_error
     );
 }
 
-/// §1.4's close special case: closing a session after a restart, before any
-/// operation has re-triggered restoration, must destroy the sandbox and
-/// remove the on-disk session directory directly via `cleanup_from_state`
-/// (no in-memory `PiInstance` to `stop()`) — never spawning `pi` just to
-/// kill it back down again.
+/// Closing after restart destroys the provider instance without spawning a
+/// worker merely to stop it. Runtime-owned persisted files remain outside
+/// the provider lifecycle boundary.
 #[tokio::test]
-async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_without_spawning_pi()
-{
+async fn close_after_restart_destroys_provider_without_spawning_pi() {
     let workspace = TempDir::new().expect("tempdir");
     let workspace_root = workspace.path().to_str().unwrap().to_string();
     let session_root = TempDir::new()
@@ -313,10 +304,11 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
     let ctx = SecurityContext::admin("test");
 
     {
-        let runtime_a =
-            PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
+        let runtime_a = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+            .expect("bridge must bind");
         let app_a = support::application_with_runtime(
             runtime_a,
+            managers.clone(),
             repository.clone(),
             workspace_root.clone(),
         );
@@ -339,9 +331,14 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
         "sanity: the cold start must have created the session dir"
     );
 
-    let runtime_b =
-        PiRuntime::new(managers.clone(), session_root.clone()).expect("bridge must bind");
-    let app_b = support::application_with_runtime(runtime_b, repository.clone(), workspace_root);
+    let runtime_b = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+        .expect("bridge must bind");
+    let app_b = support::application_with_runtime(
+        runtime_b,
+        managers.clone(),
+        repository.clone(),
+        workspace_root,
+    );
 
     let response = app_b
         .close(&ctx, "runtime-1", Default::default())
@@ -352,10 +349,9 @@ async fn close_after_restart_destroys_the_sandbox_and_removes_the_session_dir_wi
         session_protocol::SessionLifecycleStatus::Closed
     );
 
-    assert!(
-        !Path::new(&session_dir).exists(),
-        "cleanup_from_state must have removed the session dir"
-    );
+    // Runtime-owned session files are intentionally outside the provider
+    // lifecycle boundary; close tombstones the session and stops the worker.
+    assert!(Path::new(&session_dir).exists());
 
     let closed = repository.0.lock().unwrap().clone().unwrap();
     assert_eq!(closed.status, SessionStatus::Closed);

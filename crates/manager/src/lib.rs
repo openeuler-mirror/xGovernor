@@ -449,12 +449,6 @@ impl InstanceManager {
             .await
     }
 
-    /// Best-effort platform-liveness probe backing
-    /// `RuntimeAdapter::check_alive`'s pi-runtime implementation. Unlike
-    /// `stop_instance`/`checkpoint_instance`, this takes no per-runtime lock
-    /// — it is a pure read with nothing to serialize against, and the
-    /// reclaim sweep calling it must not contend with in-flight mutating
-    /// operations on the same instance.
     pub async fn inspect_instance(
         &self,
         runtime_id: &str,

@@ -3,6 +3,11 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use thiserror::Error;
 
+pub use agent_runtime_protocol::{
+    RuntimeStateSnapshot as OpaqueRuntimeState, RuntimeWorkspace as WorkspaceFacts,
+    RuntimeWorkspaceAccess as WorkspaceAccess,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -29,16 +34,11 @@ pub enum SandboxCapability {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeCapability {
     Interaction,
-    // runtime steering
     Steering,
-    // session fork
     Fork,
     Checkpoint,
-    // Loop state information export
     StateExport,
-    // model change
     ModelOverride,
-    // reasoning level capabilities
     ReasoningControl,
 }
 
@@ -67,24 +67,6 @@ pub struct EffectiveCapabilities {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceAccess {
-    ReadOnly,
-    ReadWrite,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkspaceFacts {
-    pub workspace_id: String,
-    pub root: String,
-    pub access: WorkspaceAccess,
-    #[serde(default)]
-    pub revision: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum IsolationBoundary {
     Host,
     Process,
@@ -108,16 +90,6 @@ pub struct IsolationFacts {
     pub network: NetworkIsolation,
     #[serde(default)]
     pub metadata: Value,
-}
-
-/// Runtime-owned state is quarantined behind a kind and schema version.
-/// Concrete runtime snapshot types must never appear in [`SessionRecord`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OpaqueRuntimeState {
-    pub runtime_kind: String,
-    pub schema_version: u32,
-    #[serde(default)]
-    pub state: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,6 +7,9 @@
 //! (`src/bin/fake_pi.rs`, built as the sibling `fake_pi` binary target)
 //! rather than the real Pi CLI; see `contract.rs`'s module doc for why.
 
+use agent_runtime_protocol::{
+    AgentRuntime, RuntimeEntryContext, RuntimeExecutionContext, RuntimeStartRequest,
+};
 use async_trait::async_trait;
 use backend::local::LocalProvider;
 use backend::{OperationAttach, ProviderInstanceLedger, SqliteProviderInstanceLedger};
@@ -18,9 +21,9 @@ use std::sync::Arc as StdArc;
 use tempfile::TempDir;
 use xgovernor_core::{
     Clock, IsolationBoundary, IsolationFacts, NetworkIsolation, NormalizedSessionEnvironment,
-    RuntimeAdapter, RuntimeEntryContext, RuntimeIdGenerator, RuntimeStartRequest, SecurityContext,
-    SessionApplication, SessionDomainError, SessionEnvironmentNormalizer, SessionListPage,
-    SessionRecord, SessionRepository, TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
+    RuntimeIdGenerator, SecurityContext, SessionApplication, SessionDomainError,
+    SessionEnvironmentNormalizer, SessionListPage, SessionRecord, SessionRepository,
+    TurnIdGenerator, WorkspaceAccess, WorkspaceFacts,
 };
 use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
 use xgovernor_runtime_pi::{PiRuntime, EXT_NAMESPACE};
@@ -30,6 +33,10 @@ use xgovernor_runtime_pi::{PiRuntime, EXT_NAMESPACE};
 /// integration test target in the package, pointing at the built artifact.
 pub fn fake_pi_path() -> String {
     env!("CARGO_BIN_EXE_fake_pi").to_string()
+}
+
+pub fn pi_worker_path() -> std::path::PathBuf {
+    env!("CARGO_BIN_EXE_pi-worker").into()
 }
 
 /// `backend_id` these tests register their sandbox under, matching
@@ -74,7 +81,8 @@ pub fn new_pi_runtime() -> PiRuntime {
     let session_root = TempDir::new()
         .expect("tempdir for pi session-dir root")
         .keep();
-    PiRuntime::new(build_managers(), session_root).expect("bridge http listener must bind")
+    PiRuntime::new_with_worker(session_root, pi_worker_path())
+        .expect("bridge http listener must bind")
 }
 
 pub fn workspace_facts(root: &str) -> WorkspaceFacts {
@@ -84,6 +92,27 @@ pub fn workspace_facts(root: &str) -> WorkspaceFacts {
         access: WorkspaceAccess::ReadWrite,
         revision: None,
         metadata: Value::Null,
+    }
+}
+
+pub async fn runtime_context(root: &str) -> RuntimeExecutionContext {
+    let root = std::fs::canonicalize(root)
+        .expect("workspace root must exist")
+        .to_string_lossy()
+        .into_owned();
+    let managers = build_managers();
+    let runtime_id = format!("direct-test-{}", uuid::Uuid::new_v4());
+    let backend = managers[LOCAL_BACKEND_ID]
+        .start_instance(
+            runtime_id,
+            provider_protocol::BackendId(LOCAL_BACKEND_ID.into()),
+            "admin".into(),
+            json!({"workspace_root": root}),
+        )
+        .await
+        .expect("provider start must succeed");
+    RuntimeExecutionContext {
+        operation_backend: backend,
     }
 }
 
@@ -171,6 +200,7 @@ pub fn application(root: String) -> (SessionApplication, StdArc<MemoryRepository
     let repository = StdArc::new(MemoryRepository::default());
     let app = SessionApplication::new(
         StdArc::new(new_pi_runtime()),
+        build_managers(),
         repository.clone(),
         StdArc::new(FixedIds),
         StdArc::new(FixedIds),
@@ -195,11 +225,13 @@ pub fn application(root: String) -> (SessionApplication, StdArc<MemoryRepository
 #[allow(dead_code)]
 pub fn application_with_runtime(
     runtime: PiRuntime,
+    managers: HashMap<String, StdArc<InstanceManager>>,
     repository: StdArc<MemoryRepository>,
     root: String,
 ) -> SessionApplication {
     SessionApplication::new(
         StdArc::new(runtime),
+        managers,
         repository,
         StdArc::new(FixedIds),
         StdArc::new(FixedIds),
@@ -219,18 +251,45 @@ pub fn no_entry() -> RuntimeEntryContext {
 
 pub async fn started_runtime(workspace_root: &str) -> PiRuntime {
     let runtime = new_pi_runtime();
-    runtime
-        .start(RuntimeStartRequest {
+    start_runtime(
+        &runtime,
+        RuntimeStartRequest {
             runtime_id: "runtime-1".into(),
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),
             workspace: workspace_facts(workspace_root),
             state: None,
             llm: None,
-            owner_ref: "admin".into(),
             ext: pi_runtime_ext(),
-        })
-        .await
-        .expect("start must succeed against the fake pi process");
+        },
+    )
+    .await
+    .expect("start must succeed against the fake pi process");
     runtime
+}
+
+pub async fn start_runtime(
+    runtime: &PiRuntime,
+    request: RuntimeStartRequest,
+) -> Result<(), agent_runtime_protocol::RuntimeError> {
+    let managers = build_managers();
+    let workspace_root = request.workspace.root.clone();
+    let runtime_id = request.runtime_id.clone();
+    let backend = managers[LOCAL_BACKEND_ID]
+        .start_instance(
+            runtime_id,
+            provider_protocol::BackendId(LOCAL_BACKEND_ID.into()),
+            "admin".into(),
+            json!({"workspace_root": workspace_root}),
+        )
+        .await
+        .expect("provider start must succeed");
+    runtime
+        .start(
+            request,
+            RuntimeExecutionContext {
+                operation_backend: backend,
+            },
+        )
+        .await
 }

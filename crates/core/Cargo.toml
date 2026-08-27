@@ -15,9 +15,14 @@ tokio-util.workspace = true
 tracing.workspace = true
 rusqlite.workspace = true
 session-protocol = { path = "../protocol/session" }
+agent-runtime-protocol = { path = "../protocol/runtime" }
+xgovernor-manager = { path = "../manager" }
+provider-protocol = { path = "../protocol/provider" }
+operation-protocol = { path = "../protocol/operation" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+backend = { path = "../backend" }

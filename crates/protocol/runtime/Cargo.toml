@@ -1,0 +1,16 @@
+[package]
+name = "agent-runtime-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+session-protocol = { path = "../session" }
+operation-protocol = { path = "../operation" }
+
+[dev-dependencies]
+serde_json.workspace = true
