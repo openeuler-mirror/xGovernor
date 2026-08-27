@@ -675,11 +675,10 @@ async fn start_rejects_a_missing_or_empty_backend_id() {
     assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 }
 
-/// A `backend_id` naming no configured `InstanceManager` must fail closed
-/// rather than silently falling back to some default manager (see
-/// `PiRuntime::new`'s doc and `start()`'s comment on this lookup).
+/// Provider registration is a host concern. Direct runtime startup consumes
+/// the already-resolved operation backend and does not resolve a manager.
 #[tokio::test]
-async fn start_rejects_an_unconfigured_backend_id() {
+async fn start_uses_the_injected_backend_without_resolving_a_provider_registry() {
     let workspace = TempDir::new().expect("tempdir");
     let runtime = new_pi_runtime();
     let ext: SessionExtensions = [(
@@ -689,7 +688,7 @@ async fn start_rejects_an_unconfigured_backend_id() {
     .into_iter()
     .collect();
 
-    let error = runtime
+    runtime
         .start(
             RuntimeStartRequest {
                 runtime_id: "runtime-z".into(),
@@ -703,8 +702,8 @@ async fn start_rejects_an_unconfigured_backend_id() {
             support::runtime_context(workspace.path().to_str().unwrap()).await,
         )
         .await
-        .expect_err("an unrecognized backend_id must be rejected");
-    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
+        .expect("the host-injected backend is sufficient for runtime startup");
+    runtime.stop("runtime-z").await.ok();
 }
 
 #[tokio::test]

@@ -978,6 +978,33 @@ mod tests {
         }
     }
 
+    fn test_local_provider_managers(
+    ) -> std::collections::HashMap<String, Arc<xgovernor_manager::InstanceManager>> {
+        use backend::local::LocalProvider;
+        use backend::{OperationAttach, ProviderInstanceLedger, SqliteProviderInstanceLedger};
+        use provider_protocol::{ProviderKind, ProviderLifecycle};
+        use xgovernor_manager::{InstanceManager, InstanceManagerConfig};
+
+        let provider = Arc::new(LocalProvider::new());
+        let lifecycle: Arc<dyn ProviderLifecycle> = provider.clone();
+        let attach: Arc<dyn OperationAttach> = provider;
+        let ledger: Arc<dyn ProviderInstanceLedger> = Arc::new(
+            SqliteProviderInstanceLedger::open_in_memory().expect("open test provider ledger"),
+        );
+        [(
+            "local".to_string(),
+            Arc::new(InstanceManager::new(
+                lifecycle,
+                attach,
+                ledger,
+                ProviderKind("local".into()),
+                InstanceManagerConfig::new(10, 10),
+            )),
+        )]
+        .into_iter()
+        .collect()
+    }
+
     /// A router over [`HostOnlyEnvironment`] + [`NoRecordRepository`], guarded
     /// by the same three-token `TokenTable` shape as
     /// [`test_router_with_tenant_a_record`], for exercising `/sessions/open`
@@ -990,7 +1017,7 @@ mod tests {
 
         let router = session_router(Arc::new(SessionHttpState::new(SessionApplication::new(
             Arc::new(CompletingRuntime),
-            std::collections::HashMap::new(),
+            test_local_provider_managers(),
             Arc::new(NoRecordRepository),
             Arc::new(FixedTurnId),
             Arc::new(FixedTurnId),

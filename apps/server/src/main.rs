@@ -521,7 +521,7 @@ async fn main() {
             std::process::exit(1);
         },
     ));
-    let xiaoo_runtime = Arc::new(XiaooRuntime::new(runtime_managers.clone()));
+    let xiaoo_runtime = Arc::new(XiaooRuntime::new());
 
     let mut lease_stale = configured_duration_secs("XGOVERNOR_LEASE_STALE_SECS", 45);
     let orphan_threshold = configured_duration_secs("XGOVERNOR_ORPHAN_THRESHOLD_SECS", 1_800);

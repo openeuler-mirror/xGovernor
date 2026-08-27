@@ -15,7 +15,6 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{CapabilityFamily, OpaqueRuntimeState, SessionDomainError};
-use xgovernor_manager::InstanceManager;
 use xgovernor_runtime_pi::bridge::Bridge;
 use xiaoo_api::runtime::RuntimeState;
 
@@ -66,7 +65,7 @@ pub struct XiaooRuntime {
 }
 
 impl XiaooRuntime {
-    pub fn new(_managers: HashMap<String, Arc<InstanceManager>>) -> Self {
+    pub fn new() -> Self {
         let bridge = Bridge::spawn().expect("xiaoO operation bridge must bind");
         let worker_executable = std::env::var_os("XGOVERNOR_XIAOO_WORKER")
             .map(PathBuf::from)
@@ -254,7 +253,6 @@ impl XiaooRuntime {
                 });
             }
             let ext = read_ext(&request.ext)?;
-            let manager = self.manager_for(&ext.backend_id)?;
             // `allow_internet_access` is an e2b-only provider option; the
             // local provider rejects unknown fields, so only include it
             // for e2b (mirrors apps/runtime-pi/src/lib.rs::prepare_cold_start).
@@ -264,15 +262,6 @@ impl XiaooRuntime {
             if ext.backend_id == E2B_BACKEND_ID {
                 provider_options["allow_internet_access"] = json!(true);
             }
-            let backend = manager
-                .start_instance(
-                    request.runtime_id.clone(),
-                    BackendId(ext.backend_id.clone()),
-                    request.owner_ref.clone(),
-                    provider_options.clone(),
-                )
-                .await
-                .map_err(map_provider_error)?;
             if request.workspace.metadata != Value::Null {
                 if let Err(error) = clone_git_workspace(
                     backend.as_ref(),

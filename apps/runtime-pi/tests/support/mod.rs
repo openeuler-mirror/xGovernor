@@ -96,6 +96,10 @@ pub fn workspace_facts(root: &str) -> WorkspaceFacts {
 }
 
 pub async fn runtime_context(root: &str) -> RuntimeExecutionContext {
+    let root = std::fs::canonicalize(root)
+        .expect("workspace root must exist")
+        .to_string_lossy()
+        .into_owned();
     let managers = build_managers();
     let runtime_id = format!("direct-test-{}", uuid::Uuid::new_v4());
     let backend = managers[LOCAL_BACKEND_ID]

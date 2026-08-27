@@ -1838,11 +1838,17 @@ impl SessionApplication {
             Err(error) => return Err(error),
         }
         let (_, manager) = provider_for_isolation(registration, &record.isolation)?;
-        let context = RuntimeExecutionContext {
-            operation_backend: manager
-                .backend_for(&record.runtime_id)
-                .map_err(map_provider_error)?,
+        let operation_backend = match manager
+            .backend_for(&record.runtime_id)
+            .map_err(map_provider_error)
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.mark_restoration_failed(record, &error).await;
+                return Err(error);
+            }
         };
+        let context = RuntimeExecutionContext { operation_backend };
         match runtime
             .attach(&record.runtime_id, context.clone())
             .await
