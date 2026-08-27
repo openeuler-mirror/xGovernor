@@ -53,9 +53,7 @@
 | owner_ref  | provider 层 opaque 业主    | 由装配层从 tenant **机械推导**（形如 `tenant/{tenant_id}`），彻底取代从客户端 ext 读取的过渡形态        |
 
 
-owner_ref 推导落地后，`QuotaEnforcedLifecycle` 现成的按 owner 沙箱配额自动成为按租户配额，provider 层零改动——这是当初把 owner_ref 设计为 opaque 的回报。
-
-> 2026-08 后续更新：`QuotaEnforcedLifecycle` 与同段提到的 `ProviderBoundRuntime`（binding.rs）已删除，责任收拢进独立 crate `crates/manager` 的 `xgovernor_manager::InstanceManager`——本节及下文引用的 `crates/backend/src/quota.rs`/`crates/backend/src/binding.rs` 路径均已不存在，按owner/租户配额的行为本身未变，只是搬了家。完整现状见 [protocol_boundaries.md](./protocol_boundaries.md) §2.3/§4 与 [session_orchestration_skeleton.md](./session_orchestration_skeleton.md) §3。本节以下保留原文，作为该决策发生时的真实记录，不再逐处修改路径。
+`owner_ref` 由 Application 从 `SecurityContext` 机械推导，并作为 opaque 值传给 `InstanceManager`。provider 配额按可信 owner 生效，客户端不能通过 `ext` 伪造 owner。
 
 ---
 
@@ -233,52 +231,11 @@ match (role, workspace_spec, provider):
    （`run_single_listener`/`run_dual_listener` 两条路径），用户认为开关本身就是不必要的复杂度，要求双监听器成为唯一路径——  
    `run_single_listener` 及其专用的 `TokenTable::has_admin_entry()` 已随之删除。尚未落地：非 https 传输的 git 卫生检查细节以外  
    的 workspace_spec 扩展、跨监听器 SSE 共享（如需要）。
-3. **沙箱内 clone 与两段式 bootstrap**：与 e2b/容器 provider 落地天然并轨。
-  **落地状态：窄切片已实现（仅沙箱内 clone，不含运行时断网）。** 新增 `apps/runtime-e2b`（crate 名 `xgovernor-runtime-e2b`）：`E2bMockRuntime`  
-   复用 `crates/backend/src/binding.rs` 的 `ProviderBoundRuntime`（与 `apps/runtime-local` 的 `LocalMockRuntime` 完全相同的组合方式）包一层  
-   `QuotaEnforcedLifecycle<E2bProvider>`；`GitSandboxWorkspaceEnvironment`（`SessionEnvironmentNormalizer` 实现）只接受  
-   `WorkspaceSpec::Git`，复用既有的 `enforce_workspace_axiom(ctx, workspace, true)` 三元组闸门，产出 `IsolationBoundary::VirtualMachine`  
-   + `NetworkIsolation::None`（诚实上报——本切片全程不断网，不敢谎报 `Restricted`/`Isolated`）。git url/reference/subdirectory 经  
-   `WorkspaceFacts.metadata` 传递，不走 `ext`——这暴露了一处此前遗漏：`RuntimeStartRequest` 此前只带 `workspace_root: String`，  
-   normalizer 产出的 `WorkspaceFacts.metadata` 在 `SessionApplication::open`/`fork` 里被悄悄丢弃。首次修补时图省事加了个独立的  
-   `workspace_metadata: Value` 字段，与已有的 `workspace_root: String` 并列传递——用户当场指出这是偷懒：`root` 与 `metadata` 描述的是  
-   同一个工作区，拆成两个独立字段会有脱节风险（例如未来某处只更新其中一个）。改为单一字段 `workspace: WorkspaceFacts`，把  
-   normalizer 产出的 `WorkspaceFacts` 整体转发给 runtime adapter，root/metadata 天然不脱节（`ext` 仍然留给客户端自带的运行时专属  
-   输入，`workspace` 是应用层自己校验过的工作区事实，两个通道故意分开，见该字段的文档注释）。`E2bMockRuntime::start` 创建沙箱后，  
-   若 `request.workspace.metadata` 非空则反序列化并在沙箱内 `exec()` 跑 `git clone [--branch  
-   <reference>] <url> <workspace_root>`（clone 目标复用 e2b 自身 envd 引导已创建好的 `/home/user/workspace` 空目录），clone 失败则回滚  
-   （`stop_instance`）已创建的沙箱。**尚未落地**：两段式网络断开（e2b 沙箱创建后能否动态收网未经确认，本次范围显式排除，  
-   `allow_internet_access` 只在创建时静态设一次）、私有仓库凭证注入（deploy token，见 §5.2 第 4 条）、subdirectory-scoped checkout  
-   （`GitWorkspaceMetadata.subdirectory` 已解析但未消费）、把 `E2bMockRuntime`/`GitSandboxWorkspaceEnvironment` 接入 `apps/server` 的运行时路由（目前  
-   `SessionApplication` 只持有一个固定的 `RuntimeAdapter`+`SessionEnvironmentNormalizer`，尚无按角色/租户分发的机制）。编译/测试：  
-   `cargo build --workspace`/`cargo test --workspace` 全绿（新增用例含一个 `#[ignore]` 的真实 e2b 集成测试，需 `E2B_API_KEY` 与出网）。
+3. **沙箱内 clone 与 runtime 路由**：`SessionApplication` 按 `runtime_kind` 注册 `AgentRuntime`、provider manager 和 `SessionEnvironmentNormalizer`。normalizer 将 git intent 归一化为完整的 workspace facts；Application 先通过 `InstanceManager` 创建 Local/E2B provider，再把 `OperationBackend` 注入 runtime。runtime 不持有 provider manager。E2B 的 git clone 通过注入的 operation backend 在沙箱内执行；失败时 Application 回滚 provider 与 runtime。
 4. **配额准入与 429**：租户三级配额 + QuotaExceeded 错误码。
   **落地状态：窄切片已实现（仅 `max_sessions` 一级）。** §4 原定三级配额（`max_sessions`/`max_concurrent_turns`/`max_sandboxes`）
    落地时用户当场收窄范围："active turn 限制没必要，只要活跃 session 数就行"——`max_concurrent_turns` 因此不实现（活跃 session 数
-   已经界定了租户的总体footprint，再加一层turn并发计数只是为同一件事重复记账）；`max_sandboxes` 因另一个原因搁置：它天然要接
-   `crates/backend/src/quota.rs` 既有的 `QuotaEnforcedLifecycle`（owner-scoped），但那要求 `owner_ref` 先从 `tenant_id` 机械派生
-   （§2），今天 `owner_ref` 仍读客户端自带的 `ext`——用客户端自报的身份去撑一个租户级配额，等于让 §1"wire 请求不带 tenant_id"的
-   边界白设，所以留给 `owner_ref` 派生工作，不在此处伪造。
-
-   **owner_ref 派生已于同日后续追加落地**（用户指示"owner_ref 改为装配层从 SecurityContext 机械推导，从
-   RuntimeStartRequest 一等字段下传，ext 里的这条路径直接删除……不留开关、不留兼容路径"）：`SecurityContext::owner_ref()`
-   （`crates/core/src/security.rs`）为 tenant 推导 `tenant/{tenant_id}`，为 admin 返回固定哨兵 `ADMIN_OWNER_REF`
-   （`"admin"`，用户明确要求"admin 给个哨兵值，然后对 admin 百无禁忌，不需要 max 限制"）；`RuntimeStartRequest` 新增一等
-   字段 `owner_ref`，`open_impl`/`fork_impl` 用 `ctx.owner_ref()` 填充；`apps/runtime-local`/`apps/runtime-e2b` 的 ext 结构体
-   （`LocalRuntimeExt`/`E2bRuntimeExt`）删掉 `owner_ref` 字段，只保留 `backend_id`——旧的客户端 ext 路径整条删除，无双路径。
-   `QuotaEnforcedLifecycle::reserve`（`crates/backend/src/quota.rs`）对 `owner_ref == "admin"` 直接跳过 `max_per_owner`
-   拒绝分支（仍计数，只是不拦截）。**至此，本节开头说的"`max_sandboxes` 天然要接 QuotaEnforcedLifecycle，但那要求
-   owner_ref 先机械派生"这个前置条件已经满足**——line 56 预告的"owner_ref 推导落地后，QuotaEnforcedLifecycle 现成的按
-   owner 沙箱配额自动成为按租户配额，provider 层零改动"现在成立：`apps/runtime-local`/`apps/runtime-e2b` 已有的
-   `DEFAULT_MAX_SANDBOXES_PER_OWNER`（当前硬编码 4）现在就是按租户生效的并发沙箱上限，而不是按可伪造的客户端字符串生效。
-   **仍未做的**：`max_sandboxes` 尚未做成可配置的租户级策略数字（即没有从 `TenantTokenEntry` 或某个 tenants 策略表读取
-   每租户不同的上限，仍是编译期常量 4，对所有租户一视同仁）——如果要做到"按租户配置不同并发沙箱数"，还需要把这个常量
-   替换成从 `SecurityContext`/token 表读出的每租户值，这是本次范围之外的下一步。跨 crate 依赖问题：`crates/backend` 与
-   `xgovernor-core` 互不依赖，`ADMIN_OWNER_REF` 因此以字面量形式在两处各自定义（`crates/core/src/security.rs` +
-   `crates/backend/src/quota.rs`），靠交叉引用注释保持同步，而非新增依赖边——`apps/runtime-e2b` 早先给
-   `E2B_WORKSPACE_ROOT` 开的同样先例。`cargo check --workspace --tests` 全绿；逐 crate `cargo test`：`xgovernor-core`
-   58/58、`backend` 88/88（含新增 `admin_owner_ref_is_exempt_from_the_cap`）、`xgovernor-runtime-local` 2/2、
-   `xgovernor-runtime-e2b` 6/6（1 ignored）、`xgovernor-server` 26/26。
+   已经界定了租户的总体 footprint。`owner_ref` 由 `SecurityContext::owner_ref()` 机械推导：tenant 使用 `tenant/{tenant_id}`，admin 使用 `ADMIN_OWNER_REF`。该值只传给 `InstanceManager`/provider lifecycle，不进入 runtime protocol，也不从客户端 `ext` 读取。provider 配额因此按可信 owner 生效。
 
    `TenantQuota { max_sessions: Option<u32> }`
    （`crates/core/src/security.rs`）挂在 `SecurityContext.quota` 上，`None`（默认）= 不设上限，与既有 `admin(..)`/`tenant(..)`
@@ -293,7 +250,7 @@ match (role, workspace_spec, provider):
    （`SecurityContext::admin` 的 `tenant_id()` 恒为 `None`，`reserve_tenant_session` 只按 `tenant_id` 记账）。测试：
    `fork_counts_against_the_same_tenant_session_quota` 等锁定"open 占额、close 放额、fork 与 open 共享同一计数"。
 
-   > 2026-08 后续更新：本段的 `XGOVERNOR_TENANT_TOKENS_JSON`/`TenantTokenEntry` 通道已删除，`max_sessions` 现从 §4 落地的 `tenants.toml` 读取（`tenant_config.rs` 的 schema），语义不变（可选字段、`None` = 不设上限），只是搬到了新文件。
+   `max_sessions` 从 `tenants.toml` 的 tenant schema 读取；可选字段缺省为不限制。
 5. **审计日志**。
   **落地状态：已实现。** `crates/core/src/application.rs` 新增 `audit_log<T>(ctx, operation, runtime_id, result)` 自由函数：
    每次调用发一条 `tracing::info!(target: "audit", principal, tenant, operation, runtime_id, result = "ok"/"error", [error])`——
@@ -317,5 +274,3 @@ match (role, workspace_spec, provider):
    循环跑 30 次（10+20 两轮）全绿后才认定修好，单跑一次绿不算数（之前那版"看似修好"的单跑同样是假阳性）。
 
 五步均不依赖持久化——内存态同样成立；持久化落地时 tenant_id 已在记录中。
-
-> 2026-08 后续更新：步骤 3/4 提到的 `apps/runtime-local`/`apps/runtime-e2b`（crate 名 `xgovernor-runtime-local`/`xgovernor-runtime-e2b`，类型 `LocalMockRuntime`/`E2bMockRuntime`）已合并为单一 crate `apps/runtime-mock`（`xgovernor-runtime-mock`，`MockRuntime`，按 `ext.runtime_mock.backend_id` 分发 local/e2b 两个 `InstanceManager`）；测试数随之从两个 crate 各自的计数合并为 `xgovernor-runtime-mock` 一个计数。与 line 58 同理，本节以上保留原文，作为对应决策发生时的真实记录，不逐处修改路径。

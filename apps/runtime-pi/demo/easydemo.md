@@ -2,7 +2,7 @@
 
 > 面向想跑通 `apps/runtime-pi`（真实 `pi --mode rpc` 而非合同测试里的 fake-pi）端到端 demo 的人。
 > 本流程已在 pi 0.84.2 + DeepSeek + E2B 上端到端验证过一次（2026-08-15），实跑记录见 §10，踩过的坑见 §0 与 §11。
-> 架构背景：[runtime_adapter_guide.md](./runtime_adapter_guide.md) §2、[protocol_boundaries.md](./protocol_boundaries.md) §5 point 4 —
+> 架构背景：[agent_runtime_guide.md](../../../docs/agent_runtime_guide.md)、[protocol_boundaries.md](../../../docs/protocol_boundaries.md) —
 > `apps/runtime-pi` 现在**组合** `InstanceManager`（`local`/`e2b`，按会话选），Pi 的工具执行（读写文件、exec、grep/glob）经一个
 > 本地 HTTP 桥（`apps/runtime-pi/src/bridge.rs` + `apps/runtime-pi/extension/` 里的 TS Pi 扩展）转发到真正的沙箱/工作区，不再直接碰
 > daemon 本机文件系统。仍然直接在 daemon 本机 `tokio::process` 拉起的，只有 `pi --mode rpc` 这条 RPC 控制通道本身——结构性原因见
@@ -201,7 +201,7 @@ curl -sS -X POST http://127.0.0.1:8787/api/v1/sessions/turns \
 { "runtime_id": "<...>", "turn_id": "<server 生成>", "accepted_kind": "turn" }
 ```
 
-这一步在 `apps/runtime-pi` 内部立刻返回（不等 pi 把 turn 跑完——`runtime_adapter_guide.md` §3 point 六的合同），真正的执行在后台任务里跑，事件
+这一步在 `apps/runtime-pi` 内部立刻返回（不等 pi 把 turn 跑完——`agent_runtime_guide.md` 的 worker 合同），真正的执行在后台任务里跑，事件
 经下一步的 SSE 流出来。
 
 ## 6. 拉事件流

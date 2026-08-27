@@ -11,7 +11,7 @@
 - **鉴权**：凭证与身份来自 `tenants.toml` 声明式策略文件（[tenancy_design.md](./tenancy_design.md) §4，默认路径 `$XGOVERNOR_DATA_DIR/tenants.toml`，可用 `XGOVERNOR_TENANTS_CONFIG_PATH` 覆盖，支持 `SIGHUP` 热重载）——`[admin]` 节的 `tokens` 签发 admin 身份，`[[tenant]]` 节的 `tokens` 签发对应 `tenant_id` 的 tenant 身份。配置了该文件（且非空）时，所有路由要求 `Authorization: Bearer <token>`，未知/缺失 token 返回 401。**默认路径**下该文件不存在时视为单机 dev 模式：每个请求隐式获得 admin 身份，行为与历史版本一致；**显式**设置 `XGOVERNOR_TENANTS_CONFIG_PATH` 却指向不存在的文件，或文件存在但解析/校验失败，则 fail-closed 拒绝启动。鉴权解析出的身份是服务端事实（[tenancy_design.md](./tenancy_design.md) §1/§2/§3.1），wire 请求体中不存在、也不接受 tenant_id 字段。
 - **跨租户所有权**：非 admin 身份访问不属于自己租户的 `runtime_id` 时，一律返回 `not_found`（404）而非 403——存在性对无权限的调用方不可见（[tenancy_design.md](./tenancy_design.md) §3.2 "404 不泄露存在性信息"）。admin 身份不受此约束。
 - **未知字段**：请求 DTO 一律 `deny_unknown_fields`——多传字段是 400 错误，不是静默忽略。唯一例外是 `ext` 扩展袋内部。
-- **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 runtime adapter 消费（例如 `ext.runtime_mock`、`ext.runtime_pi`、未来的 `ext.xiaoo`）。
+- **ext 扩展袋**：`ext` 是 `{命名空间: 任意 JSON}` 的映射，核心协议不解释其内容，由对应 `AgentRuntime` 消费（例如 `ext.runtime_mock`、`ext.runtime_pi`、`ext.xiaoo`）。
 - **lease 声明**：所有控制请求可携带 `lease` 对象：
 
 ```json
@@ -141,7 +141,7 @@
 
 - `runtime_id` 省略/为 null 时由服务端签发；携带已存在的 id 为**幂等重附着**（attach + 返回现有会话投影）。
 - `workspace.kind`：`daemon_default`（默认）/ `local_path` / `git` / `shared`。当前部署只实现前两种，其余返回 400。
-- `requested_capabilities` 从严校验：请求未知能力名是 400；请求了归一化结果/adapter 宣告之外的能力是 422。
+- `requested_capabilities` 从严校验：请求未知能力名是 400；请求了归一化结果/runtime 宣告之外的能力是 422。
 - `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 当前按 OpenAI Chat Completions-compatible endpoint 处理。
 - Pi 会把生效配置保存在该 session 的隔离目录中，以便 daemon 重启、checkpoint/load 后恢复；响应只投影 provider/model/base 与凭证来源，不回显 key。
 
@@ -204,7 +204,7 @@
 { "checkpoint_id": "checkpoint-…", "lease": {} }
 ```
 
-删除会清理 provider snapshot、runtime 归档目录以及 SQLite checkpoint 记录。tenant 只能删除自己的 checkpoint，admin 可删除任意 checkpoint；无权限与不存在统一返回 404。provider 或归档清理失败时保留 SQLite 记录，便于重试。当前不运行自动 GC，也不会因 session close 自动删除 checkpoint；重复删除已不存在的记录返回 404。
+删除会先通过 `InstanceManager` 清理 provider snapshot，再删除 SQLite checkpoint 记录。tenant 只能删除自己的 checkpoint，admin 可删除任意 checkpoint；无权限与不存在统一返回 404。provider 清理失败时保留 SQLite 记录，便于重试。当前不运行自动 GC，也不会因 session close 自动删除 checkpoint；重复删除已不存在的记录返回 404。
 
 ### 租户管理（管控面，admin-only）
 

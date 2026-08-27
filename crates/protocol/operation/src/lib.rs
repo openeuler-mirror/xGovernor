@@ -1,4 +1,4 @@
-//! Operation-plane contract between a runtime adapter and a concrete backend
+//! Operation-plane contract between an agent runtime and a concrete backend
 //! implementation (local process, remote sandbox, container, ...).
 //!
 //! This is the counterpart to `provider-protocol`: that crate governs the

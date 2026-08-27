@@ -52,7 +52,7 @@ pub struct SessionUsage {
 /// [`crate::SessionWireError`], which describes rejection at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionTurnFailure {
-    /// Stable machine-readable code owned by the runtime adapter/domain layer.
+    /// Stable machine-readable code owned by the runtime/domain layer.
     pub code: String,
     pub message: String,
     #[serde(default)]
@@ -65,7 +65,7 @@ pub struct SessionTurnFailure {
 /// [`SessionEvent::ToolActivity`] event's `ext` bag, when the tool call
 /// mutated a file. Not interpreted by this crate — `SessionEvent` still
 /// carries `ext` as opaque JSON — this type exists purely so that runtime
-/// adapters populating the key and clients reading it agree on a shape
+/// runtimes populating the key and clients reading it agree on a shape
 /// without either side needing to know the tool's own argument schema
 /// (e.g. `file_edit`'s `old_string`/`new_string` vs. `file_write`'s
 /// `content`). The delta itself is computed by whoever has access to the
