@@ -52,11 +52,12 @@ The system is organized around explicit boundaries, each owned by a contract cra
 | `crates/session-protocol` | Client ↔ daemon HTTP/SSE wire contract. Runtime-neutral core vocabulary (open / turn / events / interaction / operation / errors) plus namespaced `ext` bags for runtime-specific payloads. |
 | `crates/provider-protocol` | Manager ↔ sandbox-provider lifecycle contract. Opaque `owner_ref` instead of business identity, neutral lifecycle reasons, and a pure state machine as the executable spec. |
 | `crates/operation-protocol` | The operation plane (exec / filesystem / search) available once a provider instance is attached — the in-process counterpart to `provider-protocol`. |
-| `crates/core` | Domain + application layer: `SessionApplication`, session records with **opaque runtime state**, the `RuntimeAdapter` seam every agent runtime plugs into, lease table, orphan reaper, admission gates, wire projections. |
-| `crates/backend` | Provider implementations shared by adapters: local directory sandbox, E2B remote sandbox, SQLite provider-instance ledger. |
+| `crates/core` | Domain + application layer: `SessionApplication`, session records with **opaque runtime state**, multi-runtime registration through `AgentRuntime`, lease table, orphan reaper, admission gates, wire projections. |
+| `crates/backend` | Provider implementations used by `InstanceManager`: local directory sandbox, E2B remote sandbox, SQLite provider-instance ledger. |
 | `crates/manager` | `InstanceManager`: unified provider-instance orchestration — per-owner quota + global ceiling, per-runtime_id create idempotency, attach-failure compensating delete, delete-failure pending-release retry queue, create-path semaphore admission with backoff, startup reconcile against the ledger. |
-| `apps/runtime-mock` | A mock runtime adapter over **real** local and E2B providers (dispatched by `ext.runtime_mock.backend_id`) — proves the full plumbing, including in-sandbox `git clone` for git workspaces, without pretending to be an LLM. |
-| `apps/runtime-pi` | The **real** Pi runtime adapter and worker: the adapter supervises a per-session worker over shared NDJSON; the worker owns Pi's native RPC process; tools route through the bridge into `local` / `e2b`. |
+| `apps/runtime-mock` | A mock `AgentRuntime` over **real** local and E2B providers (dispatched by `ext.runtime_mock.backend_id`) — proves the full plumbing, including in-sandbox `git clone` for git workspaces, without pretending to be an LLM. |
+| `apps/runtime-pi` | The **real** Pi runtime and worker: the runtime supervises a per-session worker over shared NDJSON; the worker owns Pi's native RPC process; tools route through the bridge into `local` / `e2b`. |
+| `apps/runtime-xiaoo` | The xiaoO `AgentRuntime` and worker: xiaoO tools execute through the same host-injected operation backend and Local/E2B provider boundary. |
 | `apps/server` | The runnable daemon (`xgovernor-server`): two listeners (admin loopback + tenant), HTTP/SSE transport, SQLite session repository, assembly. |
 
 Design rules that hold everywhere: the wire core stays runtime-neutral (any single runtime's concept lives in `ext`); runtime internal state is quarantined as an opaque, versioned blob; capabilities come in two families (sandbox vs runtime) and gate requests before they reach a runtime; every error leaves through one projected wire vocabulary; on the tenant surface, sessions are only admitted with a git workspace (https) and a sandboxed provider — fail-closed.
@@ -69,13 +70,13 @@ Honest edition: the control plane **closed loop is proven against the real thing
 
 What ships today:
 
-- **Real Pi runtime adapter** (`apps/runtime-pi`) — per-session worker + nested `pi --mode rpc` + bridge extension; tool execution lands in a real sandbox, never the daemon host filesystem.
+- **Real Pi runtime** (`apps/runtime-pi`) — per-session worker + nested `pi --mode rpc` + bridge extension; tool execution lands in a real sandbox, never the daemon host filesystem.
 - **Two sandbox providers** — `local` (host directory) and `e2b` (remote VM, optional via `E2B_API_KEY`), behind the same provider SPI and quota plumbing; `InstanceManager` gives per-owner quota (default 20), a global ceiling (default 1024), create idempotency, compensating deletes, and a pending-release retry queue.
 - **Durable state** — SQLite session repository + provider-instance ledger in one WAL-mode file (`~/.xgovernor/xgovernor.db`, override with `XGOVERNOR_DATA_DIR`); startup reconcile re-attaches to surviving sandboxes after a restart, and pi sessions get **lazy restoration**: the per-session state needed to re-spawn `pi` is persisted into the opaque `SessionRecord.runtime` slot at open, so after a daemon restart the same `runtime_id` transparently resumes its conversation (verified end-to-end with `kill -9` on 2026-08-17, see the demo's §10.5).
 - **Two listening surfaces** — loopback-only admin (`XGOVERNOR_BIND_ADDR`) and tenant (`XGOVERNOR_TENANT_BIND_ADDR`); both require tokens at startup; tenant sessions are admitted only as git-workspace + sandboxed-provider (`e2b`), with https-only URL hygiene.
 - **Lifecycle & defense** — single-writer leases with heartbeats, orphan reaper for dead clients, real turn cancellation, graceful shutdown with a forced-exit deadline, request timeouts / body limits / concurrency ceilings / SSE stream TTL on the transport.
 
-Honest gaps (see Roadmap): the pi child-process registry is in-process — a daemon restart loses the dialog channel to still-running sandboxes, though **lazy restoration now rebuilds it from the persisted session state** (completed turns resume with full context; an in-flight turn is dropped by design, and a dead sandbox / lost session file fails closed rather than silently cold-starting); the operation plane is not yet exposed as HTTP routes; `owner_ref` is not yet derived from external authentication; the ingress adapters (Feishu / Telegram / cron / MCP) are legacy in-tree code pending migration; xiaoO / opencode are not attached; the e2b git workspace only supports **public https URLs** (no credential injection, by design — private repos cannot be cloned).
+Honest gaps (see Roadmap): the operation plane is not yet exposed as HTTP routes; the ingress adapters (Feishu / Telegram / cron / MCP) are legacy in-tree code pending migration; opencode is not attached; the e2b git workspace only supports **public https URLs** (no credential injection, by design — private repos cannot be cloned).
 
 ## Requirements
 
@@ -195,7 +196,7 @@ To see two pi agents running in parallel (repo analysis + live web lookup, indep
 - **Controlled credentials for e2b git workspaces** — clone private repos without embedding credentials in URLs (must pass the existing hygiene gate).
 - **External auth → `owner_ref`** — derive tenant identity from an authenticated principal; today the token table decides the role.
 - **Ingress adapters** — channels (Feishu / Telegram), cron triggers, and an MCP surface, rebuilt as thin adapters on top of the session API (legacy implementations exist in-tree and are pending migration).
-- **More runtimes** — xiaoO / opencode adapters via the ACP-aligned normalized event model.
+- **More runtimes** — opencode and additional runtimes via `AgentRuntime` and the normalized event model.
 
 ## Development
 
@@ -209,10 +210,10 @@ The protocol crates are self-guarding: a dependency-policy test pins `session-pr
 
 | Document | What it covers |
 |---|---|
-| [docs/protocol_boundaries.md](./docs/protocol_boundaries.md) | Normative spec: protocol crate scopes, admission criteria, capability model, runtime-adapter seam rules |
+| [docs/protocol_boundaries.md](./docs/protocol_boundaries.md) | Current protocol scopes, Application/provider/runtime responsibilities, state and capability rules |
 | [docs/session_orchestration_skeleton.md](./docs/session_orchestration_skeleton.md) | How the shipped orchestration works: minimal closed loop, lease table, orphan reaper (Components A/B/C) |
 | [docs/http_api.md](./docs/http_api.md) | Wire reference: every route, request/response shape, SSE event vocabulary, error codes |
-| [docs/runtime_adapter_guide.md](./docs/runtime_adapter_guide.md) | How to attach a new agent runtime: trait obligations, event mapping, capabilities, checklist |
+| [docs/agent_runtime_guide.md](./docs/agent_runtime_guide.md) | How to attach a new agent runtime: protocol obligations, worker RPC, state, capabilities, checklist |
 | [docs/tenancy_design.md](./docs/tenancy_design.md) | Multi-tenancy design: identity chain, the admin/tenant trust axiom, git-only sandboxed workspaces, quotas |
 | [apps/runtime-pi/demo/easydemo.md](./apps/runtime-pi/demo/easydemo.md) | Single-session end-to-end demo: real `pi --mode rpc` + DeepSeek + E2B, verified run log, `kill -9` restart + lazy restoration (§10.5), known pitfalls |
 | [apps/runtime-pi/demo/mult_agent_demo.md](./apps/runtime-pi/demo/mult_agent_demo.md) | Two-agent parallel demo: independent pi sessions (repo analysis + live web lookup), isolation model, how to read the results |

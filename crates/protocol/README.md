@@ -7,5 +7,6 @@
 - **`session/`**(`session-protocol`) — governor daemon 与外部客户端(HTTP/SSE)之间的**线协议**。
 - **`provider/`**(`provider-protocol`) — governor 与"基础设施 provider"(local/e2b/未来的其它沙箱)之间的**控制面契约**(create/load/pause/delete/inspect)。
 - **`operation/`**(`operation-protocol`) — 一个已 attach 的 provider 实例，对外暴露的**操作面契约**(exec/文件读写/搜索/导出等)。
+- **`runtime/`**(`agent-runtime-protocol`) — host 与 agent runtime/worker 之间的 runtime 契约(start/attach/turn/interaction/cancel/state，以及 worker NDJSON)。
 
-三者都刻意不解释对方的内部细节：session 不关心 provider 怎么实现，provider 不关心 operation 具体怎么跑，全部当不透明值透传。谁在什么时候该依赖谁，见各自子目录的 README。
+四者都刻意不解释对方的内部细节：session 不关心 provider/runtime 怎么实现，provider 不关心 operation/runtime 具体怎么跑，runtime 只接收 host 注入的 operation backend。跨层编排统一由 `crates/core` 的 `SessionApplication` 完成。
