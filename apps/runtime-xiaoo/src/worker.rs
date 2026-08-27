@@ -1,6 +1,7 @@
 use crate::xiaoo_backend::{HttpOperationBackend, WorkerConfig};
 use crate::{build_runtime, usage_from_outcome, STATE_SCHEMA_VERSION};
 use agent_contracts::interaction::InteractionHandle;
+use agent_runtime_protocol::RuntimeFailure;
 use agent_runtime_protocol::{
     decode_worker_request, encode_worker_response, RuntimeError, RuntimeEvent,
     RuntimeStateSnapshot, WorkerRequest, WorkerResponse,
@@ -17,7 +18,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xgovernor_core::RuntimeFailure;
 use xiaoo_api::runtime::{RuntimeInput, RuntimeOutput, RuntimeState};
 
 pub async fn run_worker_from_env() -> Result<(), String> {

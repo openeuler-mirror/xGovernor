@@ -3,10 +3,17 @@ use crate::{
     RuntimeInteractionRequest, RuntimeStartRequest, RuntimeStateSnapshot, RuntimeTurnRequest,
 };
 use async_trait::async_trait;
+use operation_protocol::OperationBackend;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub type RuntimeEventReceiver = mpsc::Receiver<RuntimeEvent>;
+
+#[derive(Clone)]
+pub struct RuntimeExecutionContext {
+    pub operation_backend: Arc<dyn OperationBackend>,
+}
 
 /// Runtime implementation seam independent of xGovernor's session/domain
 /// crate. A host may adapt this trait to its own persistence and wire model.
@@ -22,8 +29,16 @@ pub trait AgentRuntime: Send + Sync {
         self.capabilities()
     }
 
-    async fn start(&self, request: RuntimeStartRequest) -> Result<(), RuntimeError>;
-    async fn attach(&self, runtime_id: &str) -> Result<(), RuntimeError>;
+    async fn start(
+        &self,
+        request: RuntimeStartRequest,
+        execution_context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError>;
+    async fn attach(
+        &self,
+        runtime_id: &str,
+        execution_context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError>;
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError>;
     async fn check_alive(&self, runtime_id: &str) -> Result<bool, RuntimeError>;
     async fn submit_turn(

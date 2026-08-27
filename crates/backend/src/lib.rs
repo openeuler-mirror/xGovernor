@@ -13,7 +13,7 @@
 //! Scope of this phase: `local` and `e2b` providers are ported. Other
 //! providers (conch) and the multi-session `BackendManager`/gateway
 //! orchestration layer (leasing, fork/checkpoint lineage, sandbox pooling)
-//! are deferred to a future phase, to be picked up once a `RuntimeAdapter`
+//! are deferred to a future phase, to be picked up once a `AgentRuntime`
 //! implementation actually needs multi-session sandbox sharing.
 
 pub mod e2b;

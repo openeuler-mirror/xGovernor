@@ -46,6 +46,7 @@ name = "agent-runtime-protocol"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "operation-protocol",
  "serde",
  "serde_json",
  "session-protocol",
@@ -3337,7 +3338,10 @@ version = "0.1.0"
 dependencies = [
  "agent-runtime-protocol",
  "async-trait",
+ "backend",
  "libc",
+ "operation-protocol",
+ "provider-protocol",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3347,6 +3351,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "xgovernor-manager",
 ]
 
 [[package]]
@@ -3367,6 +3372,7 @@ dependencies = [
 name = "xgovernor-runtime-mock"
 version = "0.1.0"
 dependencies = [
+ "agent-runtime-protocol",
  "async-trait",
  "backend",
  "operation-protocol",
@@ -3440,6 +3446,7 @@ dependencies = [
 name = "xgovernor-server"
 version = "0.1.0"
 dependencies = [
+ "agent-runtime-protocol",
  "arc-swap",
  "async-trait",
  "axum",

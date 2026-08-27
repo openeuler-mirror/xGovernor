@@ -51,14 +51,6 @@ impl TurnCancellationRegistry {
         cancel_rx
     }
 
-    /// Fire the cancel signal for `runtime_id`'s in-flight turn. When
-    /// `turn_id` is `Some`, only fires if it matches the registered turn —
-    /// a stale `cancel` for a turn that has already ended (and possibly been
-    /// replaced by a newer one under the same `runtime_id`) is a silent
-    /// no-op rather than an error, matching `RuntimeAdapter::cancel`'s
-    /// existing "cancel whatever's active, if anything" tolerance. Returns
-    /// whether a signal was actually fired, purely for tests — adapters
-    /// should not treat `false` as an error.
     pub fn fire(&self, runtime_id: &str, turn_id: Option<&str>) -> bool {
         let mut guard = self
             .active

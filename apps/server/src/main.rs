@@ -515,12 +515,13 @@ async fn main() {
     // runtime can actually provision (and no others), so the two stay in
     // lockstep by construction.
     let configured_backend_ids: Vec<String> = runtime_managers.keys().cloned().collect();
-    let pi_runtime = PiRuntime::new(runtime_managers.clone(), xgovernor_pi_session_root())
-        .unwrap_or_else(|error| {
+    let pi_runtime = Arc::new(PiRuntime::new(xgovernor_pi_session_root()).unwrap_or_else(
+        |error| {
             eprintln!("refusing to start: failed to initialize PiRuntime bridge: {error}");
             std::process::exit(1);
-        });
-    let xiaoo_runtime = XiaooRuntime::new(runtime_managers);
+        },
+    ));
+    let xiaoo_runtime = Arc::new(XiaooRuntime::new(runtime_managers.clone()));
 
     let mut lease_stale = configured_duration_secs("XGOVERNOR_LEASE_STALE_SECS", 45);
     let orphan_threshold = configured_duration_secs("XGOVERNOR_ORPHAN_THRESHOLD_SECS", 1_800);
@@ -540,15 +541,17 @@ async fn main() {
     let application = SessionApplication::with_runtime_registry(
         "pi",
         [
-            RuntimeRegistration::new(
-                Arc::new(pi_runtime),
+            RuntimeRegistration::with_providers(
+                pi_runtime.clone(),
+                runtime_managers.clone(),
                 Arc::new(PiSessionEnvironment::new(
                     default_workspace_root.clone(),
                     configured_backend_ids.clone(),
                 )),
             ),
-            RuntimeRegistration::new(
-                Arc::new(xiaoo_runtime),
+            RuntimeRegistration::with_providers(
+                xiaoo_runtime.clone(),
+                runtime_managers.clone(),
                 Arc::new(XiaooSessionEnvironment::new(
                     default_workspace_root,
                     configured_backend_ids,

@@ -10,6 +10,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 session-protocol = { path = "../session" }
+operation-protocol = { path = "../operation" }
 
 [dev-dependencies]
 serde_json.workspace = true

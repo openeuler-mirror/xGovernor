@@ -427,6 +427,12 @@ fn session_event_name(event: &SessionEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_runtime_protocol::{
+        AgentRuntime, RuntimeCancelRequest, RuntimeCapability, RuntimeError, RuntimeEvent,
+        RuntimeEventReceiver, RuntimeExecutionContext,
+        RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeStartRequest,
+        RuntimeTurnRequest as RuntimeTurnInput,
+    };
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
@@ -436,9 +442,8 @@ mod tests {
     use tower::ServiceExt;
     use xgovernor_core::application::{SessionRepository, TurnIdGenerator};
     use xgovernor_core::{
-        Clock, NormalizedSessionEnvironment, RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver,
-        RuntimeIdGenerator, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-        SessionDomainError, SessionEnvironmentNormalizer, SessionListPage, SessionRecord,
+        Clock, NormalizedSessionEnvironment, RuntimeIdGenerator, SessionDomainError,
+        SessionEnvironmentNormalizer, SessionListPage, SessionRecord,
     };
 
     struct EmptyRepository;
@@ -582,34 +587,42 @@ mod tests {
     struct CompletingRuntime;
 
     #[async_trait]
-    impl RuntimeAdapter for CompletingRuntime {
-        fn kind(&self) -> &str {
+    impl AgentRuntime for CompletingRuntime {
+        fn runtime_kind(&self) -> &str {
             "test"
         }
 
-        fn capabilities(&self) -> BTreeSet<session_protocol::SessionRuntimeCapability> {
+        fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
             BTreeSet::new()
         }
 
-        async fn start(&self, _request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
+        async fn start(
+            &self,
+            _request: RuntimeStartRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
 
-        async fn stop(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
+        async fn stop(&self, _runtime_id: &str) -> Result<(), RuntimeError> {
             Ok(())
         }
 
-        async fn attach(&self, _runtime_id: &str) -> Result<(), SessionDomainError> {
+        async fn attach(
+            &self,
+            _runtime_id: &str,
+            _context: RuntimeExecutionContext,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
-        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, SessionDomainError> {
+        async fn check_alive(&self, _runtime_id: &str) -> Result<bool, RuntimeError> {
             Ok(true)
         }
 
         async fn submit_turn(
             &self,
             _input: RuntimeTurnInput,
-        ) -> Result<RuntimeEventReceiver, SessionDomainError> {
+        ) -> Result<RuntimeEventReceiver, RuntimeError> {
             let (tx, rx) = mpsc::channel(1);
             tx.send(RuntimeEvent::Completed {
                 outcome: session_protocol::SessionTurnOutcome::Complete,
@@ -623,15 +636,11 @@ mod tests {
         async fn answer_interaction(
             &self,
             _input: RuntimeInteractionInput,
-        ) -> Result<(), SessionDomainError> {
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
 
-        async fn cancel(
-            &self,
-            _runtime_id: &str,
-            _turn_id: Option<&str>,
-        ) -> Result<(), SessionDomainError> {
+        async fn cancel(&self, _request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
             Ok(())
         }
     }
@@ -639,6 +648,7 @@ mod tests {
     fn test_router() -> Router {
         let router = session_router(Arc::new(SessionHttpState::new(SessionApplication::new(
             Arc::new(CompletingRuntime),
+            std::collections::HashMap::new(),
             Arc::new(EmptyRepository),
             Arc::new(FixedTurnId),
             Arc::new(FixedTurnId),
@@ -662,6 +672,7 @@ mod tests {
 
         let router = session_router(Arc::new(SessionHttpState::new(SessionApplication::new(
             Arc::new(CompletingRuntime),
+            std::collections::HashMap::new(),
             Arc::new(TenantARepository),
             Arc::new(FixedTurnId),
             Arc::new(FixedTurnId),
@@ -979,6 +990,7 @@ mod tests {
 
         let router = session_router(Arc::new(SessionHttpState::new(SessionApplication::new(
             Arc::new(CompletingRuntime),
+            std::collections::HashMap::new(),
             Arc::new(NoRecordRepository),
             Arc::new(FixedTurnId),
             Arc::new(FixedTurnId),
@@ -1079,6 +1091,7 @@ mod tests {
     fn test_router_with_state() -> (Router, Arc<SessionHttpState>) {
         let state = Arc::new(SessionHttpState::new(SessionApplication::new(
             Arc::new(CompletingRuntime),
+            std::collections::HashMap::new(),
             Arc::new(EmptyRepository),
             Arc::new(FixedTurnId),
             Arc::new(FixedTurnId),

@@ -1131,7 +1131,7 @@ impl ProviderLifecycle for E2bProvider {
     /// Unlike every other accessor here, this deliberately re-verifies
     /// against the platform rather than trusting the in-memory registry
     /// alone — it is the single source of truth `check_alive`
-    /// (`RuntimeAdapter::check_alive`, used by the core-layer reclaim sweep)
+    /// (`AgentRuntime::check_alive`, used by the core-layer reclaim sweep)
     /// relies on to notice a sandbox the platform already killed via its
     /// idle `timeout` (`backend.rs`'s `touch_activity`/`refresh_timeout`
     /// push that deadline out on real activity, but a session left idle
@@ -2054,7 +2054,7 @@ mod tests {
     /// public repo into `DEFAULT_WORKSPACE_ROOT` via the operation-plane
     /// `exec`, verifies the clone landed with `git rev-parse HEAD`, then tears
     /// the sandbox down. This used to live in `apps/runtime-e2b`'s own test
-    /// module (exercised through `RuntimeAdapter::start`/`stop`) before that
+    /// module (exercised through `AgentRuntime::start`/`stop`) before that
     /// crate was folded into `apps/runtime-mock`; it is rewritten here in raw
     /// `provider_protocol` calls, matching this module's own
     /// `live_create_attach_exec_and_delete` above, so this crate's live e2b

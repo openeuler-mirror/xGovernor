@@ -20,11 +20,15 @@
 
 mod support;
 
+use agent_runtime_protocol::{
+    AgentRuntime, RuntimeCancelRequest, RuntimeError, RuntimeEvent,
+    RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeStartRequest,
+    RuntimeTurnRequest as RuntimeTurnInput,
+};
 use serde_json::{json, Value};
 use session_protocol::{
     LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionOpenRequest,
-    SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
-    SessionTurnOutcome, SessionTurnRequest,
+    SessionToolActivityPhase, SessionToolActivityStatus, SessionTurnOutcome, SessionTurnRequest,
 };
 use std::time::{Duration, Instant};
 use support::{
@@ -32,10 +36,7 @@ use support::{
     workspace_facts, LOCAL_BACKEND_ID,
 };
 use tempfile::TempDir;
-use xgovernor_core::{
-    RuntimeAdapter, RuntimeEvent, RuntimeInteractionInput, RuntimeStartRequest, RuntimeTurnInput,
-    SecurityContext, SessionDomainError,
-};
+use xgovernor_core::SecurityContext;
 use xgovernor_runtime_pi::EXT_NAMESPACE;
 
 fn llm(provider: &str, model: &str, api_key: &str) -> LlmOverrideRequest {
@@ -54,19 +55,21 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
     let runtime = new_pi_runtime();
     assert!(runtime
         .capabilities()
-        .contains(&SessionRuntimeCapability::ModelOverride));
+        .contains(&agent_runtime_protocol::RuntimeCapability::ModelOverride));
 
     runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-llm".into(),
-            conversation_id: "conversation-llm".into(),
-            sender_id: "sender-llm".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: Some(llm("openai", "gpt-4.1-mini", "open-key")),
-            owner_ref: "admin".into(),
-            ext: pi_runtime_ext(),
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-llm".into(),
+                conversation_id: "conversation-llm".into(),
+                sender_id: "sender-llm".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: Some(llm("openai", "gpt-4.1-mini", "open-key")),
+                ext: pi_runtime_ext(),
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect("start must accept a caller-selected provider/model");
 
@@ -157,22 +160,24 @@ async fn llm_override_requires_explicit_provider_and_model() {
     let workspace = TempDir::new().expect("tempdir");
     let runtime = new_pi_runtime();
     let error = runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-invalid-llm".into(),
-            conversation_id: "conversation".into(),
-            sender_id: "sender".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: Some(LlmOverrideRequest {
-                model: Some("some-model".into()),
-                ..Default::default()
-            }),
-            owner_ref: "admin".into(),
-            ext: pi_runtime_ext(),
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-invalid-llm".into(),
+                conversation_id: "conversation".into(),
+                sender_id: "sender".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: Some(LlmOverrideRequest {
+                    model: Some("some-model".into()),
+                    ..Default::default()
+                }),
+                ext: pi_runtime_ext(),
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect_err("missing provider must fail closed");
-    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 }
 
 #[tokio::test]
@@ -180,22 +185,24 @@ async fn api_base_creates_a_session_isolated_openai_compatible_provider() {
     let workspace = TempDir::new().expect("tempdir");
     let runtime = new_pi_runtime();
     runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-custom-base".into(),
-            conversation_id: "conversation".into(),
-            sender_id: "sender".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: Some(LlmOverrideRequest {
-                provider: Some("my-gateway".into()),
-                model: Some("my-model".into()),
-                api_base: Some("https://llm.example.test/v1".into()),
-                api_key: Some("gateway-key".into()),
-                api_key_env: None,
-            }),
-            owner_ref: "admin".into(),
-            ext: pi_runtime_ext(),
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-custom-base".into(),
+                conversation_id: "conversation".into(),
+                sender_id: "sender".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: Some(LlmOverrideRequest {
+                    provider: Some("my-gateway".into()),
+                    model: Some("my-model".into()),
+                    api_base: Some("https://llm.example.test/v1".into()),
+                    api_key: Some("gateway-key".into()),
+                    api_key_env: None,
+                }),
+                ext: pi_runtime_ext(),
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect("custom OpenAI-compatible endpoint must start");
 
@@ -364,7 +371,7 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
     );
 }
 
-/// Pins down the `RuntimeAdapter::submit_turn` contract: it must return
+/// Pins down the `AgentRuntime::submit_turn` contract: it must return
 /// without waiting for the turn to actually finish. Unlike `runtime-local`'s
 /// equivalent test (which gets a hard zero-race guarantee from controlling
 /// both sides of an in-process future), this adapter drives a real OS
@@ -449,7 +456,7 @@ async fn native_pi_crash_is_reported_as_worker_unavailable() {
     runtime.stop("runtime-1").await.ok();
 }
 
-/// Pins down `RuntimeAdapter::cancel`'s "real interrupt semantics" contract
+/// Pins down `AgentRuntime::cancel`'s "real interrupt semantics" contract
 /// against a real subprocess: calling `cancel` must make the fake pi process
 /// actually stop short, not just eventually report `Cancelled` after
 /// quietly waiting out its own natural completion. The elapsed-time
@@ -473,7 +480,10 @@ async fn cancel_interrupts_a_real_pi_turn_before_its_natural_completion() {
         .expect("submit_turn must be accepted");
 
     runtime
-        .cancel("runtime-1", Some("turn-1"))
+        .cancel(RuntimeCancelRequest {
+            runtime_id: "runtime-1".into(),
+            turn_id: Some("turn-1".into()),
+        })
         .await
         .expect("cancel must be accepted");
 
@@ -597,19 +607,21 @@ async fn start_rejects_a_malformed_executable_ext_payload() {
     .collect();
 
     let error = runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-x".into(),
-            conversation_id: "conversation-x".into(),
-            sender_id: "sender-x".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: None,
-            owner_ref: "admin".into(),
-            ext,
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-x".into(),
+                conversation_id: "conversation-x".into(),
+                sender_id: "sender-x".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: None,
+                ext,
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect_err("a non-string 'executable' field must be rejected");
-    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 }
 
 /// Mirrors `runtime-local`'s `start_without_ext_namespace_is_rejected`: Task
@@ -622,19 +634,21 @@ async fn start_rejects_a_missing_or_empty_backend_id() {
 
     let runtime = new_pi_runtime();
     let error = runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-x".into(),
-            conversation_id: "conversation-x".into(),
-            sender_id: "sender-x".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: None,
-            owner_ref: "admin".into(),
-            ext: Default::default(),
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-x".into(),
+                conversation_id: "conversation-x".into(),
+                sender_id: "sender-x".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: None,
+                ext: Default::default(),
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect_err("a wholly missing 'runtime_pi' ext namespace must be rejected");
-    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 
     let runtime = new_pi_runtime();
     let ext: SessionExtensions = [(
@@ -644,19 +658,21 @@ async fn start_rejects_a_missing_or_empty_backend_id() {
     .into_iter()
     .collect();
     let error = runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-y".into(),
-            conversation_id: "conversation-y".into(),
-            sender_id: "sender-y".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: None,
-            owner_ref: "admin".into(),
-            ext,
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-y".into(),
+                conversation_id: "conversation-y".into(),
+                sender_id: "sender-y".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: None,
+                ext,
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect_err("an empty 'backend_id' must be rejected");
-    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 }
 
 /// A `backend_id` naming no configured `InstanceManager` must fail closed
@@ -674,19 +690,21 @@ async fn start_rejects_an_unconfigured_backend_id() {
     .collect();
 
     let error = runtime
-        .start(RuntimeStartRequest {
-            runtime_id: "runtime-z".into(),
-            conversation_id: "conversation-z".into(),
-            sender_id: "sender-z".into(),
-            workspace: workspace_facts(workspace.path().to_str().unwrap()),
-            state: None,
-            llm: None,
-            owner_ref: "admin".into(),
-            ext,
-        })
+        .start(
+            RuntimeStartRequest {
+                runtime_id: "runtime-z".into(),
+                conversation_id: "conversation-z".into(),
+                sender_id: "sender-z".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: None,
+                ext,
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        )
         .await
         .expect_err("an unrecognized backend_id must be rejected");
-    assert!(matches!(error, SessionDomainError::InvalidRequest { .. }));
+    assert!(matches!(error, RuntimeError::InvalidRequest { .. }));
 }
 
 #[tokio::test]
@@ -695,7 +713,10 @@ async fn cancel_without_an_active_turn_is_a_silent_no_op() {
     let runtime = started_runtime(workspace.path().to_str().unwrap()).await;
 
     runtime
-        .cancel("runtime-1", None)
+        .cancel(RuntimeCancelRequest {
+            runtime_id: "runtime-1".into(),
+            turn_id: None,
+        })
         .await
         .expect("cancel with nothing active must be a no-op, not an error");
     runtime.stop("runtime-1").await.ok();
@@ -705,8 +726,8 @@ async fn cancel_without_an_active_turn_is_a_silent_no_op() {
 async fn operations_against_an_unknown_runtime_id_return_not_found() {
     let runtime = new_pi_runtime();
     let error = runtime
-        .attach("does-not-exist")
+        .attach("does-not-exist", support::runtime_context(".").await)
         .await
         .expect_err("must be not found");
-    assert!(matches!(error, SessionDomainError::NotFound { .. }));
+    assert!(matches!(error, RuntimeError::NotFound { .. }));
 }

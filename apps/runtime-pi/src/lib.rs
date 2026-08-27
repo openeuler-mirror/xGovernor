@@ -8,16 +8,19 @@ use agent_runtime_protocol::{
     decode_worker_response, encode_worker_request, worker_error_event, RuntimeCancelRequest,
     RuntimeError, WorkerRequest, WorkerResponse,
 };
+use agent_runtime_protocol::{
+    AgentRuntime, RuntimeCapability, RuntimeCapabilityContext, RuntimeEvent, RuntimeEventReceiver,
+    RuntimeExecutionContext, RuntimeInteractionRequest as RuntimeInteractionInput,
+    RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
+};
 use async_trait::async_trait;
 use bridge::Bridge;
 use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
-use provider_protocol::{BackendId, ProviderControlError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_protocol::{
-    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionRuntimeCapability,
-    SessionUsage,
+    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionUsage,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -27,13 +30,11 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{
-    enforce_workspace_axiom, CheckpointPayload, IsolationBoundary, IsolationFacts,
-    NetworkIsolation, NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm,
-    RuntimeAdapter, RuntimeEvent, RuntimeEventReceiver, RuntimeInteractionInput,
-    RuntimeLoadRequest, RuntimeStartRequest, RuntimeTurnInput, SandboxCapability, SecurityContext,
-    SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess, WorkspaceFacts,
+    enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
+    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, SandboxCapability,
+    SecurityContext, SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess,
+    WorkspaceFacts,
 };
-use xgovernor_manager::InstanceManager;
 
 /// Namespaced `ext` key this adapter reads its bootstrap config from,
 /// matching the "runtime-specific input belongs in namespaced ext bags"
@@ -373,6 +374,30 @@ fn read_pi_runtime_ext(ext: &SessionExtensions) -> Result<PiRuntimeExt, SessionD
     Ok(parsed)
 }
 
+fn to_runtime_error(error: SessionDomainError) -> RuntimeError {
+    match error {
+        SessionDomainError::InvalidRequest { message } => RuntimeError::InvalidRequest {
+            code: "invalid_request".into(),
+            message,
+        },
+        SessionDomainError::NotFound { runtime_id } => RuntimeError::NotFound { runtime_id },
+        SessionDomainError::Conflict { message } => RuntimeError::Conflict {
+            code: "conflict".into(),
+            message,
+        },
+        SessionDomainError::UnsupportedCapability { capability, .. } => {
+            RuntimeError::UnsupportedCapability { capability }
+        }
+        SessionDomainError::Unavailable { message } => RuntimeError::WorkerUnavailable {
+            message,
+            retryable: true,
+        },
+        error => RuntimeError::Internal {
+            message: error.to_string(),
+        },
+    }
+}
+
 /// Environment facts for PI sessions. The selected tool backend is part of
 /// PI's namespaced open extension, so the same `backend_id` that `PiRuntime`
 /// later uses to provision the sandbox must also drive admission and the
@@ -555,30 +580,6 @@ async fn clone_git_workspace(
     Ok(())
 }
 
-/// Maps a `ProviderControlError` (surfaced by the composed
-/// `InstanceManager`s) to `SessionDomainError`. Identical in shape to
-/// `runtime-local`/`runtime-e2b`'s `map_provider_error` — kept as a
-/// per-crate copy rather than a shared helper for the same reason those two
-/// don't share one: it is a three-line mapping, not enough surface to
-/// justify a cross-crate dependency.
-fn map_provider_error(error: ProviderControlError) -> SessionDomainError {
-    match error {
-        ProviderControlError::NotFound { resource_ref } => SessionDomainError::NotFound {
-            runtime_id: resource_ref,
-        },
-        ProviderControlError::InvalidRequest { message } => {
-            SessionDomainError::InvalidRequest { message }
-        }
-        ProviderControlError::ResourceLimitExceeded { .. } => SessionDomainError::Unavailable {
-            message: error.to_string(),
-        },
-        other => SessionDomainError::Internal {
-            message: other.to_string(),
-            source: None,
-        },
-    }
-}
-
 /// Supervisor-side metadata for the single turn currently owned by a worker.
 /// Pi-native state and event sequencing live exclusively in `pi-worker`.
 struct CurrentTurn {
@@ -597,28 +598,16 @@ struct PiInstance {
     /// shared [`Bridge`]. `stop()` unregisters it so a dangling token can't
     /// keep proxying to a backend whose sandbox is about to be torn down.
     bridge_token: String,
-    /// The `InstanceManager` (looked up by `ext.backend_id` in `start()`)
-    /// that provisioned this instance's sandbox, kept so `stop()` can call
-    /// `stop_instance` on the *same* manager without re-deriving it from
-    /// `ext` (the ext payload isn't available in `stop()`, which only
-    /// receives a `runtime_id`).
-    manager: Arc<InstanceManager>,
     /// Everything needed to reconstruct this instance's `start()` call after
     /// a restart — see [`PiPersistedState`]. Immutable snapshot taken at
     /// `start()` time; `export_state()` just clones and re-wraps it.
     persisted_state: PiPersistedState,
-    activity: Arc<tokio::sync::RwLock<()>>,
 }
 
-/// `RuntimeAdapter` backed by one `pi-worker` subprocess per `runtime_id`.
-/// Each worker owns one nested `pi --mode rpc` process. Composes one
-/// `InstanceManager` per provider
-/// `backend_id` this runtime is willing to provision sandboxes against
-/// (`managers`), plus a single shared [`Bridge`] HTTP server (bound once at
-/// construction, alive for this `PiRuntime`'s entire lifetime) that proxies
-/// Pi's tool calls to whichever backend `start()` attached for that session.
+/// `AgentRuntime` backed by one `pi-worker` subprocess per `runtime_id`.
+/// Each worker owns one nested `pi --mode rpc` process. A shared [`Bridge`]
+/// proxies Pi's tool calls to the operation backend injected by the host.
 pub struct PiRuntime {
-    managers: HashMap<String, Arc<InstanceManager>>,
     bridge: Arc<Bridge>,
     instances: RwLock<HashMap<String, Arc<PiInstance>>>,
     pi_session_root: PathBuf,
@@ -626,15 +615,6 @@ pub struct PiRuntime {
 }
 
 impl PiRuntime {
-    /// `managers` maps `backend_id` (the same string `ext.runtime_pi.backend_id`
-    /// on a start request must name) to the `InstanceManager` that should
-    /// provision sandboxes for it — e.g. `{"local": <InstanceManager over
-    /// LocalProvider>, "e2b": <InstanceManager over E2bProvider>}`. A
-    /// `backend_id` naming a manager not present here is rejected by
-    /// `start()` as `InvalidRequest` (see that method): there is no sandbox
-    /// implementation to route to, so silently falling back to some default
-    /// would hide a caller/config bug rather than surface it.
-    ///
     /// `pi_session_root` is where each started session's `--session-dir`
     /// subdirectory (named after its `runtime_id`) is created — see the
     /// field doc on [`PiRuntime::pi_session_root`].
@@ -642,27 +622,22 @@ impl PiRuntime {
     /// Binds the bridge's HTTP listener synchronously as part of
     /// construction (`Bridge::spawn`), hence the `std::io::Result` return —
     /// this is the one fallible step in bringing up a `PiRuntime`.
-    pub fn new(
-        managers: HashMap<String, Arc<InstanceManager>>,
-        pi_session_root: PathBuf,
-    ) -> std::io::Result<Self> {
+    pub fn new(pi_session_root: PathBuf) -> std::io::Result<Self> {
         let worker_executable = std::env::var_os(PI_WORKER_ENV)
             .map(PathBuf::from)
             .or_else(|| std::env::current_exe().ok())
             .unwrap_or_else(|| PathBuf::from("pi-worker"));
-        Self::new_with_worker(managers, pi_session_root, worker_executable)
+        Self::new_with_worker(pi_session_root, worker_executable)
     }
 
     /// Constructs a supervisor with an explicit worker binary. Integration
     /// tests use this to launch Cargo's standalone `pi-worker` artifact.
     pub fn new_with_worker(
-        managers: HashMap<String, Arc<InstanceManager>>,
         pi_session_root: PathBuf,
         worker_executable: PathBuf,
     ) -> std::io::Result<Self> {
         let bridge = Bridge::spawn()?;
         Ok(Self {
-            managers,
             bridge,
             instances: RwLock::new(HashMap::new()),
             pi_session_root,
@@ -690,6 +665,7 @@ impl PiRuntime {
     async fn prepare_cold_start(
         &self,
         request: &RuntimeStartRequest,
+        backend: Arc<dyn OperationBackend>,
     ) -> Result<PreparedStart, SessionDomainError> {
         let ext = read_pi_runtime_ext(&request.ext)?;
         let executable = ext
@@ -698,37 +674,6 @@ impl PiRuntime {
             .or_else(|| std::env::var(PI_EXECUTABLE_ENV).ok())
             .unwrap_or_else(|| DEFAULT_PI_EXECUTABLE.to_string());
         let extension_dir = resolve_extension_dir(&ext);
-
-        let manager = self.managers.get(&ext.backend_id).cloned().ok_or_else(|| {
-            SessionDomainError::InvalidRequest {
-                message: format!(
-                    "no InstanceManager configured for backend_id '{}'; this PiRuntime only \
-                     knows about: {:?}",
-                    ext.backend_id,
-                    self.managers.keys().collect::<Vec<_>>()
-                ),
-            }
-        })?;
-
-        // E2B sandboxes created by PI sessions keep internet access, exactly
-        // like `apps/runtime-mock`'s `MockRuntime::start` does
-        // (create-time-only knob); `PiSessionEnvironment` therefore reports
-        // `NetworkIsolation::None`, not a stronger claim. `LocalProvider` has
-        // no such option — local backends are host processes — so it is only
-        // sent for the e2b backend.
-        let mut provider_options = json!({ "workspace_root": request.workspace.root });
-        if ext.backend_id == E2B_BACKEND_ID {
-            provider_options["allow_internet_access"] = json!(true);
-        }
-        let backend: Arc<dyn OperationBackend> = manager
-            .start_instance(
-                request.runtime_id.clone(),
-                BackendId(ext.backend_id.clone()),
-                request.owner_ref.clone(),
-                provider_options,
-            )
-            .await
-            .map_err(map_provider_error)?;
 
         // Stashed verbatim into `PiPersistedState.workspace_metadata` (§1.1)
         // for a possible future explicit-rebuild path; Phase 1/2 only store
@@ -748,7 +693,6 @@ impl PiRuntime {
                 })?;
             let clone_target = backend.paths().workspace_root().clone();
             if let Err(error) = clone_git_workspace(backend.as_ref(), &git, &clone_target.0).await {
-                let _ = manager.stop_instance(&request.runtime_id).await;
                 return Err(error);
             }
         }
@@ -761,7 +705,6 @@ impl PiRuntime {
         // default no-flag behavior).
         let session_dir = self.pi_session_root.join(&request.runtime_id);
         if let Err(error) = tokio::fs::create_dir_all(&session_dir).await {
-            let _ = manager.stop_instance(&request.runtime_id).await;
             return Err(SessionDomainError::Unavailable {
                 message: format!(
                     "failed to create pi session directory {}: {error}",
@@ -779,14 +722,12 @@ impl PiRuntime {
         };
 
         Ok(PreparedStart {
-            manager,
             backend,
             executable,
             extension_dir,
             session_dir,
             resume_session_file: None,
             persisted_state,
-            destroy_sandbox_on_spawn_failure: true,
         })
     }
 
@@ -802,41 +743,11 @@ impl PiRuntime {
     /// up (see `PreparedStart::destroy_sandbox_on_spawn_failure`'s doc).
     async fn prepare_resume(
         &self,
-        request: &RuntimeStartRequest,
+        _request: &RuntimeStartRequest,
         opaque_state: &OpaqueRuntimeState,
+        backend: Arc<dyn OperationBackend>,
     ) -> Result<PreparedStart, SessionDomainError> {
         let state = PiPersistedState::from_opaque(opaque_state)?;
-
-        let manager = self
-            .managers
-            .get(&state.backend_id)
-            .cloned()
-            .ok_or_else(|| SessionDomainError::InvalidRequest {
-                message: format!(
-                    "no InstanceManager configured for backend_id '{}' from persisted state; \
-                     this PiRuntime only knows about: {:?}",
-                    state.backend_id,
-                    self.managers.keys().collect::<Vec<_>>()
-                ),
-            })?;
-
-        // Read-only lookup into the registry `InstanceManager::reconcile()`
-        // repopulated at startup (F7) — never provisions. `NotFound` here is
-        // exactly §1.4's "sandbox already dead" signal (e2b lease expired,
-        // or `reconcile()` itself decided the ledger row was orphaned).
-        let backend = manager
-            .backend_for(&request.runtime_id)
-            .map_err(|error| match error {
-                ProviderControlError::NotFound { .. } => SessionDomainError::Unavailable {
-                    message: format!(
-                        "pi_sandbox_gone: sandbox for runtime '{}' is no longer tracked by its \
-                         InstanceManager (likely reclaimed or expired since the last restart); \
-                         cannot resume — a fresh explicit open is required instead",
-                        request.runtime_id
-                    ),
-                },
-                other => map_provider_error(other),
-            })?;
 
         let executable = state
             .executable
@@ -857,62 +768,14 @@ impl PiRuntime {
             })?;
 
         Ok(PreparedStart {
-            manager,
             backend,
             executable,
             extension_dir,
             session_dir,
             resume_session_file: Some(resume_session_file),
             persisted_state: state,
-            destroy_sandbox_on_spawn_failure: false,
         })
     }
-}
-
-fn copy_dir<'a>(
-    src: &'a PathBuf,
-    dst: &'a PathBuf,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SessionDomainError>> + Send + 'a>>
-{
-    Box::pin(async move {
-        let mut entries =
-            tokio::fs::read_dir(src)
-                .await
-                .map_err(|e| SessionDomainError::Unavailable {
-                    message: format!("failed to read session directory: {e}"),
-                })?;
-        while let Some(entry) =
-            entries
-                .next_entry()
-                .await
-                .map_err(|e| SessionDomainError::Unavailable {
-                    message: e.to_string(),
-                })?
-        {
-            let target = dst.join(entry.file_name());
-            let ty = entry
-                .file_type()
-                .await
-                .map_err(|e| SessionDomainError::Unavailable {
-                    message: e.to_string(),
-                })?;
-            if ty.is_dir() {
-                tokio::fs::create_dir_all(&target).await.map_err(|e| {
-                    SessionDomainError::Unavailable {
-                        message: e.to_string(),
-                    }
-                })?;
-                copy_dir(&entry.path(), &target).await?;
-            } else {
-                tokio::fs::copy(entry.path(), target).await.map_err(|e| {
-                    SessionDomainError::Unavailable {
-                        message: e.to_string(),
-                    }
-                })?;
-            }
-        }
-        Ok(())
-    })
 }
 
 /// Everything `start()` needs to spawn `pi` and register the resulting
@@ -920,7 +783,6 @@ fn copy_dir<'a>(
 /// so the rest of `start()` — bridge registration, `Command` construction,
 /// bookkeeping — is shared between the two branches instead of duplicated.
 struct PreparedStart {
-    manager: Arc<InstanceManager>,
     backend: Arc<dyn OperationBackend>,
     executable: String,
     extension_dir: String,
@@ -929,11 +791,6 @@ struct PreparedStart {
     /// <path>` in addition to `--session-dir`. `None` on a cold start.
     resume_session_file: Option<PathBuf>,
     persisted_state: PiPersistedState,
-    /// Whether a spawn failure should tear down `backend`'s sandbox. `true`
-    /// for a cold start (this call is the sandbox's sole owner so far);
-    /// `false` for a resume (the sandbox predates this call and outlives a
-    /// `pi`-spawn failure — see `prepare_resume`'s doc).
-    destroy_sandbox_on_spawn_failure: bool,
 }
 
 async fn send_worker_request(
@@ -1082,37 +939,104 @@ async fn read_worker_turn(
 }
 
 #[async_trait]
-impl RuntimeAdapter for PiRuntime {
-    fn kind(&self) -> &str {
+impl AgentRuntime for PiRuntime {
+    fn runtime_kind(&self) -> &str {
         "pi"
     }
 
-    fn capabilities(&self) -> BTreeSet<SessionRuntimeCapability> {
-        let mut capabilities = BTreeSet::from([SessionRuntimeCapability::Interaction]);
-        capabilities.insert(SessionRuntimeCapability::ModelOverride);
-        if self.managers.contains_key(E2B_BACKEND_ID) {
-            capabilities.insert(SessionRuntimeCapability::Checkpoint);
-        }
-        capabilities
+    fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
+        BTreeSet::from([
+            RuntimeCapability::Interaction,
+            RuntimeCapability::ModelOverride,
+        ])
     }
 
-    fn capabilities_for_request(
+    fn capabilities_for_context(
         &self,
-        request: &session_protocol::SessionOpenRequest,
-    ) -> BTreeSet<SessionRuntimeCapability> {
-        let mut capabilities = self.capabilities();
-        let backend_id = request
-            .ext
-            .get(EXT_NAMESPACE)
-            .and_then(|value| value.get("backend_id"))
-            .and_then(Value::as_str);
-        if backend_id != Some(E2B_BACKEND_ID) {
-            capabilities.remove(&SessionRuntimeCapability::Checkpoint);
-        }
-        capabilities
+        _context: &RuntimeCapabilityContext,
+    ) -> BTreeSet<RuntimeCapability> {
+        self.capabilities()
     }
 
-    async fn start(&self, request: RuntimeStartRequest) -> Result<(), SessionDomainError> {
+    async fn start(
+        &self,
+        request: RuntimeStartRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        self.start_inner(request, context)
+            .await
+            .map_err(to_runtime_error)
+    }
+
+    async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        self.stop_inner(runtime_id).await.map_err(to_runtime_error)
+    }
+
+    async fn attach(
+        &self,
+        runtime_id: &str,
+        _context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        self.instance_for(runtime_id)
+            .await
+            .map(|_| ())
+            .map_err(to_runtime_error)
+    }
+
+    async fn check_alive(&self, runtime_id: &str) -> Result<bool, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        let alive = instance
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .map_err(|error| RuntimeError::WorkerUnavailable {
+                message: error.to_string(),
+                retryable: true,
+            })?
+            .is_none();
+        Ok(alive)
+    }
+
+    async fn submit_turn(
+        &self,
+        input: RuntimeTurnInput,
+    ) -> Result<RuntimeEventReceiver, RuntimeError> {
+        self.submit_turn_inner(input)
+            .await
+            .map_err(to_runtime_error)
+    }
+
+    async fn answer_interaction(&self, input: RuntimeInteractionInput) -> Result<(), RuntimeError> {
+        self.answer_interaction_inner(input)
+            .await
+            .map_err(to_runtime_error)
+    }
+
+    async fn cancel(&self, request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
+        self.cancel_inner(&request.runtime_id, request.turn_id.as_deref())
+            .await
+            .map_err(to_runtime_error)
+    }
+
+    async fn export_state(&self, runtime_id: &str) -> Result<OpaqueRuntimeState, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        Ok(instance.persisted_state.clone().into_opaque())
+    }
+}
+
+impl PiRuntime {
+    async fn start_inner(
+        &self,
+        request: RuntimeStartRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), SessionDomainError> {
         // Registry conflict check up front, shared by both branches — this
         // is what naturally prevents concurrent double-restoration (plan
         // §2 Phase 2 item 2: "先到者 insert，后到者 attach 命中").
@@ -1129,18 +1053,22 @@ impl RuntimeAdapter for PiRuntime {
         // sandbox. A malformed llm block must have no provider-side effects.
         let requested_llm = resolve_llm(request.llm.as_ref())?;
         let plan = match &request.state {
-            None => self.prepare_cold_start(&request).await?,
-            Some(state) => self.prepare_resume(&request, state).await?,
+            None => {
+                self.prepare_cold_start(&request, context.operation_backend)
+                    .await?
+            }
+            Some(state) => {
+                self.prepare_resume(&request, state, context.operation_backend)
+                    .await?
+            }
         };
         let PreparedStart {
-            manager,
             backend,
             executable,
             extension_dir,
             session_dir,
             resume_session_file,
             persisted_state,
-            destroy_sandbox_on_spawn_failure,
         } = plan;
         let llm = match requested_llm {
             Some(config) => Some(config),
@@ -1174,9 +1102,6 @@ impl RuntimeAdapter for PiRuntime {
                 Ok(parts) => parts,
                 Err(error) => {
                     self.bridge.unregister(&bridge_token);
-                    if destroy_sandbox_on_spawn_failure {
-                        let _ = manager.stop_instance(&request.runtime_id).await;
-                    }
                     return Err(error);
                 }
             };
@@ -1187,9 +1112,7 @@ impl RuntimeAdapter for PiRuntime {
             stdout: Mutex::new(stdout),
             current_turn: Mutex::new(None),
             bridge_token,
-            manager,
             persisted_state,
-            activity,
         });
 
         self.instances
@@ -1199,7 +1122,7 @@ impl RuntimeAdapter for PiRuntime {
         Ok(())
     }
 
-    async fn stop(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
+    async fn stop_inner(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
         let instance = {
             let mut registry = self.instances.write().await;
             registry.remove(runtime_id)
@@ -1221,198 +1144,10 @@ impl RuntimeAdapter for PiRuntime {
             let _ = child.wait().await;
         }
         self.bridge.unregister(&instance.bridge_token);
-        instance
-            .manager
-            .stop_instance(runtime_id)
-            .await
-            .map_err(map_provider_error)
-    }
-
-    async fn checkpoint(&self, runtime_id: &str) -> Result<CheckpointPayload, SessionDomainError> {
-        let instance = self.instance_for(runtime_id).await?;
-        let _freeze = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            instance.activity.write(),
-        )
-        .await
-        .map_err(|_| SessionDomainError::Unavailable {
-            message: "checkpoint freeze timed out".into(),
-        })?;
-        let snapshot = instance
-            .manager
-            .checkpoint_instance(runtime_id)
-            .await
-            .map_err(map_provider_error)?;
-        let checkpoint_id = format!("checkpoint-{}", Uuid::new_v4());
-        let archive_root = self
-            .pi_session_root
-            .parent()
-            .unwrap_or(&self.pi_session_root)
-            .join("pi-checkpoints");
-        let archive = archive_root.join(&checkpoint_id);
-        tokio::fs::create_dir_all(&archive)
-            .await
-            .map_err(|e| SessionDomainError::Unavailable {
-                message: format!("failed to create checkpoint archive: {e}"),
-            })?;
-        copy_dir(
-            &PathBuf::from(&instance.persisted_state.pi_session_dir),
-            &archive,
-        )
-        .await?;
-        let mut state = instance.persisted_state.clone();
-        state.pi_session_dir = archive.to_string_lossy().into_owned();
-        Ok(CheckpointPayload {
-            checkpoint_id,
-            runtime_state: state.into_opaque(),
-            provider_snapshot_id: snapshot.snapshot_id.0,
-        })
-    }
-
-    async fn load_from_checkpoint(
-        &self,
-        request: RuntimeLoadRequest,
-    ) -> Result<(), SessionDomainError> {
-        let state = PiPersistedState::from_opaque(&request.runtime_state)?;
-        let requested_llm = resolve_llm(request.llm.as_ref())?;
-        let manager = self
-            .managers
-            .get(&state.backend_id)
-            .cloned()
-            .ok_or_else(|| SessionDomainError::InvalidRequest {
-                message: format!("unknown backend_id '{}'", state.backend_id),
-            })?;
-        let provider_options = if state.backend_id == E2B_BACKEND_ID {
-            json!({"workspace_root": E2B_WORKSPACE_ROOT, "allow_internet_access": true})
-        } else {
-            json!({"workspace_root": E2B_WORKSPACE_ROOT})
-        };
-        let backend = manager
-            .load_instance_from_snapshot(
-                request.new_runtime_id.clone(),
-                BackendId(state.backend_id.clone()),
-                request.owner_ref,
-                provider_protocol::ProviderSnapshotId(request.provider_snapshot_id),
-                provider_options,
-            )
-            .await
-            .map_err(map_provider_error)?;
-        let session_dir = self.pi_session_root.join(&request.new_runtime_id);
-        tokio::fs::create_dir_all(&session_dir).await.map_err(|e| {
-            SessionDomainError::Unavailable {
-                message: e.to_string(),
-            }
-        })?;
-        copy_dir(&PathBuf::from(&state.pi_session_dir), &session_dir).await?;
-        let llm = match requested_llm {
-            Some(config) => Some(config),
-            None => load_llm_config(&session_dir).await?,
-        };
-        let executable = state
-            .executable
-            .clone()
-            .or_else(|| std::env::var(PI_EXECUTABLE_ENV).ok())
-            .unwrap_or_else(|| DEFAULT_PI_EXECUTABLE.to_string());
-        let extension_dir = state
-            .extension_dir
-            .clone()
-            .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string());
-        let token = Uuid::new_v4().to_string();
-        let activity = Arc::new(tokio::sync::RwLock::new(()));
-        let workspace_root = backend.paths().workspace_root().clone();
-        self.bridge.register(
-            token.clone(),
-            Arc::clone(&backend),
-            workspace_root.clone(),
-            Arc::clone(&activity),
-        );
-        let worker_config = worker::PiWorkerConfig {
-            runtime_id: request.new_runtime_id.clone(),
-            executable,
-            extension_dir,
-            session_dir: session_dir.clone(),
-            resume_session_file: session_file::latest_complete_turn_file(&session_dir).ok(),
-            bridge_url: self.bridge.base_url(),
-            bridge_token: token.clone(),
-            workspace_root: workspace_root.0.clone(),
-            use_workspace_cwd: state.backend_id == LOCAL_BACKEND_ID,
-            llm,
-        };
-        let (child, stdin, stdout) =
-            match worker::spawn_worker_process(&self.worker_executable, &worker_config).await {
-                Ok(parts) => parts,
-                Err(error) => {
-                    self.bridge.unregister(&token);
-                    let _ = manager.stop_instance(&request.new_runtime_id).await;
-                    return Err(error);
-                }
-            };
-        let instance = Arc::new(PiInstance {
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            stdout: Mutex::new(stdout),
-            current_turn: Mutex::new(None),
-            bridge_token: token,
-            manager,
-            persisted_state: PiPersistedState {
-                pi_session_dir: session_dir.to_string_lossy().into_owned(),
-                ..state
-            },
-            activity,
-        });
-        self.instances
-            .write()
-            .await
-            .insert(request.new_runtime_id, instance);
         Ok(())
     }
 
-    async fn delete_checkpoint(
-        &self,
-        runtime_state: OpaqueRuntimeState,
-        provider_snapshot_id: String,
-    ) -> Result<(), SessionDomainError> {
-        let state = PiPersistedState::from_opaque(&runtime_state)?;
-        let manager = self.managers.get(&state.backend_id).ok_or_else(|| {
-            SessionDomainError::InvalidRequest {
-                message: format!("unknown backend_id '{}'", state.backend_id),
-            }
-        })?;
-        manager
-            .delete_snapshot(
-                BackendId(state.backend_id),
-                provider_protocol::ProviderSnapshotId(provider_snapshot_id),
-            )
-            .await
-            .map_err(map_provider_error)?;
-        match tokio::fs::remove_dir_all(&state.pi_session_dir).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(SessionDomainError::Unavailable {
-                message: format!(
-                    "provider snapshot was deleted but checkpoint archive '{}' could not be removed: {error}",
-                    state.pi_session_dir
-                ),
-            }),
-        }
-    }
-
-    async fn attach(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
-        self.instance_for(runtime_id).await.map(|_| ())
-    }
-
-    async fn check_alive(&self, runtime_id: &str) -> Result<bool, SessionDomainError> {
-        let instance = self.instance_for(runtime_id).await?;
-        match instance.manager.inspect_instance(runtime_id).await {
-            Ok(_) => Ok(true),
-            // The registry still knows about this instance but the platform
-            // no longer does — confirmed reclaim, not a lookup miss.
-            Err(ProviderControlError::NotFound { .. }) => Ok(false),
-            Err(error) => Err(map_provider_error(error)),
-        }
-    }
-
-    async fn submit_turn(
+    async fn submit_turn_inner(
         &self,
         input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, SessionDomainError> {
@@ -1449,7 +1184,7 @@ impl RuntimeAdapter for PiRuntime {
         Ok(rx)
     }
 
-    async fn answer_interaction(
+    async fn answer_interaction_inner(
         &self,
         input: RuntimeInteractionInput,
     ) -> Result<(), SessionDomainError> {
@@ -1479,7 +1214,7 @@ impl RuntimeAdapter for PiRuntime {
         send_worker_request(&instance, WorkerRequest::AnswerInteraction(input)).await
     }
 
-    async fn cancel(
+    async fn cancel_inner(
         &self,
         runtime_id: &str,
         turn_id: Option<&str>,
@@ -1501,42 +1236,6 @@ impl RuntimeAdapter for PiRuntime {
             }),
         )
         .await
-    }
-
-    /// Returns the `PiPersistedState` snapshot taken when this `runtime_id`
-    /// was started (`docs/pi_session_restore_plan.md` §1.1), wrapped as an
-    /// opaque blob. This overrides the trait's fail-closed default
-    /// (`UnsupportedCapability`) — see [`PiPersistedState`]'s doc for why
-    /// this is a governor-internal reuse of the state-quarantine slot, not a
-    /// declaration of the (unrelated) checkpoint `StateExport` capability;
-    /// `capabilities()` above is deliberately unchanged.
-    async fn export_state(
-        &self,
-        runtime_id: &str,
-    ) -> Result<OpaqueRuntimeState, SessionDomainError> {
-        let instance = self.instance_for(runtime_id).await?;
-        Ok(instance.persisted_state.clone().into_opaque())
-    }
-
-    async fn cleanup_from_state(
-        &self,
-        runtime_id: &str,
-        state: &OpaqueRuntimeState,
-    ) -> Result<(), SessionDomainError> {
-        let persisted = PiPersistedState::from_opaque(state)?;
-        if let Some(manager) = self.managers.get(&persisted.backend_id) {
-            if let Err(error) = manager.destroy_by_runtime_id(runtime_id).await {
-                tracing::warn!(
-                    runtime_id,
-                    backend_id = %persisted.backend_id,
-                    %error,
-                    "cleanup_from_state: failed to destroy the sandbox (registry- and ledger-driven \
-                     paths both failed); it may be leaked and require manual cleanup"
-                );
-            }
-        }
-        let _ = tokio::fs::remove_dir_all(&persisted.pi_session_dir).await;
-        Ok(())
     }
 }
 

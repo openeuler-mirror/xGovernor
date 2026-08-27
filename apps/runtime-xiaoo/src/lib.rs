@@ -1,4 +1,5 @@
 use agent_contracts::tool::{DiscoveredTool, ToolRegistryBuilder, ToolSource};
+use agent_runtime_protocol::RuntimeEvent;
 use agent_types::common::ids::{AgentId, ToolName};
 use agent_types::context::TokenBudgetConfig;
 use agent_types::interaction::{InteractionRequest, InteractionResponse};
@@ -7,7 +8,6 @@ use agent_types::tool::{ToolRegistryConfig, ToolVisibilityConfig};
 use async_trait::async_trait;
 use compact::{build_context_manager, CompactionPolicy};
 use operation_protocol::capability::exec::ExecRequest;
-use provider_protocol::ProviderControlError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_protocol::{SessionToolActivityPhase, SessionToolActivityStatus, SessionUsage};
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use xgovernor_core::{
     enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
-    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, RuntimeEvent, SandboxCapability,
+    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, SandboxCapability,
     SecurityContext, SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess,
 };
 use xiaoo_api::events::{LoopEndSummary, LoopEventSink, ToolResultEvent};
@@ -220,20 +220,6 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
             }),
             lease: None,
         })
-    }
-}
-
-pub(crate) fn map_provider_error(error: ProviderControlError) -> SessionDomainError {
-    match error {
-        ProviderControlError::NotFound { resource_ref } => SessionDomainError::NotFound {
-            runtime_id: resource_ref,
-        },
-        ProviderControlError::InvalidRequest { message } => {
-            SessionDomainError::InvalidRequest { message }
-        }
-        other => SessionDomainError::Unavailable {
-            message: other.to_string(),
-        },
     }
 }
 
