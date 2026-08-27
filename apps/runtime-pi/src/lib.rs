@@ -19,6 +19,7 @@ use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use llm_client::ResolveInput;
 use session_protocol::{
     LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionUsage,
 };
@@ -186,6 +187,46 @@ fn resolve_llm(
     request: Option<&LlmOverrideRequest>,
 ) -> Result<Option<PiLlmConfig>, SessionDomainError> {
     request.map(PiLlmConfig::resolve).transpose()
+}
+
+/// Open-time LLM connectivity probe. Sends a minimal chat-completions
+/// request (max_tokens: 1) to verify the endpoint is reachable and the
+/// key/model are valid. Any failure aborts the session open before the
+/// sandbox is provisioned.
+async fn probe_llm_endpoint(
+    api_base: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> Result<(), SessionDomainError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| SessionDomainError::InvalidRequest {
+            message: format!("LLM probe: failed to build HTTP client: {e}"),
+        })?;
+    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+    let mut req = client.post(&url).json(&json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1
+    }));
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.map_err(|e| SessionDomainError::InvalidRequest {
+        message: format!("LLM probe to '{url}': {e}"),
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SessionDomainError::InvalidRequest {
+            message: format!(
+                "LLM probe to '{url}' returned {status}: {}",
+                body.chars().take(500).collect::<String>()
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn persist_llm_config(
@@ -966,6 +1007,30 @@ impl AgentRuntime for PiRuntime {
         self.start_inner(request, context)
             .await
             .map_err(to_runtime_error)
+    }
+
+    async fn probe_llm(&self, request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
+        let Some(override_req) = request.llm.as_ref() else {
+            return Ok(());
+        };
+        let config = PiLlmConfig::resolve(override_req).map_err(to_runtime_error)?;
+        let resolved = llm_client::resolve_config(ResolveInput {
+            provider: Some(config.provider.clone()),
+            api_key: config.api_key.clone(),
+            base_url: config.api_base.clone(),
+            ..Default::default()
+        })
+        .map_err(|e| RuntimeError::InvalidRequest {
+            code: "llm_config".into(),
+            message: e.to_string(),
+        })?;
+        probe_llm_endpoint(
+            &resolved.base_url,
+            resolved.api_key.as_deref(),
+            &config.model,
+        )
+        .await
+        .map_err(to_runtime_error)
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {

@@ -20,11 +20,12 @@ agent-runtime-protocol = { path = "../../crates/protocol/runtime" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }
+llm-client.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-reqwest.workspace = true
 
 [[bin]]
 name = "pi-worker"
