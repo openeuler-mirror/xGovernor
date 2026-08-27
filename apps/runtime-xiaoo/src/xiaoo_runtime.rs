@@ -254,10 +254,25 @@ impl XiaooRuntime {
                 });
             }
             let ext = read_ext(&request.ext)?;
-            let provider_options = json!({
+            let manager = self.manager_for(&ext.backend_id)?;
+            // `allow_internet_access` is an e2b-only provider option; the
+            // local provider rejects unknown fields, so only include it
+            // for e2b (mirrors apps/runtime-pi/src/lib.rs::prepare_cold_start).
+            let mut provider_options = json!({
                 "workspace_root": request.workspace.root,
-                "allow_internet_access": ext.backend_id == E2B_BACKEND_ID,
             });
+            if ext.backend_id == E2B_BACKEND_ID {
+                provider_options["allow_internet_access"] = json!(true);
+            }
+            let backend = manager
+                .start_instance(
+                    request.runtime_id.clone(),
+                    BackendId(ext.backend_id.clone()),
+                    request.owner_ref.clone(),
+                    provider_options.clone(),
+                )
+                .await
+                .map_err(map_provider_error)?;
             if request.workspace.metadata != Value::Null {
                 if let Err(error) = clone_git_workspace(
                     backend.as_ref(),
