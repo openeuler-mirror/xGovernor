@@ -51,6 +51,14 @@ pub trait AgentRuntime: Send + Sync {
     ) -> Result<(), RuntimeError>;
     async fn cancel(&self, request: RuntimeCancelRequest) -> Result<(), RuntimeError>;
 
+    /// Open-time LLM connectivity probe. Called **before** the sandbox is
+    /// provisioned, so a failure aborts the session open without any
+    /// runtime-side side effects. The default is a no-op for runtimes that
+    /// do not configure an LLM endpoint.
+    async fn probe_llm(&self, _request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     async fn export_state(&self, _runtime_id: &str) -> Result<RuntimeStateSnapshot, RuntimeError> {
         Err(RuntimeError::UnsupportedCapability {
             capability: "state_export".into(),

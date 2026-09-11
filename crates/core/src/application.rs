@@ -661,6 +661,26 @@ impl SessionApplication {
                 })?;
         }
 
+        // LLM connectivity probe: abort the session open *before* the sandbox
+        // is provisioned so a misconfigured endpoint (wrong URL, bad key,
+        // unreachable host, unknown model) surfaces as an immediate error
+        // rather than a silent failure mid-turn.
+        let start_request = RuntimeStartRequest {
+            runtime_id: runtime_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            sender_id: request.sender_id.clone(),
+            workspace: normalized.workspace.clone(),
+            state: None,
+            llm: request.llm.clone(),
+            ext: request.ext.clone(),
+        };
+        if let Err(error) = runtime.probe_llm(&start_request).await.map_err(map_runtime_error) {
+            if let Some(tenant_id) = &tenant_id_for_quota {
+                self.release_tenant_session(tenant_id);
+            }
+            return Err(error);
+        }
+
         let now = self.clock.now_ms();
         let (provider_id, manager) = provider_for_request(registration, &request)?;
         let backend = match manager
@@ -683,15 +703,7 @@ impl SessionApplication {
         };
         if let Err(error) = runtime
             .start(
-                RuntimeStartRequest {
-                    runtime_id: runtime_id.clone(),
-                    conversation_id: request.conversation_id.clone(),
-                    sender_id: request.sender_id.clone(),
-                    workspace: normalized.workspace.clone(),
-                    state: None,
-                    llm: request.llm.clone(),
-                    ext: request.ext.clone(),
-                },
+                start_request,
                 RuntimeExecutionContext {
                     operation_backend: backend,
                 },

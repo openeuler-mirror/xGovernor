@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{CapabilityFamily, OpaqueRuntimeState, SessionDomainError};
 use xgovernor_runtime_pi::bridge::Bridge;
+use xiaoo_api::llm::{resolve_config, ResolveInput};
 use xiaoo_api::runtime::RuntimeState;
 
 use crate::xiaoo_backend::{spawn_worker_process, PersistedLlm, WorkerConfig};
@@ -147,6 +148,30 @@ impl AgentRuntime for XiaooRuntime {
         self.start_inner(request, context)
             .await
             .map_err(to_runtime_error)
+    }
+
+    async fn probe_llm(&self, request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
+        let ext = read_ext(&request.ext).map_err(to_runtime_error)?;
+        let resolved = resolve_config(ResolveInput {
+            provider: Some(ext.provider.clone()),
+            api_key_env: Some(ext.api_key_env.clone()),
+            base_url: ext.api_base.clone(),
+            ..Default::default()
+        })
+        .map_err(|e| RuntimeError::InvalidRequest {
+            code: "llm_config".into(),
+            message: e.to_string(),
+        })?;
+        let api_key = std::env::var(&ext.api_key_env)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        probe_llm_endpoint(
+            &resolved.base_url,
+            api_key.as_deref(),
+            &ext.model,
+        )
+        .await
+        .map_err(to_runtime_error)
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
@@ -525,6 +550,46 @@ impl XiaooRuntime {
         *instance.persisted.lock().await = persisted;
         Ok(())
     }
+}
+
+/// Open-time LLM connectivity probe. Sends a minimal chat-completions
+/// request (max_tokens: 1) to verify the endpoint is reachable and the
+/// key/model are valid. Any failure aborts the session open before the
+/// sandbox is provisioned.
+async fn probe_llm_endpoint(
+    api_base: &str,
+    api_key: Option<&str>,
+    model: &str,
+) -> Result<(), SessionDomainError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| SessionDomainError::InvalidRequest {
+            message: format!("LLM probe: failed to build HTTP client: {e}"),
+        })?;
+    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1
+    }));
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    let resp = req.send().await.map_err(|e| SessionDomainError::InvalidRequest {
+        message: format!("LLM probe to '{url}': {e}"),
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SessionDomainError::InvalidRequest {
+            message: format!(
+                "LLM probe to '{url}' returned {status}: {}",
+                body.chars().take(500).collect::<String>()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn to_runtime_error(error: SessionDomainError) -> RuntimeError {

@@ -3397,6 +3397,7 @@ dependencies = [
  "axum",
  "backend",
  "base64",
+ "llm-client",
  "operation-protocol",
  "provider-protocol",
  "reqwest",
