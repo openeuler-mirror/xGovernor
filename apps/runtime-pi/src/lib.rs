@@ -15,11 +15,11 @@ use agent_runtime_protocol::{
 };
 use async_trait::async_trait;
 use bridge::Bridge;
+use llm_client::ResolveInput;
 use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use llm_client::ResolveInput;
 use session_protocol::{
     LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionUsage,
 };
@@ -76,6 +76,65 @@ struct PiRuntimeExt {
     /// [`resolve_extension_dir`].
     #[serde(default)]
     extension_dir: Option<String>,
+    #[serde(flatten)]
+    role: PiRoleConfig,
+}
+
+/// Per-session defaults and per-turn overrides. Persisted separately from Pi history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct PiRoleConfig {
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+    #[serde(default)]
+    tools_enabled: Option<bool>,
+}
+const PI_ROLE_FILE: &str = "xgovernor-role.json";
+impl PiRoleConfig {
+    fn validate(&self) -> Result<(), SessionDomainError> {
+        if self.max_turns == Some(0) {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "max_turns must be positive".into(),
+            });
+        }
+        Ok(())
+    }
+    fn merge(&mut self, next: Self) {
+        if next.system_prompt.is_some() {
+            self.system_prompt = next.system_prompt;
+        }
+        if next.max_turns.is_some() {
+            self.max_turns = next.max_turns;
+        }
+        if next.tools_enabled.is_some() {
+            self.tools_enabled = next.tools_enabled;
+        }
+    }
+}
+async fn read_role(dir: &std::path::Path) -> Result<PiRoleConfig, SessionDomainError> {
+    match tokio::fs::read(dir.join(PI_ROLE_FILE)).await {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| SessionDomainError::InvalidRequest {
+                message: format!("invalid Pi role state: {e}"),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PiRoleConfig::default()),
+        Err(e) => Err(SessionDomainError::Unavailable {
+            message: e.to_string(),
+        }),
+    }
+}
+async fn write_role(dir: &std::path::Path, role: &PiRoleConfig) -> Result<(), SessionDomainError> {
+    role.validate()?;
+    tokio::fs::write(
+        dir.join(PI_ROLE_FILE),
+        serde_json::to_vec(role).expect("role is serializable"),
+    )
+    .await
+    .map_err(|e| SessionDomainError::Unavailable {
+        message: e.to_string(),
+    })
 }
 
 /// Default location of the bundled Pi extension, resolved at compile time
@@ -213,9 +272,12 @@ async fn probe_llm_endpoint(
     if let Some(key) = api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = req.send().await.map_err(|e| SessionDomainError::InvalidRequest {
-        message: format!("LLM probe to '{url}': {e}"),
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SessionDomainError::InvalidRequest {
+            message: format!("LLM probe to '{url}': {e}"),
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -344,18 +406,31 @@ struct PiPersistedState {
     /// Absolute path of the per-`runtime_id` `--session-dir` this instance's
     /// `pi` process was (or, on restore, will be) spawned with.
     pi_session_dir: String,
+    #[serde(default)]
+    runtime_id: Option<String>,
     /// The `WorkspaceFacts.metadata` blob this session opened with (e.g. git
     /// clone parameters), stashed verbatim for a future explicit-rebuild path
     /// (`docs/pi_session_restore_plan.md` §4.3 / risk #3). Phase 1 only
     /// stores this; nothing reads it back yet.
     #[serde(default)]
     workspace_metadata: Value,
+    /// Embedded immutable history only for checkpoint exports; never a live path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<PiCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PiCheckpoint {
+    session_jsonl: Option<String>,
+    llm_config_ref: Option<String>,
+    llm_config: Option<PiLlmConfig>,
+    role: PiRoleConfig,
 }
 
 /// Bump whenever [`PiPersistedState`]'s shape changes. `from_opaque` fails
 /// closed on any version it doesn't recognize (`docs/pi_session_restore_plan.md`
 /// §1.1) rather than guessing at a shape it was never told about.
-const PI_PERSISTED_STATE_SCHEMA_VERSION: u32 = 1;
+const PI_PERSISTED_STATE_SCHEMA_VERSION: u32 = 2;
 
 impl PiPersistedState {
     fn into_opaque(self) -> OpaqueRuntimeState {
@@ -378,7 +453,8 @@ impl PiPersistedState {
                 source: None,
             });
         }
-        if opaque.schema_version != PI_PERSISTED_STATE_SCHEMA_VERSION {
+        if opaque.schema_version != 1 && opaque.schema_version != PI_PERSISTED_STATE_SCHEMA_VERSION
+        {
             return Err(SessionDomainError::Internal {
                 message: format!(
                     "PiRuntime does not recognize persisted state schema_version {} (expected \
@@ -407,6 +483,7 @@ fn read_pi_runtime_ext(ext: &SessionExtensions) -> Result<PiRuntimeExt, SessionD
             message: format!("invalid '{EXT_NAMESPACE}' ext payload: {error}"),
         }
     })?;
+    parsed.role.validate()?;
     if parsed.backend_id.trim().is_empty() {
         return Err(SessionDomainError::InvalidRequest {
             message: format!("'{EXT_NAMESPACE}.backend_id' must not be empty"),
@@ -754,12 +831,15 @@ impl PiRuntime {
             });
         }
 
+        write_role(&session_dir, &ext.role).await?;
         let persisted_state = PiPersistedState {
             backend_id: ext.backend_id.clone(),
             executable: ext.executable.clone(),
             extension_dir: ext.extension_dir.clone(),
             pi_session_dir: session_dir.to_string_lossy().into_owned(),
+            runtime_id: Some(request.runtime_id.clone()),
             workspace_metadata: workspace_metadata_snapshot,
+            checkpoint: None,
         };
 
         Ok(PreparedStart {
@@ -784,11 +864,11 @@ impl PiRuntime {
     /// up (see `PreparedStart::destroy_sandbox_on_spawn_failure`'s doc).
     async fn prepare_resume(
         &self,
-        _request: &RuntimeStartRequest,
+        request: &RuntimeStartRequest,
         opaque_state: &OpaqueRuntimeState,
         backend: Arc<dyn OperationBackend>,
     ) -> Result<PreparedStart, SessionDomainError> {
-        let state = PiPersistedState::from_opaque(opaque_state)?;
+        let mut state = PiPersistedState::from_opaque(opaque_state)?;
 
         let executable = state
             .executable
@@ -800,20 +880,95 @@ impl PiRuntime {
             .clone()
             .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string());
 
-        let session_dir = PathBuf::from(&state.pi_session_dir);
-        let resume_session_file =
-            session_file::latest_complete_turn_file(&session_dir).map_err(|error| {
-                SessionDomainError::Unavailable {
-                    message: format!("pi_session_state_lost: {error}"),
+        let (session_dir, resume_session_file) = if let Some(snapshot) = state.checkpoint.take() {
+            // A unique directory for each load/fork: neither parent writes nor sibling
+            // resumes can alter this branch's history, even after the source closes.
+            let dir = self
+                .pi_session_root
+                .join(format!("branch-{}", Uuid::new_v4()));
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| SessionDomainError::Unavailable {
+                    message: e.to_string(),
+                })?;
+            let result = async {
+                let history = if let Some(jsonl) = snapshot.session_jsonl {
+                    let path = dir.join("session.jsonl");
+                    tokio::fs::write(&path, jsonl).await.map_err(|e| {
+                        SessionDomainError::Unavailable {
+                            message: e.to_string(),
+                        }
+                    })?;
+                    Some(path)
+                } else {
+                    None
+                };
+                if let Some(reference) = snapshot.llm_config_ref.as_ref() {
+                    let path = self.checkpoint_credential_path(reference)?;
+                    let bytes = tokio::fs::read(path).await.map_err(|e| {
+                        SessionDomainError::Unavailable {
+                            message: format!("checkpoint credential unavailable: {e}"),
+                        }
+                    })?;
+                    let config: PiLlmConfig = serde_json::from_slice(&bytes).map_err(|e| {
+                        SessionDomainError::InvalidRequest {
+                            message: e.to_string(),
+                        }
+                    })?;
+                    persist_llm_config(&dir, &config).await?;
                 }
-            })?;
+                if let Some(mut config) = snapshot.llm_config {
+                    if let Some(name) = config.credential_source.strip_prefix("env:") {
+                        config.api_key = Some(std::env::var(name).map_err(|_| {
+                            SessionDomainError::InvalidRequest {
+                                message: format!(
+                                    "checkpoint requires environment credential {name}"
+                                ),
+                            }
+                        })?);
+                    }
+                    persist_llm_config(&dir, &config).await?;
+                }
+                write_role(&dir, &snapshot.role).await?;
+                Ok::<_, SessionDomainError>(history)
+            }
+            .await;
+            match result {
+                Ok(history) => (dir, history),
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(dir).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            let dir = PathBuf::from(&state.pi_session_dir);
+            let owner = state
+                .runtime_id
+                .as_deref()
+                .or_else(|| dir.file_name().and_then(|v| v.to_str()));
+            if owner != Some(request.runtime_id.as_str()) {
+                return Err(SessionDomainError::InvalidRequest {message:"legacy Pi state is a live session reference, not an immutable branch checkpoint; create a new checkpoint first".into()});
+            }
+            let history = match session_file::latest_complete_turn_file(&dir) {
+                Ok(path) => Some(path),
+                Err(session_file::SessionFileError::NoSessionFiles(_)) => None,
+                Err(error) => {
+                    return Err(SessionDomainError::Unavailable {
+                        message: format!("pi_session_state_lost: {error}"),
+                    })
+                }
+            };
+            (dir, history)
+        };
+        state.pi_session_dir = session_dir.to_string_lossy().into_owned();
+        state.runtime_id = Some(request.runtime_id.clone());
 
         Ok(PreparedStart {
             backend,
             executable,
             extension_dir,
             session_dir,
-            resume_session_file: Some(resume_session_file),
+            resume_session_file,
             persisted_state: state,
         })
     }
@@ -962,6 +1117,15 @@ async fn read_worker_turn(
                 }
             }
             terminal_sent = event.is_terminal();
+            if terminal_sent {
+                let mut current = instance.current_turn.lock().await;
+                if current
+                    .as_ref()
+                    .is_some_and(|value| value.turn_id == turn_id)
+                {
+                    current.take();
+                }
+            }
             let _ = output.send(event).await;
         }
 
@@ -1094,9 +1258,134 @@ impl AgentRuntime for PiRuntime {
             .map_err(to_runtime_error)?;
         Ok(instance.persisted_state.clone().into_opaque())
     }
+
+    async fn export_checkpoint_state(
+        &self,
+        runtime_id: &str,
+    ) -> Result<OpaqueRuntimeState, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        if instance.current_turn.lock().await.is_some() {
+            return Err(RuntimeError::Conflict {
+                code: "active_turn".into(),
+                message: "cannot checkpoint an active Pi turn".into(),
+            });
+        }
+        let mut state = instance.persisted_state.clone();
+        let dir = PathBuf::from(&state.pi_session_dir);
+        let session_jsonl =
+            match session_file::latest_complete_turn_file(&dir) {
+                Ok(path) => Some(tokio::fs::read_to_string(path).await.map_err(|e| {
+                    RuntimeError::Internal {
+                        message: e.to_string(),
+                    }
+                })?),
+                Err(session_file::SessionFileError::NoSessionFiles(_)) => None,
+                Err(error) => {
+                    return Err(RuntimeError::StateCorrupt {
+                        message: format!("cannot checkpoint Pi history: {error}"),
+                    })
+                }
+            };
+        let role = read_role(&dir).await.map_err(to_runtime_error)?;
+        let mut llm_config = load_llm_config(&dir).await.map_err(to_runtime_error)?;
+        if let Some(config) = llm_config.as_mut() {
+            if config.credential_source.starts_with("env:") {
+                config.api_key = None;
+            }
+        }
+        let llm_config_ref = if let Some(config) = llm_config
+            .as_ref()
+            .filter(|config| config.api_key.is_some())
+        {
+            // Keep credentials out of opaque state/SQLite. The immutable private
+            // sidecar survives source-session cleanup and is deleted with the checkpoint.
+            let credential_dir = self.pi_session_root.join(".checkpoint-credentials");
+            std::fs::create_dir_all(&credential_dir).map_err(|e| RuntimeError::Internal {
+                message: e.to_string(),
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&credential_dir, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| RuntimeError::Internal {
+                    message: e.to_string(),
+                })?;
+            }
+            let id = format!("{}.json", Uuid::new_v4());
+            let path = credential_dir.join(&id);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).map_err(|e| RuntimeError::Internal {
+                message: e.to_string(),
+            })?;
+            use std::io::Write;
+            file.write_all(&serde_json::to_vec(&config).expect("LLM config serializes"))
+                .map_err(|e| RuntimeError::Internal {
+                    message: e.to_string(),
+                })?;
+            Some(id)
+        } else {
+            None
+        };
+        if llm_config_ref.is_some() {
+            llm_config = None;
+        }
+        state.checkpoint = Some(PiCheckpoint {
+            session_jsonl,
+            llm_config_ref,
+            llm_config,
+            role,
+        });
+        Ok(state.into_opaque())
+    }
+
+    async fn delete_checkpoint_state(
+        &self,
+        opaque: &OpaqueRuntimeState,
+    ) -> Result<(), RuntimeError> {
+        let state = PiPersistedState::from_opaque(opaque).map_err(to_runtime_error)?;
+        if let Some(reference) = state
+            .checkpoint
+            .and_then(|snapshot| snapshot.llm_config_ref)
+        {
+            let path = self
+                .checkpoint_credential_path(&reference)
+                .map_err(to_runtime_error)?;
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(RuntimeError::Internal {
+                        message: e.to_string(),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PiRuntime {
+    fn checkpoint_credential_path(&self, reference: &str) -> Result<PathBuf, SessionDomainError> {
+        if reference.contains('/') || reference.contains('\\') || !reference.ends_with(".json") {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "invalid checkpoint credential reference".into(),
+            });
+        }
+        Ok(self
+            .pi_session_root
+            .join(".checkpoint-credentials")
+            .join(reference))
+    }
+
     async fn start_inner(
         &self,
         request: RuntimeStartRequest,
@@ -1117,6 +1406,10 @@ impl PiRuntime {
         // Validate request-supplied model configuration before provisioning a
         // sandbox. A malformed llm block must have no provider-side effects.
         let requested_llm = resolve_llm(request.llm.as_ref())?;
+        let created_branch = request
+            .state
+            .as_ref()
+            .is_some_and(|state| state.state.get("checkpoint").is_some_and(|v| !v.is_null()));
         let plan = match &request.state {
             None => {
                 self.prepare_cold_start(&request, context.operation_backend)
@@ -1167,6 +1460,9 @@ impl PiRuntime {
                 Ok(parts) => parts,
                 Err(error) => {
                     self.bridge.unregister(&bridge_token);
+                    if created_branch {
+                        let _ = tokio::fs::remove_dir_all(&session_dir).await;
+                    }
                     return Err(error);
                 }
             };
@@ -1219,6 +1515,14 @@ impl PiRuntime {
         // Keep malformed model overrides as synchronous API errors. The
         // worker performs the actual Pi model reconfiguration.
         resolve_llm(input.llm.as_ref())?;
+        if let Some(value) = input.ext.get(EXT_NAMESPACE) {
+            let role: PiRoleConfig = serde_json::from_value(value.clone()).map_err(|e| {
+                SessionDomainError::InvalidRequest {
+                    message: e.to_string(),
+                }
+            })?;
+            role.validate()?;
+        }
         let instance = self.instance_for(&input.runtime_id).await?;
         let (tx, rx) = mpsc::channel(32);
 
@@ -1470,7 +1774,9 @@ mod tests {
             executable: Some("/opt/homebrew/bin/pi".to_string()),
             extension_dir: None,
             pi_session_dir: "/tmp/xgovernor-test/pi-sessions/runtime-1".to_string(),
+            runtime_id: Some("runtime-1".into()),
             workspace_metadata: Value::Null,
+            checkpoint: None,
         }
     }
 

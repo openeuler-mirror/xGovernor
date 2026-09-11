@@ -1,6 +1,6 @@
 use super::{
-    configure_pi_launch, extract_usage, map_answer_to_pi_value, resolve_llm, PiLlmConfig,
-    DIALOG_METHODS,
+    configure_pi_launch, extract_usage, map_answer_to_pi_value, read_role, resolve_llm, write_role,
+    PiLlmConfig, PiRoleConfig, DIALOG_METHODS, EXT_NAMESPACE, PI_ROLE_FILE,
 };
 use agent_runtime_protocol::{
     decode_worker_request, encode_worker_response, RuntimeError, RuntimeEvent, RuntimeFailure,
@@ -209,7 +209,11 @@ async fn spawn_native_pi(
         .arg(&config.session_dir)
         .env("XGOVERNOR_BRIDGE_URL", &config.bridge_url)
         .env("XGOVERNOR_BRIDGE_TOKEN", &config.bridge_token)
-        .env("XGOVERNOR_WORKSPACE_ROOT", &config.workspace_root);
+        .env("XGOVERNOR_WORKSPACE_ROOT", &config.workspace_root)
+        .env(
+            "XGOVERNOR_PI_ROLE_FILE",
+            config.session_dir.join(PI_ROLE_FILE),
+        );
     if config.use_workspace_cwd {
         command.current_dir(&config.workspace_root);
     }
@@ -265,6 +269,31 @@ async fn handle_worker_request(
 
     match request {
         WorkerRequest::SubmitTurn(request) => {
+            if let Some(value) = request.ext.get(EXT_NAMESPACE) {
+                let next: PiRoleConfig = serde_json::from_value(value.clone()).map_err(|e| {
+                    RuntimeError::InvalidRequest {
+                        code: "pi_role_configuration".into(),
+                        message: e.to_string(),
+                    }
+                })?;
+                next.validate().map_err(|e| RuntimeError::InvalidRequest {
+                    code: "pi_role_configuration".into(),
+                    message: e.to_string(),
+                })?;
+                let mut role = read_role(&native.session_dir).await.map_err(|e| {
+                    RuntimeError::WorkerUnavailable {
+                        message: e.to_string(),
+                        retryable: true,
+                    }
+                })?;
+                role.merge(next);
+                write_role(&native.session_dir, &role).await.map_err(|e| {
+                    RuntimeError::WorkerUnavailable {
+                        message: e.to_string(),
+                        retryable: true,
+                    }
+                })?;
+            }
             if let Some(llm) = request.llm.as_ref() {
                 if let Some(config) =
                     resolve_llm(Some(llm)).map_err(|error| RuntimeError::InvalidRequest {
