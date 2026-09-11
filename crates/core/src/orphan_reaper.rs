@@ -80,15 +80,6 @@ async fn reap_one_record_with_threshold(
     }
 }
 
-#[cfg(test)]
-async fn reap_one_record(
-    app: &SessionApplication,
-    lease_table: &SessionLeaseTable,
-    session_id: &str,
-) -> ReapOutcome {
-    reap_one_record_with_threshold(app, lease_table, session_id, ORPHAN_SESSION_THRESHOLD_MS).await
-}
-
 /// Sweep every entry currently in `lease_table`, force-closing the ones past
 /// `ORPHAN_SESSION_THRESHOLD_MS`. Split out from [`spawn_orphan_reaper`] so a
 /// test can drive exactly one sweep synchronously instead of waiting on
@@ -129,11 +120,6 @@ async fn sweep_once_with_config(
             ),
         }
     }
-}
-
-#[cfg(test)]
-async fn sweep_once(app: &SessionApplication, lease_table: &SessionLeaseTable) {
-    sweep_once_with_config(app, lease_table, OrphanReaperConfig::default()).await;
 }
 
 /// Spawn a background task that calls [`sweep_once`] every `REAPER_INTERVAL`

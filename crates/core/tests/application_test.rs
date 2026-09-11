@@ -2551,3 +2551,181 @@ async fn close_emits_an_audit_event_using_the_caller_supplied_runtime_id() {
     assert!(event.contains("runtime_id=runtime-fixed"), "{event}");
     assert!(event.contains("result=ok"), "{event}");
 }
+
+#[tokio::test]
+async fn external_operations_roundtrip_bytes_and_enforce_identity_lease_and_capabilities() {
+    use base64::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let providers = test_provider_managers();
+    providers["local"]
+        .start_instance(
+            "runtime-1".into(),
+            provider_protocol::BackendId("local".into()),
+            "test".into(),
+            serde_json::json!({"workspace_root":dir.path()}),
+        )
+        .await
+        .unwrap();
+    let mut record = test_record();
+    record.tenant_id = Some("tenant-a".into());
+    record.capabilities.sandbox = [
+        SandboxCapability::Exec,
+        SandboxCapability::FileRead,
+        SandboxCapability::FileWrite,
+    ]
+    .into_iter()
+    .collect();
+    let repository = Arc::new(MemoryRepository(Mutex::new(Some(record))));
+    let leases = Arc::new(SessionLeaseTable::new());
+    leases.acquire("runtime-1", "owner", None, None).await;
+    let app = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        providers,
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    )
+    .with_lease_table(leases);
+    let lease = SessionLeaseClaim {
+        client_id: Some("owner".into()),
+        ..Default::default()
+    };
+    let write = SessionFileWriteRequest {
+        runtime_id: "runtime-1".into(),
+        path: "nested/data.bin".into(),
+        content_base64: base64::engine::general_purpose::STANDARD.encode([0, 1, 255, 128]),
+        create_parents: true,
+        lease: lease.clone(),
+    };
+    assert!(matches!(
+        app.write_file(&SecurityContext::tenant("tenant-b", "other"), write.clone())
+            .await,
+        Err(SessionDomainError::NotFound { .. })
+    ));
+    let mut wrong = write.clone();
+    wrong.lease.client_id = Some("intruder".into());
+    assert!(matches!(
+        app.write_file(&tenant_ctx(), wrong).await,
+        Err(SessionDomainError::LeaseConflict { .. })
+    ));
+    let result = app.write_file(&tenant_ctx(), write.clone()).await.unwrap();
+    assert_eq!(result.bytes_written, 4);
+    let read = app
+        .read_file(
+            &tenant_ctx(),
+            SessionFileReadRequest {
+                runtime_id: "runtime-1".into(),
+                path: write.path.clone(),
+                lease: lease.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.content_base64, write.content_base64);
+    let output = app
+        .exec(
+            &tenant_ctx(),
+            SessionExecRequest {
+                runtime_id: "runtime-1".into(),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf hello; printf error >&2; exit 7".into(),
+                ],
+                cwd: None,
+                env: Default::default(),
+                timeout_ms: Some(1000),
+                lease: lease.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, "hello");
+    assert_eq!(output.stderr, "error");
+    assert_eq!(output.exit_code, Some(7));
+    let mut invalid = write.clone();
+    invalid.content_base64 = "!!!".into();
+    assert!(matches!(
+        app.write_file(&tenant_ctx(), invalid).await,
+        Err(SessionDomainError::InvalidRequest { .. })
+    ));
+    app.write_file(&tenant_ctx(), write.clone()).await.unwrap(); // error released the operation claim
+    repository
+        .0
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .capabilities
+        .sandbox
+        .remove(&SandboxCapability::FileWrite);
+    assert!(matches!(
+        app.write_file(&tenant_ctx(), write).await,
+        Err(SessionDomainError::UnsupportedCapability { .. })
+    ));
+}
+
+#[tokio::test]
+async fn active_turn_blocks_external_operations_and_checkpoint() {
+    let mut record = test_record();
+    record.capabilities.sandbox = [SandboxCapability::FileWrite, SandboxCapability::Snapshot]
+        .into_iter()
+        .collect();
+    record
+        .capabilities
+        .runtime
+        .insert(RuntimeCapability::Checkpoint);
+    let runtime = Arc::new(HoldingRuntime {
+        turn_sender: Mutex::new(None),
+    });
+    let app = SessionApplication::new(
+        runtime,
+        test_provider_managers(),
+        Arc::new(MemoryRepository(Mutex::new(Some(record)))),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    app.submit_turn(
+        &admin_ctx(),
+        SessionTurnRequest {
+            runtime_id: "runtime-1".into(),
+            text: "hold".into(),
+            entry: Default::default(),
+            llm: None,
+            reasoning_effort: None,
+            client_request_id: None,
+            ext: Default::default(),
+            lease: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let write = SessionFileWriteRequest {
+        runtime_id: "runtime-1".into(),
+        path: "file".into(),
+        content_base64: "".into(),
+        create_parents: false,
+        lease: Default::default(),
+    };
+    assert!(matches!(
+        app.write_file(&admin_ctx(), write).await,
+        Err(SessionDomainError::Conflict { .. })
+    ));
+    assert!(matches!(
+        app.checkpoint(
+            &admin_ctx(),
+            SessionCheckpointRequest {
+                runtime_id: "runtime-1".into(),
+                name: None,
+                requested_scope: None,
+                lease: Default::default()
+            }
+        )
+        .await,
+        Err(SessionDomainError::Conflict { .. })
+    ));
+}

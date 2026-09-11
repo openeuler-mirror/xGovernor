@@ -69,16 +69,6 @@ impl SessionHttpState {
             }
         })
     }
-
-    #[cfg(test)]
-    async fn pending_stream_count(&self) -> usize {
-        self.streams
-            .lock()
-            .await
-            .values()
-            .map(|turns| turns.len())
-            .sum()
-    }
 }
 
 async fn register_stream(
