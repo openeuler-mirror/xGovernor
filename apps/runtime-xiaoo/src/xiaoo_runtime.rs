@@ -165,13 +165,9 @@ impl AgentRuntime for XiaooRuntime {
         let api_key = std::env::var(&ext.api_key_env)
             .ok()
             .filter(|v| !v.trim().is_empty());
-        probe_llm_endpoint(
-            &resolved.base_url,
-            api_key.as_deref(),
-            &ext.model,
-        )
-        .await
-        .map_err(to_runtime_error)
+        probe_llm_endpoint(&resolved.base_url, api_key.as_deref(), &ext.model)
+            .await
+            .map_err(to_runtime_error)
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
@@ -278,6 +274,7 @@ impl XiaooRuntime {
                 });
             }
             let ext = read_ext(&request.ext)?;
+            let role_settings = ext.role_settings()?;
             // `allow_internet_access` is an e2b-only provider option; the
             // local provider rejects unknown fields, so only include it
             // for e2b (mirrors apps/runtime-pi/src/lib.rs::prepare_cold_start).
@@ -310,6 +307,7 @@ impl XiaooRuntime {
                     api_base: ext.api_base,
                 },
                 loop_state: RuntimeState::new(request.conversation_id).to_snapshot(),
+                role_settings,
             };
             persisted
         };
@@ -324,6 +322,7 @@ impl XiaooRuntime {
         let config = WorkerConfig {
             llm: persisted.llm.clone(),
             loop_state: persisted.loop_state.clone(),
+            role_settings: persisted.role_settings.clone(),
             bridge_url: self.bridge.base_url(),
             bridge_token: bridge_token.clone(),
             backend_id: backend.backend_id().to_string(),
@@ -377,7 +376,7 @@ impl XiaooRuntime {
 
     async fn submit_turn_inner(
         &self,
-        input: RuntimeTurnInput,
+        mut input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, SessionDomainError> {
         if input
             .llm
@@ -390,6 +389,7 @@ impl XiaooRuntime {
             });
         }
         let instance = self.instance_for(&input.runtime_id).await?;
+        let role_settings;
         {
             let mut active = instance.active_turn.lock().await;
             if active.is_some() {
@@ -397,6 +397,21 @@ impl XiaooRuntime {
                     message: "xiaoO worker already has an active turn".into(),
                 });
             }
+            role_settings = instance
+                .persisted
+                .lock()
+                .await
+                .role_settings
+                .for_turn(&input.ext)?;
+            input.ext.insert(
+                crate::EXT_NAMESPACE.into(),
+                serde_json::to_value(&role_settings).map_err(|error| {
+                    SessionDomainError::Internal {
+                        message: error.to_string(),
+                        source: None,
+                    }
+                })?,
+            );
             *active = Some(input.turn_id.clone());
         }
         if let Err(error) = self
@@ -406,6 +421,7 @@ impl XiaooRuntime {
             instance.active_turn.lock().await.take();
             return Err(error);
         }
+        instance.persisted.lock().await.role_settings = role_settings;
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             loop {
@@ -432,6 +448,11 @@ impl XiaooRuntime {
                                 .lock()
                                 .await
                                 .insert(interaction_id.clone(), input.turn_id.clone());
+                        }
+                        if terminal {
+                            // Export immediately after a terminal SSE event must see an idle
+                            // worker and the preceding persisted State response.
+                            instance.active_turn.lock().await.take();
                         }
                         if tx.send(event).await.is_err() || terminal {
                             break;
@@ -464,7 +485,10 @@ impl XiaooRuntime {
                     }
                 }
             }
-            instance.active_turn.lock().await.take();
+            let mut active = instance.active_turn.lock().await;
+            if active.as_deref() == Some(input.turn_id.as_str()) {
+                active.take();
+            }
         });
         Ok(rx)
     }
@@ -576,9 +600,12 @@ async fn probe_llm_endpoint(
     if let Some(key) = api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = req.send().await.map_err(|e| SessionDomainError::InvalidRequest {
-        message: format!("LLM probe to '{url}': {e}"),
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SessionDomainError::InvalidRequest {
+            message: format!("LLM probe to '{url}': {e}"),
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();

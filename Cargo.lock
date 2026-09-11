@@ -3339,6 +3339,7 @@ dependencies = [
  "agent-runtime-protocol",
  "async-trait",
  "backend",
+ "base64",
  "libc",
  "operation-protocol",
  "provider-protocol",
@@ -3366,26 +3367,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "xgovernor-runtime-mock"
-version = "0.1.0"
-dependencies = [
- "agent-runtime-protocol",
- "async-trait",
- "backend",
- "operation-protocol",
- "provider-protocol",
- "rusqlite",
- "serde",
- "serde_json",
- "session-protocol",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "xgovernor-core",
- "xgovernor-manager",
 ]
 
 [[package]]

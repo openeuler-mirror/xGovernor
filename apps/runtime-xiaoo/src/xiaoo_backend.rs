@@ -103,6 +103,8 @@ fn transport_error(error: impl ToString) -> xiaoo_api::backend::OperationError {
 pub struct WorkerConfig {
     pub(crate) llm: PersistedLlm,
     pub(crate) loop_state: LoopStateSnapshot,
+    #[serde(default)]
+    pub(crate) role_settings: crate::RoleSettings,
     pub(crate) bridge_url: String,
     pub(crate) bridge_token: String,
     pub(crate) backend_id: String,
