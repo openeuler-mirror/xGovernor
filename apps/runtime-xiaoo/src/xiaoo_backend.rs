@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, process::Stdio};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use xgovernor_core::SessionDomainError;
 use xiaoo_core::LoopStateSnapshot;
@@ -438,7 +438,8 @@ pub async fn spawn_worker_process(
     let mut command = Command::new(executable);
     command
         .arg("--worker")
-        .env("XGOVERNOR_XIAOO_WORKER_CONFIG", config_json)
+        .env_remove("XGOVERNOR_XIAOO_WORKER_CONFIG")
+        .env("XGOVERNOR_XIAOO_WORKER_CONFIG_STDIN", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -451,7 +452,15 @@ pub async fn spawn_worker_process(
                 executable.display()
             ),
         })?;
-    let stdin = child.stdin.take().expect("xiaoO worker stdin was piped");
+    let mut stdin = child.stdin.take().expect("xiaoO worker stdin was piped");
+    // Full conversation snapshots can exceed the OS per-environment-entry limit.
+    // Bootstrap over the same private pipe used for subsequent worker requests.
+    stdin
+        .write_all(format!("{config_json}\n").as_bytes())
+        .await
+        .map_err(|error| SessionDomainError::Unavailable {
+            message: format!("failed to send xiaoO worker config: {error}"),
+        })?;
     let stdout = child.stdout.take().expect("xiaoO worker stdout was piped");
     let mut stdout = BufReader::new(stdout);
     let mut ready = String::new();
@@ -477,5 +486,53 @@ pub async fn spawn_worker_process(
         Err(error) => Err(SessionDomainError::Unavailable {
             message: format!("invalid xiaoO worker readiness response: {error}"),
         }),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bootstrap_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn worker_bootstrap_exceeds_environment_entry_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("worker");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json, os, sys
+assert "XGOVERNOR_XIAOO_WORKER_CONFIG" not in os.environ
+config = json.loads(sys.stdin.readline())
+assert len(config["role_settings"]["system_prompt"]) == 256 * 1024
+print('{"kind":"ready"}', flush=True)
+assert sys.stdin.readline() == "next-request\n"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut role_settings = crate::RoleSettings::default();
+        role_settings.system_prompt = "x".repeat(256 * 1024);
+        let config = WorkerConfig {
+            llm: PersistedLlm {
+                provider: "deepseek".into(),
+                model: "test".into(),
+                api_key_env: "TEST_KEY".into(),
+                api_base: None,
+            },
+            loop_state: xiaoo_api::runtime::RuntimeState::new("test".into()).to_snapshot(),
+            role_settings,
+            bridge_url: "http://127.0.0.1:1".into(),
+            bridge_token: "test".into(),
+            backend_id: "e2b".into(),
+            workspace_root: "/work".into(),
+            home_dir: None,
+            supports_atomic_write: false,
+            supports_grep: false,
+        };
+        let (mut child, mut stdin, _) = spawn_worker_process(&executable, &config).await.unwrap();
+        stdin.write_all(b"next-request\n").await.unwrap();
+        drop(stdin);
+        assert!(child.wait().await.unwrap().success());
     }
 }
