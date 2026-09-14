@@ -333,3 +333,34 @@
 - 新增字段一律 `#[serde(default)]`；请求侧未知字段拒绝、响应侧未知能力按缺席处理——客户端可以落后于服务端，反之需同步窗口。
 - 协议 crate 的任何 JSON 形态变更都会触发其 schema/边界测试 diff，按 wire 变更评审。
 - 操作面（exec / 文件读写 / checkpoint / checkout / pause / resume）的 DTO 已在 session-protocol 定义但**尚未路由**，接线后并入本文 §2。
+
+
+## MCTS / 外部运行环境操作
+
+三个接口均使用 JSON POST，执行已认证调用方的 ownership、lease 和 sandbox capability 检查；与同会话的活跃 turn、checkpoint、其他操作互斥，忙时返回 409。客户端应等待 turn 的终态事件，再评分或创建 checkpoint。read-only workspace 不允许 exec/write。操作通过该会话的 provider operation backend 执行。
+
+| 路由 | 请求核心字段 | 成功响应 |
+| --- | --- | --- |
+| `/api/v1/sessions/exec` | `runtime_id`, `command: [executable, ...args]`, `cwd?`, `env: {}`, `timeout_ms?`, `lease` | `stdout`, `stderr`, `exit_code`, `timed_out` |
+| `/api/v1/sessions/files/read` | `runtime_id`, `path`, `lease` | `path`, `content_base64`, `media_type` |
+| `/api/v1/sessions/files/write` | `runtime_id`, `path`, `content_base64`, `create_parents`, `lease` | `path`, `bytes_written` |
+
+文件内容用 base64 保持二进制完整；exec 输出按 UTF-8 解码，非法序列用替代字符表示。需要精确二进制输出时写入文件后调用 files/read。相对路径按 provider workspace 解析；shell 语法应显式用 `command: ["bash", "-lc", "..."]`。exec 的 `timeout_ms` 默认 30000，允许 1–3600000；HTTP 超时为该值加 30 秒。open/load/checkpoint/fork 的 HTTP 超时为 900 秒，其他请求仍为 30 秒。请求体上限为 2 MiB；大文件可用 1 MiB 二进制分块（base64 后约 1.34 MiB）。
+
+创建会话时，`deployment.options.provider_options` 对象透传给选定 provider，并保存在 isolation 元数据中，供后续 checkpoint/load 复用。例如：
+
+```json
+{
+  "runtime_kind": "pi",
+  "conversation_id": "mcts-task",
+  "sender_id": "mcts",
+  "ext": {"runtime_pi": {"backend_id": "e2b", "system_prompt": "Solve the task.", "max_turns": 30, "tools_enabled": true}},
+  "deployment": {"options": {"provider_options": {"template_id": "swepro-docker", "timeout_secs": 3600}}}
+}
+```
+
+`workspace_root` 始终取环境 normalizer 已验证的值，provider_options 不能覆盖它。`runtime_kind: "xiaoo"` 对应 `ext.xiaoo`，`runtime_kind: "pi"` 对应 `ext.runtime_pi`；两者都支持 `system_prompt`、正整数 `max_turns`、`tools_enabled`，可在 open 设置默认值，也可在 turns 的对应 ext 对象中覆盖，覆盖结果进入后续 checkpoint。`tools_enabled: false` 会禁用模型工具，适用于 selector；宿主调用的 exec/files 操作不受角色工具开关影响，仍由 sandbox capability/lease 控制。xiaoo 额外支持 `allow_interaction`（默认 true）；基准测试可设 false 禁止 ask_user_question。
+
+Pi 用受信扩展替换真实 system prompt，限定沙箱工具集合，关闭个人扩展/skills/template/theme 发现。其 checkpoint 导出会冻结当时完整 JSONL 和角色配置；每次 load/fork 获得独立会话目录。正常 turn 持久化只保存本会话的实时状态，不重复复制历史。快照的模型环境凭证保留环境变量引用；inline key 放在权限为 0600 的独立私有文件中，opaque state/SQLite 只含引用，删除 checkpoint 时释放。关闭源 session 后 checkpoint 仍有效，必须显式调用 checkpoint/delete 清理。
+
+Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式仅含实时会话目录的 state 不可直接作为新分支使用，需要在升级后的服务上重新 checkpoint。当前本地 provider 不提供环境快照；完整 MCTS 分支需使用具备 snapshot 能力的 provider（如 E2B）。

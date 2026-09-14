@@ -9,6 +9,13 @@ use agent_runtime_protocol::{
     RuntimeExecutionContext, RuntimeFailure, RuntimeInteractionRequest as RuntimeInteractionInput,
     RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
 };
+use base64::Engine;
+use operation_protocol::capability::{
+    exec::ExecRequest,
+    filesystem::{ReadBytesRequest, WriteBytesRequest, WriteMode},
+    path::{ResolveBase, ResolvePathRequest},
+};
+use operation_protocol::{OperationBackend, OperationError};
 use session_protocol::{
     SessionCheckpointDeleteRequest, SessionCheckpointDeleteResult, SessionCheckpointListResponse,
     SessionCheckpointRequest, SessionCheckpointResult, SessionCheckpointSummary,
@@ -16,6 +23,10 @@ use session_protocol::{
     SessionInteractionRequest, SessionLeaseClaim, SessionLifecycleStatus, SessionListResponse,
     SessionLoadRequest, SessionOpenRequest, SessionOpenResponse, SessionSubmitReceipt,
     SessionTurnRequest, TenantQuotaSnapshot,
+};
+use session_protocol::{
+    SessionExecRequest, SessionExecResult, SessionFileReadRequest, SessionFileReadResult,
+    SessionFileWriteRequest, SessionFileWriteResult,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -228,12 +239,21 @@ fn provider_for_isolation(
 
 fn provider_options(
     workspace: &WorkspaceFacts,
-    _isolation: &IsolationFacts,
+    isolation: &IsolationFacts,
     provider_id: &str,
 ) -> serde_json::Value {
-    let mut options = serde_json::json!({"workspace_root": workspace.root});
+    let mut options = isolation
+        .metadata
+        .get("provider_options")
+        .cloned()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Workspace admission belongs to the normalizer, never the options blob.
+    options["workspace_root"] = serde_json::json!(workspace.root);
     if provider_id == "e2b" {
-        options["allow_internet_access"] = serde_json::json!(true);
+        if options.get("allow_internet_access").is_none() {
+            options["allow_internet_access"] = serde_json::json!(true);
+        }
     }
     options
 }
@@ -302,6 +322,31 @@ struct TurnGate {
     active: Mutex<HashMap<String, String>>,
     /// runtime_id → bounded FIFO of remembered (client_request_id, turn_id).
     receipts: Mutex<HashMap<String, ReceiptWindow>>,
+}
+
+struct SessionOperationGuard {
+    gate: Arc<TurnGate>,
+    runtime_id: String,
+    operation_id: String,
+}
+impl Drop for SessionOperationGuard {
+    fn drop(&mut self) {
+        self.gate.release(&self.runtime_id, &self.operation_id);
+    }
+}
+
+fn map_operation_error(error: OperationError) -> SessionDomainError {
+    match error {
+        OperationError::NotFound { path } => SessionDomainError::NotFound { runtime_id: path },
+        OperationError::Unsupported { message } => SessionDomainError::UnsupportedCapability {
+            family: crate::CapabilityFamily::Sandbox,
+            capability: message,
+        },
+        OperationError::Transport { message } => SessionDomainError::Unavailable { message },
+        error => SessionDomainError::InvalidRequest {
+            message: error.to_string(),
+        },
+    }
 }
 
 #[derive(Default)]
@@ -589,7 +634,18 @@ impl SessionApplication {
             .unwrap_or(&self.default_runtime_kind);
         let registration = self.registration(runtime_kind)?;
         let runtime = Arc::clone(&registration.runtime);
-        let normalized = registration.environment.normalize(ctx, &request).await?;
+        let mut normalized = registration.environment.normalize(ctx, &request).await?;
+        if let Some(options) = request.deployment.options.get("provider_options") {
+            if !options.is_object() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "deployment.options.provider_options must be an object".into(),
+                });
+            }
+            if !normalized.isolation.metadata.is_object() {
+                normalized.isolation.metadata = serde_json::json!({});
+            }
+            normalized.isolation.metadata["provider_options"] = options.clone();
+        }
 
         // Fail-closed second gate (`docs/tenancy_design.md` §0/§7 step 2):
         // deliberately independent of whatever `self.environment.normalize`
@@ -674,7 +730,11 @@ impl SessionApplication {
             llm: request.llm.clone(),
             ext: request.ext.clone(),
         };
-        if let Err(error) = runtime.probe_llm(&start_request).await.map_err(map_runtime_error) {
+        if let Err(error) = runtime
+            .probe_llm(&start_request)
+            .await
+            .map_err(map_runtime_error)
+        {
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
             }
@@ -938,6 +998,9 @@ impl SessionApplication {
                             usage: session_protocol::SessionUsage::default(),
                         };
                     }
+                }
+                if terminal {
+                    gate.release(&event_runtime_id, &event_turn_id);
                 }
                 let sent = tokio::time::timeout(
                     FORWARD_SEND_TIMEOUT,
@@ -1358,12 +1421,253 @@ impl SessionApplication {
         result
     }
 
+    fn claim_operation(
+        &self,
+        runtime_id: &str,
+    ) -> Result<SessionOperationGuard, SessionDomainError> {
+        let operation_id = format!("operation-{}", self.turn_ids.next_turn_id());
+        self.turn_gate
+            .claim(runtime_id, &operation_id)
+            .map_err(|active| SessionDomainError::Conflict {
+                message: format!("session has an active operation or turn: {active}"),
+            })?;
+        Ok(SessionOperationGuard {
+            gate: self.turn_gate.clone(),
+            runtime_id: runtime_id.into(),
+            operation_id,
+        })
+    }
+
+    async fn operation_backend(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+        lease: &SessionLeaseClaim,
+        capability: crate::SandboxCapability,
+    ) -> Result<(Arc<dyn OperationBackend>, SessionOperationGuard), SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        self.check_lease_holder(runtime_id, lease).await?;
+        if !record.capabilities.sandbox.contains(&capability) {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Sandbox,
+                capability: format!("{capability:?}"),
+            });
+        }
+        if matches!(
+            capability,
+            crate::SandboxCapability::Exec | crate::SandboxCapability::FileWrite
+        ) && record.workspace.access != crate::WorkspaceAccess::ReadWrite
+        {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "workspace is read-only".into(),
+            });
+        }
+        let guard = self.claim_operation(runtime_id)?;
+        let registration = self.registration_for_record(&record)?;
+        let (_, manager) = provider_for_isolation(registration, &record.isolation)?;
+        Ok((
+            manager
+                .backend_for(runtime_id)
+                .map_err(map_provider_error)?,
+            guard,
+        ))
+    }
+
+    pub async fn exec(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionExecRequest,
+    ) -> Result<SessionExecResult, SessionDomainError> {
+        let runtime_id = request.runtime_id.clone();
+        let result = self.exec_impl(ctx, request).await;
+        audit_log(ctx, "exec", Some(&runtime_id), &result);
+        result
+    }
+    async fn exec_impl(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionExecRequest,
+    ) -> Result<SessionExecResult, SessionDomainError> {
+        let (backend, _guard) = self
+            .operation_backend(
+                ctx,
+                &request.runtime_id,
+                &request.lease,
+                crate::SandboxCapability::Exec,
+            )
+            .await?;
+        if request
+            .timeout_ms
+            .is_some_and(|ms| ms == 0 || ms > 3_600_000)
+        {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "timeout_ms must be between 1 and 3600000".into(),
+            });
+        }
+        let (command, args) = request
+            .command
+            .split_first()
+            .filter(|(cmd, _)| !cmd.trim().is_empty())
+            .ok_or_else(|| SessionDomainError::InvalidRequest {
+                message: "command must contain a nonempty executable".into(),
+            })?;
+        let cwd = match request.cwd {
+            Some(raw_path) => Some(
+                backend
+                    .paths()
+                    .resolve_path(ResolvePathRequest {
+                        raw_path,
+                        base: ResolveBase::WorkspaceRoot,
+                    })
+                    .await
+                    .map_err(map_operation_error)?,
+            ),
+            None => Some(backend.paths().workspace_root().clone()),
+        };
+        let result = backend
+            .exec()
+            .exec(ExecRequest {
+                command: command.clone(),
+                args: args.to_vec(),
+                cwd,
+                env: Some(request.env.into_iter().collect()),
+                timeout_ms: Some(request.timeout_ms.unwrap_or(30_000)),
+                ..Default::default()
+            })
+            .await
+            .map_err(map_operation_error)?;
+        Ok(SessionExecResult {
+            stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+            exit_code: result.exit_code,
+            timed_out: result.timed_out,
+        })
+    }
+
+    pub async fn read_file(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionFileReadRequest,
+    ) -> Result<SessionFileReadResult, SessionDomainError> {
+        let runtime_id = request.runtime_id.clone();
+        let result = self.read_file_impl(ctx, request).await;
+        audit_log(ctx, "read_file", Some(&runtime_id), &result);
+        result
+    }
+    async fn read_file_impl(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionFileReadRequest,
+    ) -> Result<SessionFileReadResult, SessionDomainError> {
+        let (backend, _guard) = self
+            .operation_backend(
+                ctx,
+                &request.runtime_id,
+                &request.lease,
+                crate::SandboxCapability::FileRead,
+            )
+            .await?;
+        let path = backend
+            .paths()
+            .resolve_path(ResolvePathRequest {
+                raw_path: request.path,
+                base: ResolveBase::WorkspaceRoot,
+            })
+            .await
+            .map_err(map_operation_error)?;
+        let bytes = backend
+            .files()
+            .read_bytes(ReadBytesRequest { path: path.clone() })
+            .await
+            .map_err(map_operation_error)?;
+        Ok(SessionFileReadResult {
+            path: path.0,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            media_type: None,
+        })
+    }
+
+    pub async fn write_file(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionFileWriteRequest,
+    ) -> Result<SessionFileWriteResult, SessionDomainError> {
+        let runtime_id = request.runtime_id.clone();
+        let result = self.write_file_impl(ctx, request).await;
+        audit_log(ctx, "write_file", Some(&runtime_id), &result);
+        result
+    }
+    async fn write_file_impl(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionFileWriteRequest,
+    ) -> Result<SessionFileWriteResult, SessionDomainError> {
+        let (backend, _guard) = self
+            .operation_backend(
+                ctx,
+                &request.runtime_id,
+                &request.lease,
+                crate::SandboxCapability::FileWrite,
+            )
+            .await?;
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(request.content_base64)
+            .map_err(|_| SessionDomainError::InvalidRequest {
+                message: "content_base64 is not valid base64".into(),
+            })?;
+        let bytes_written = content.len() as u64;
+        let path = backend
+            .paths()
+            .resolve_path(ResolvePathRequest {
+                raw_path: request.path,
+                base: ResolveBase::WorkspaceRoot,
+            })
+            .await
+            .map_err(map_operation_error)?;
+        if request.create_parents {
+            if let Some((parent, _)) = path.0.rsplit_once('/') {
+                if !parent.is_empty() {
+                    backend
+                        .files()
+                        .create_dir_all(&operation_protocol::BackendPath(parent.into()))
+                        .await
+                        .map_err(map_operation_error)?;
+                }
+            }
+        }
+        backend
+            .files()
+            .write_bytes(WriteBytesRequest {
+                path: path.clone(),
+                content,
+                mode: WriteMode::Overwrite,
+            })
+            .await
+            .map_err(map_operation_error)?;
+        Ok(SessionFileWriteResult {
+            path: path.0,
+            bytes_written,
+        })
+    }
+
     pub async fn checkpoint(
         &self,
         ctx: &SecurityContext,
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
+        self.check_lease_holder(&request.runtime_id, &request.lease)
+            .await?;
+        let _guard = self.claim_operation(&request.runtime_id)?;
+        self.ensure_runtime_attached(ctx, &record).await?;
+        if matches!(
+            request.requested_scope,
+            Some(session_protocol::SessionCheckpointScope::WorkspaceOnly)
+        ) {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "only full checkpoint scope is supported".into(),
+            });
+        }
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
         if !record
@@ -1380,15 +1684,22 @@ impl SessionApplication {
                 capability: "checkpoint".into(),
             });
         }
+        let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
         let runtime_state = runtime
-            .export_state(&request.runtime_id)
+            .export_checkpoint_state(&request.runtime_id)
             .await
             .map_err(map_runtime_error)?;
-        let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
-        let provider_snapshot = manager
+        let provider_snapshot = match manager
             .checkpoint_instance(&request.runtime_id)
             .await
-            .map_err(map_provider_error)?;
+            .map_err(map_provider_error)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = runtime.delete_checkpoint_state(&runtime_state).await;
+                return Err(error);
+            }
+        };
         let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
         let created_at_ms = self.clock.now_ms();
         if let Err(error) = self
@@ -1397,7 +1708,7 @@ impl SessionApplication {
                 checkpoint_id: checkpoint_id.clone(),
                 source_runtime_id: request.runtime_id.clone(),
                 provider_snapshot_id: provider_snapshot.snapshot_id.0.clone(),
-                runtime_state,
+                runtime_state: runtime_state.clone(),
                 workspace: record.workspace,
                 isolation: record.isolation,
                 capabilities: record.capabilities,
@@ -1408,6 +1719,7 @@ impl SessionApplication {
             })
             .await
         {
+            let _ = runtime.delete_checkpoint_state(&runtime_state).await;
             let _ = manager
                 .delete_snapshot(
                     provider_protocol::BackendId(provider_id),
@@ -1528,6 +1840,21 @@ impl SessionApplication {
             }
             return Err(error);
         }
+        let durable_state = match runtime
+            .export_state(&runtime_id)
+            .await
+            .map_err(map_runtime_error)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = runtime.stop(&runtime_id).await;
+                let _ = manager.stop_instance(&runtime_id).await;
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
         let now = self.clock.now_ms();
         let record = SessionRecord {
             runtime_id: runtime_id.clone(),
@@ -1541,7 +1868,7 @@ impl SessionApplication {
             workspace: checkpoint.workspace,
             isolation: checkpoint.isolation,
             capabilities: checkpoint.capabilities,
-            runtime: checkpoint.runtime_state,
+            runtime: durable_state,
             llm: resolved_llm,
             lease: None,
             lineage: Some(CheckpointLineage {
@@ -1642,6 +1969,11 @@ impl SessionApplication {
             )
             .await
             .map_err(map_provider_error)?;
+        registration
+            .runtime
+            .delete_checkpoint_state(&checkpoint.runtime_state)
+            .await
+            .map_err(map_runtime_error)?;
         self.records
             .delete_checkpoint(&request.checkpoint_id)
             .await?;
@@ -1659,12 +1991,12 @@ impl SessionApplication {
         let parent = self
             .require_session(ctx, &request.parent_runtime_id)
             .await?;
+        self.check_lease_holder(&request.parent_runtime_id, &request.lease)
+            .await?;
+        let _guard = self.claim_operation(&request.parent_runtime_id)?;
+        self.ensure_runtime_attached(ctx, &parent).await?;
         let registration = self.registration_for_record(&parent)?;
         let runtime = Arc::clone(&registration.runtime);
-        let exported = runtime
-            .export_state(&request.parent_runtime_id)
-            .await
-            .map_err(map_runtime_error)?;
 
         let runtime_id = request
             .runtime_id
@@ -1692,12 +2024,44 @@ impl SessionApplication {
                 })?;
         }
 
-        let (provider_id, manager) = provider_for_isolation(registration, &parent.isolation)?;
-        let snapshot = manager
+        let exported = match runtime
+            .export_checkpoint_state(&request.parent_runtime_id)
+            .await
+            .map_err(map_runtime_error)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
+        let (provider_id, manager) = match provider_for_isolation(registration, &parent.isolation) {
+            Ok(pair) => pair,
+            Err(error) => {
+                let _ = runtime.delete_checkpoint_state(&exported).await;
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
+        let snapshot = match manager
             .checkpoint_instance(&request.parent_runtime_id)
             .await
-            .map_err(map_provider_error)?;
-        let backend = manager
+            .map_err(map_provider_error)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let _ = runtime.delete_checkpoint_state(&exported).await;
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
+        let loaded = manager
             .load_instance_from_snapshot(
                 runtime_id.clone(),
                 provider_protocol::BackendId(provider_id.clone()),
@@ -1706,13 +2070,23 @@ impl SessionApplication {
                 provider_options(&parent.workspace, &parent.isolation, &provider_id),
             )
             .await
-            .map_err(map_provider_error)?;
+            .map_err(map_provider_error);
         let _ = manager
             .delete_snapshot(
                 provider_protocol::BackendId(provider_id),
                 snapshot.snapshot_id,
             )
             .await;
+        let backend = match loaded {
+            Ok(backend) => backend,
+            Err(error) => {
+                let _ = runtime.delete_checkpoint_state(&exported).await;
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = runtime
             .start(
                 RuntimeStartRequest {
@@ -1731,6 +2105,7 @@ impl SessionApplication {
             .await
             .map_err(map_runtime_error)
         {
+            let _ = runtime.delete_checkpoint_state(&exported).await;
             let _ = manager.stop_instance(&runtime_id).await;
             if let Some(tenant_id) = &tenant_id_for_quota {
                 self.release_tenant_session(tenant_id);
@@ -1738,8 +2113,24 @@ impl SessionApplication {
             return Err(error);
         }
 
+        let _ = runtime.delete_checkpoint_state(&exported).await;
+        let durable_state = match runtime
+            .export_state(&runtime_id)
+            .await
+            .map_err(map_runtime_error)
+        {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = runtime.stop(&runtime_id).await;
+                let _ = manager.stop_instance(&runtime_id).await;
+                if let Some(id) = &tenant_id_for_quota {
+                    self.release_tenant_session(id);
+                }
+                return Err(error);
+            }
+        };
         let record = SessionRecord {
-            runtime_id,
+            runtime_id: runtime_id.clone(),
             conversation_id,
             sender_id,
             status: SessionStatus::Idle,
@@ -1748,7 +2139,7 @@ impl SessionApplication {
             workspace: parent.workspace,
             isolation: parent.isolation,
             capabilities: parent.capabilities,
-            runtime: exported,
+            runtime: durable_state,
             llm: parent.llm,
             lease: None,
             lineage: Some(CheckpointLineage {

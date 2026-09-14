@@ -65,6 +65,22 @@ pub trait AgentRuntime: Send + Sync {
         })
     }
 
+    /// Immutable export for branches; durable restart state may reference live files.
+    async fn export_checkpoint_state(
+        &self,
+        runtime_id: &str,
+    ) -> Result<RuntimeStateSnapshot, RuntimeError> {
+        self.export_state(runtime_id).await
+    }
+
+    /// Release private resources owned by an immutable checkpoint export.
+    async fn delete_checkpoint_state(
+        &self,
+        _state: &RuntimeStateSnapshot,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     async fn load_state(
         &self,
         _runtime_id: &str,

@@ -19,6 +19,7 @@
  */
 
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import {
 	type BashOperations,
 	createBashTool,
@@ -558,6 +559,26 @@ export default function (pi: ExtensionAPI): void {
 	const env = readBridgeEnv();
 	const client = new BridgeClient(env.bridgeUrl, env.bridgeToken);
 	const workspaceRoot = env.workspaceRoot;
+    // Only the trusted worker writes this host-side config. It is reloaded at
+    // each prompt boundary, allowing init -> step role changes after a fork.
+    type RoleConfig = { system_prompt?: string; max_turns?: number; tools_enabled?: boolean };
+    let role: RoleConfig = {};
+    let turns = 0;
+    const sandboxTools = ["read", "write", "edit", "bash", "find", "grep"];
+    pi.on("before_agent_start", async () => {
+        const configPath = process.env.XGOVERNOR_PI_ROLE_FILE;
+        role = configPath ? JSON.parse(readFileSync(configPath, "utf8")) as RoleConfig : {};
+        turns = 0;
+        pi.setActiveTools(role.tools_enabled === false ? [] : sandboxTools);
+        if (role.system_prompt != null) return { systemPrompt: role.system_prompt };
+    });
+    pi.on("turn_start", async (_event, ctx) => {
+        turns += 1;
+        if (role.max_turns != null && turns > role.max_turns) await ctx.abort();
+    });
+    pi.on("tool_call", async () => {
+        if (role.tools_enabled === false) return { block: true, reason: "Tools disabled for this role" };
+    });
 
 	// Runtime-neutral model switching endpoint used by xGovernor between
 	// turns. A custom base URL is registered as OpenAI Chat Completions

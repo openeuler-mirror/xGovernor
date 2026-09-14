@@ -1,10 +1,11 @@
+use agent_contracts::llm::{LlmProvider, ProviderCapabilities};
 use agent_contracts::tool::{DiscoveredTool, ToolRegistryBuilder, ToolSource};
 use agent_runtime_protocol::RuntimeEvent;
-use agent_types::common::ids::{AgentId, ToolName};
+use agent_types::common::ids::AgentId;
 use agent_types::context::TokenBudgetConfig;
 use agent_types::interaction::{InteractionRequest, InteractionResponse};
-use agent_types::outcome::AgentOutcome;
 use agent_types::tool::{ToolRegistryConfig, ToolVisibilityConfig};
+use agent_types::{LlmError, LlmRequest, LlmResponse, StreamChunk};
 use async_trait::async_trait;
 use compact::{build_context_manager, CompactionPolicy};
 use operation_protocol::capability::exec::ExecRequest;
@@ -46,6 +47,95 @@ struct XiaooRuntimeExt {
     api_key_env: String,
     #[serde(default)]
     api_base: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+    #[serde(default)]
+    max_turns: Option<u32>,
+    #[serde(default)]
+    tools_enabled: Option<bool>,
+    #[serde(default)]
+    allow_interaction: Option<bool>,
+}
+
+/// Effective role policy; persisted alongside history so branch loads retain it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct RoleSettings {
+    system_prompt: String,
+    max_turns: Option<u32>,
+    tools_enabled: bool,
+    allow_interaction: bool,
+}
+
+impl Default for RoleSettings {
+    fn default() -> Self {
+        Self {
+            system_prompt: "You are xiaoO, a coding assistant managed by xGovernor.".into(),
+            max_turns: None,
+            tools_enabled: true,
+            allow_interaction: true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleOverrides {
+    system_prompt: Option<String>,
+    max_turns: Option<u32>,
+    tools_enabled: Option<bool>,
+    #[serde(default)]
+    allow_interaction: Option<bool>,
+}
+
+impl RoleSettings {
+    fn apply(&self, overrides: RoleOverrides) -> Result<Self, SessionDomainError> {
+        let mut settings = self.clone();
+        if let Some(prompt) = overrides.system_prompt {
+            settings.system_prompt = prompt;
+        }
+        if let Some(limit) = overrides.max_turns {
+            if limit == 0 {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "ext.xiaoo.max_turns must be positive".into(),
+                });
+            }
+            settings.max_turns = Some(limit);
+        }
+        if let Some(enabled) = overrides.tools_enabled {
+            settings.tools_enabled = enabled;
+        }
+        if let Some(allowed) = overrides.allow_interaction {
+            settings.allow_interaction = allowed;
+        }
+        Ok(settings)
+    }
+
+    fn for_turn(
+        &self,
+        ext: &session_protocol::SessionExtensions,
+    ) -> Result<Self, SessionDomainError> {
+        let Some(value) = ext.get(EXT_NAMESPACE) else {
+            return Ok(self.clone());
+        };
+        let overrides = serde_json::from_value(value.clone()).map_err(|error| {
+            SessionDomainError::InvalidRequest {
+                message: format!("invalid ext.xiaoo turn policy: {error}"),
+            }
+        })?;
+        self.apply(overrides)
+    }
+}
+
+impl XiaooRuntimeExt {
+    fn role_settings(&self) -> Result<RoleSettings, SessionDomainError> {
+        RoleSettings::default().apply(RoleOverrides {
+            system_prompt: self.system_prompt.clone(),
+            max_turns: self.max_turns,
+            tools_enabled: self.tools_enabled,
+            allow_interaction: self.allow_interaction,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +146,8 @@ pub(crate) struct XiaooPersistedState {
     provider_options: Value,
     llm: PersistedLlm,
     loop_state: LoopStateSnapshot,
+    #[serde(default)]
+    role_settings: RoleSettings,
 }
 
 pub struct XiaooSessionEnvironment {
@@ -100,6 +192,7 @@ fn read_ext(
             });
         }
     }
+    parsed.role_settings()?;
     // Resolve now so open fails before a sandbox is provisioned. Only the
     // environment variable name is retained after this point.
     std::env::var(&parsed.api_key_env)
@@ -228,7 +321,12 @@ struct CoreToolSource {
 }
 
 impl CoreToolSource {
-    fn new() -> Self {
+    fn new(tools_enabled: bool, allow_interaction: bool) -> Self {
+        if !tools_enabled {
+            return Self {
+                discovered: Vec::new(),
+            };
+        }
         const ALLOWED: &[&str] = &[
             "bash",
             "file_read",
@@ -245,6 +343,7 @@ impl CoreToolSource {
         .into_iter()
         .flat_map(|source| source.discover())
         .filter(|tool| ALLOWED.contains(&tool.spec.name().0.as_str()))
+        .filter(|tool| allow_interaction || tool.spec.name().0 != "ask_user_question")
         .collect();
         Self { discovered }
     }
@@ -363,11 +462,37 @@ fn validate_persisted_llm(llm: &PersistedLlm) -> Result<(), SessionDomainError> 
     })
 }
 
+fn build_tool_registry(
+    role_settings: &RoleSettings,
+) -> Result<Box<dyn agent_contracts::tool::ToolRegistry>, SessionDomainError> {
+    let source = CoreToolSource::new(role_settings.tools_enabled, role_settings.allow_interaction);
+    let allowed = source
+        .discovered
+        .iter()
+        .map(|tool| tool.spec.name().clone())
+        .collect();
+    tool::ToolRegistryBuilderImpl::new()
+        .with_sources(vec![Box::new(source)])
+        .with_config(ToolRegistryConfig {
+            visibility: ToolVisibilityConfig {
+                per_agent_allowed_tools: [(AgentId("anonymous".into()), allowed)]
+                    .into_iter()
+                    .collect(),
+            },
+        })
+        .build()
+        .map_err(|error| SessionDomainError::Internal {
+            message: format!("failed to build xiaoO core tool registry: {error}"),
+            source: None,
+        })
+}
+
 pub(crate) async fn build_runtime(
     llm: &PersistedLlm,
     model_override: Option<&str>,
     backend: Arc<dyn xiaoo_api::backend::OperationBackend>,
-) -> Result<Runtime, SessionDomainError> {
+    role_settings: &RoleSettings,
+) -> Result<(Runtime, Arc<UsageMeter>), SessionDomainError> {
     let model = model_override.unwrap_or(&llm.model);
     let resolved = resolve_config(ResolveInput {
         provider: Some(llm.provider.clone()),
@@ -401,48 +526,38 @@ pub(crate) async fn build_runtime(
             message: error.to_string(),
         })?,
     );
+    let meter = Arc::new(UsageMeter::default());
+    let provider = Arc::new(llm_client::LlmProviderWrapper::new(
+        Arc::new(MeteredProvider {
+            inner: provider.inner(),
+            meter: Arc::clone(&meter),
+        }),
+        Some("xgovernor".into()),
+        None,
+    ));
     let compression = build_context_manager(None, Arc::clone(&provider)).map_err(|error| {
         SessionDomainError::Internal {
             message: error.to_string(),
             source: None,
         }
     })?;
-    let anonymous = AgentId("anonymous".into());
-    let allowed = [
-        "bash",
-        "file_read",
-        "file_write",
-        "file_edit",
-        "glob",
-        "grep",
-        "ask_user_question",
-    ]
-    .into_iter()
-    .map(|name| ToolName(name.into()))
-    .collect();
-    let registry = tool::ToolRegistryBuilderImpl::new()
-        .with_sources(vec![Box::new(CoreToolSource::new())])
-        .with_config(ToolRegistryConfig {
-            visibility: ToolVisibilityConfig {
-                per_agent_allowed_tools: [(anonymous, allowed)].into_iter().collect(),
-            },
-        })
-        .build()
-        .map_err(|error| SessionDomainError::Internal {
-            message: format!("failed to build xiaoO core tool registry: {error}"),
-            source: None,
-        })?;
-    Runtime::builder()
+    let registry = build_tool_registry(role_settings)?;
+    let mut builder = Runtime::builder()
         .llm_provider(provider)
         .compression_pipeline(compression)
         .prompt_builder(Arc::new(prompt::PromptBuilderImpl::new()))
-        .system_prompt("You are xiaoO, a coding assistant managed by xGovernor.")
+        .system_prompt(role_settings.system_prompt.clone())
         .tool_registry(Arc::from(registry))
         .skill_registry(Arc::new(EmptySkillRegistry::new()))
         .operation_backend(backend)
         .token_budget_config(budget.clone())
-        .token_budget_policy(Arc::new(CompactionPolicy::from_budget(&budget)))
+        .token_budget_policy(Arc::new(CompactionPolicy::from_budget(&budget)));
+    if let Some(max_turns) = role_settings.max_turns {
+        builder = builder.max_turns(max_turns);
+    }
+    builder
         .build()
+        .map(|runtime| (runtime, meter))
         .map_err(|error| SessionDomainError::Internal {
             message: error.to_string(),
             source: None,
@@ -533,16 +648,201 @@ impl LoopEventSink for GovernorEventSink {
     }
 }
 
-pub(crate) fn usage_from_outcome(outcome: &AgentOutcome) -> SessionUsage {
-    let usage = match outcome {
-        AgentOutcome::Complete { token_usage, .. }
-        | AgentOutcome::MaxTurnsReached { token_usage, .. }
-        | AgentOutcome::BudgetExhausted { token_usage, .. }
-        | AgentOutcome::Cancelled { token_usage, .. } => token_usage,
-    };
-    SessionUsage {
-        input_tokens: usage.prompt_tokens as u64,
-        output_tokens: usage.completion_tokens as u64,
-        total_tokens: usage.total_tokens as u64,
+/// Per-request accounting is independent of LoopState's last-response usage.
+/// The same provider also serves compaction, so those calls are included.
+#[derive(Default)]
+pub(crate) struct UsageMeter(std::sync::Mutex<SessionUsage>);
+
+impl UsageMeter {
+    fn record(&self, usage: &agent_types::llm::response::Usage) {
+        let mut total = self.0.lock().expect("usage lock poisoned");
+        total.input_tokens = total
+            .input_tokens
+            .saturating_add(usage.prompt_tokens as u64);
+        total.output_tokens = total
+            .output_tokens
+            .saturating_add(usage.completion_tokens as u64);
+        let tokens = if usage.total_tokens == 0 {
+            usage.prompt_tokens.saturating_add(usage.completion_tokens)
+        } else {
+            usage.total_tokens
+        };
+        total.total_tokens = total.total_tokens.saturating_add(tokens as u64);
+    }
+
+    pub(crate) fn read(&self) -> SessionUsage {
+        self.0.lock().expect("usage lock poisoned").clone()
+    }
+}
+
+struct MeteredProvider {
+    inner: Arc<dyn LlmProvider>,
+    meter: Arc<UsageMeter>,
+}
+
+#[async_trait]
+impl LlmProvider for MeteredProvider {
+    async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let response = self.inner.complete(request).await?;
+        self.meter.record(&response.message.usage);
+        Ok(response)
+    }
+
+    async fn complete_stream(
+        &self,
+        request: &LlmRequest,
+        on_chunk: &(dyn Fn(StreamChunk) + Send + Sync),
+    ) -> Result<LlmResponse, LlmError> {
+        let response = self.inner.complete_stream(request, on_chunk).await?;
+        self.meter.record(&response.message.usage);
+        Ok(response)
+    }
+
+    fn capabilities(&self) -> &ProviderCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn role_policy_survives_snapshot_and_step_override() {
+        let settings = RoleSettings::default()
+            .apply(RoleOverrides {
+                system_prompt: Some("solver-init".into()),
+                max_turns: Some(160),
+                tools_enabled: Some(true),
+                allow_interaction: Some(false),
+            })
+            .unwrap();
+        let state = XiaooPersistedState {
+            backend_id: "e2b".into(),
+            owner_ref: "owner".into(),
+            workspace_root: "/work".into(),
+            provider_options: Value::Null,
+            llm: PersistedLlm {
+                provider: "openai".into(),
+                model: "test".into(),
+                api_key_env: "TEST_KEY".into(),
+                api_base: None,
+            },
+            loop_state: xiaoo_api::runtime::RuntimeState::new("parent".into()).to_snapshot(),
+            role_settings: settings.clone(),
+        };
+        let frozen = state_to_opaque(&state).unwrap();
+        let restored = state_from_opaque(&frozen).unwrap();
+        assert_eq!(restored.role_settings, settings);
+        let ext = [(
+            EXT_NAMESPACE.into(),
+            json!({"system_prompt":"solver-step", "max_turns":80}),
+        )]
+        .into_iter()
+        .collect();
+        let child = restored.role_settings.for_turn(&ext).unwrap();
+        assert_eq!(child.system_prompt, "solver-step");
+        assert_eq!(child.max_turns, Some(80));
+        assert!(child.tools_enabled);
+        assert_eq!(state_from_opaque(&frozen).unwrap().role_settings, settings);
+    }
+
+    #[test]
+    fn usage_accumulates_repeated_and_smaller_calls_without_inheriting_history() {
+        let parent = UsageMeter::default();
+        let call = agent_types::llm::response::Usage {
+            prompt_tokens: 11,
+            completion_tokens: 5,
+            total_tokens: 16,
+            ..Default::default()
+        };
+        parent.record(&call);
+        parent.record(&call);
+        assert_eq!(parent.read().total_tokens, 32);
+        let child = UsageMeter::default();
+        assert_eq!(child.read(), SessionUsage::default());
+        child.record(&call);
+        child.record(&agent_types::llm::response::Usage {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            child.read(),
+            SessionUsage {
+                input_tokens: 13,
+                output_tokens: 6,
+                total_tokens: 19
+            }
+        );
+        assert_eq!(parent.read().total_tokens, 32);
+    }
+
+    #[test]
+    fn selector_has_no_discovered_tools() {
+        let ext = [(EXT_NAMESPACE.into(), json!({"tools_enabled":false}))]
+            .into_iter()
+            .collect();
+        let settings = RoleSettings::default().for_turn(&ext).unwrap();
+        assert!(
+            CoreToolSource::new(settings.tools_enabled, settings.allow_interaction)
+                .discover()
+                .is_empty()
+        );
+        let persisted: RoleSettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!persisted.tools_enabled);
+    }
+
+    #[test]
+    fn unattended_role_keeps_sandbox_tools_without_questions() {
+        let ext = [(EXT_NAMESPACE.into(), json!({"allow_interaction":false}))]
+            .into_iter()
+            .collect();
+        let settings = RoleSettings::default().for_turn(&ext).unwrap();
+        let tools =
+            CoreToolSource::new(settings.tools_enabled, settings.allow_interaction).discover();
+        assert!(tools.iter().any(|tool| tool.spec.name().0 == "bash"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.spec.name().0 == "ask_user_question"));
+    }
+
+    #[test]
+    fn filtered_registry_builds_for_solver_and_selector() {
+        for enabled in [true, false] {
+            let settings = RoleSettings {
+                tools_enabled: enabled,
+                allow_interaction: false,
+                ..Default::default()
+            };
+            let registry = build_tool_registry(&settings).unwrap();
+            let names: Vec<_> = registry
+                .list_specs()
+                .into_iter()
+                .map(|spec| spec.name().0.clone())
+                .collect();
+            assert!(!names.iter().any(|name| name == "ask_user_question"));
+            assert_eq!(names.iter().any(|name| name == "bash"), enabled);
+            if !enabled {
+                assert!(names.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reject_invalid_role_override_without_mutating_parent() {
+        let settings = RoleSettings::default();
+        for value in [
+            json!({"max_turns":0}),
+            json!({"max_turns":-1}),
+            json!({"tools_enabled":"false"}),
+            json!({"tools":["bash"]}),
+        ] {
+            let ext = [(EXT_NAMESPACE.into(), value)].into_iter().collect();
+            assert!(settings.for_turn(&ext).is_err());
+        }
+        assert_eq!(settings, RoleSettings::default());
     }
 }

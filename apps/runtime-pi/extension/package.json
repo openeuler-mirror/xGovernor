@@ -5,7 +5,8 @@
   "description": "Pi extension that redirects pi's built-in file/exec tools to xGovernor's local HTTP bridge (apps/runtime-pi) instead of touching the daemon host's filesystem directly.",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --test role_config.test.mjs"
   },
   "pi": {
     "extensions": [

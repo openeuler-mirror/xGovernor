@@ -1,5 +1,5 @@
 use crate::xiaoo_backend::{HttpOperationBackend, WorkerConfig};
-use crate::{build_runtime, usage_from_outcome, STATE_SCHEMA_VERSION};
+use crate::{build_runtime, STATE_SCHEMA_VERSION};
 use agent_contracts::interaction::InteractionHandle;
 use agent_runtime_protocol::RuntimeFailure;
 use agent_runtime_protocol::{
@@ -24,6 +24,7 @@ pub async fn run_worker_from_env() -> Result<(), String> {
     let raw = std::env::var("XGOVERNOR_XIAOO_WORKER_CONFIG").map_err(|e| e.to_string())?;
     let config: WorkerConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let backend = Arc::new(HttpOperationBackend::new(&config));
+    let mut role_settings = config.role_settings.clone();
     let mut state = RuntimeState::from_snapshot(config.loop_state, CancellationToken::new());
     emit(&WorkerResponse::Ready)?;
 
@@ -55,16 +56,29 @@ pub async fn run_worker_from_env() -> Result<(), String> {
         };
         match request {
             WorkerRequest::SubmitTurn(request) => {
+                role_settings = match role_settings.for_turn(&request.ext) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        emit(&WorkerResponse::Error {
+                            error: RuntimeError::InvalidRequest {
+                                code: "invalid_role_policy".into(),
+                                message: error.to_string(),
+                            },
+                        })?;
+                        continue;
+                    }
+                };
                 let effort = request
                     .reasoning_effort
                     .as_deref()
                     .unwrap_or("off")
                     .parse()
                     .map_err(|e| format!("invalid reasoning effort: {e}"))?;
-                let runtime = build_runtime(
+                let (runtime, usage_meter) = build_runtime(
                     &config.llm,
                     request.llm.as_ref().and_then(|llm| llm.model.as_deref()),
                     backend.clone(),
+                    &role_settings,
                 )
                 .await
                 .map_err(|e| format!("failed to build xiaoO runtime: {e:?}"))?;
@@ -88,12 +102,12 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                             .with_reasoning_effort(effort),
                     ),
                 );
-                let terminal = loop {
+                let mut terminal = loop {
                     tokio::select! {
                         result = &mut run => break match result {
                             Ok(RuntimeOutput::Complete(outcome)) => RuntimeEvent::Completed {
                                 outcome: match outcome { AgentOutcome::Complete { .. } => session_protocol::SessionTurnOutcome::Complete, AgentOutcome::MaxTurnsReached { .. } => session_protocol::SessionTurnOutcome::MaxTurns, AgentOutcome::BudgetExhausted { .. } => session_protocol::SessionTurnOutcome::BudgetExhausted, AgentOutcome::Cancelled { .. } => session_protocol::SessionTurnOutcome::Cancelled },
-                                usage: usage_from_outcome(&outcome),
+                                usage: Default::default(),
                             },
                             Ok(RuntimeOutput::Suspended(_)) => failed("xiaoo_suspended", "xiaoO suspended without a pending interaction"),
                             Err(error) => failed("xiaoo_runtime_error", &error.to_string()),
@@ -109,6 +123,16 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                     }
                 };
                 drop(run);
+                let usage = usage_meter.read();
+                match &mut terminal {
+                    RuntimeEvent::Completed {
+                        usage: reported, ..
+                    }
+                    | RuntimeEvent::Failed {
+                        usage: reported, ..
+                    } => *reported = usage,
+                    _ => unreachable!("run always produces a terminal event"),
+                }
                 while let Ok(event) = event_rx.try_recv() {
                     emit(&WorkerResponse::Event { event })?;
                 }
