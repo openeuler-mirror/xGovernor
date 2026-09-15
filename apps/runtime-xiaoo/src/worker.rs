@@ -21,15 +21,24 @@ use uuid::Uuid;
 use xiaoo_api::runtime::{RuntimeInput, RuntimeOutput, RuntimeState};
 
 pub async fn run_worker_from_env() -> Result<(), String> {
-    let raw = std::env::var("XGOVERNOR_XIAOO_WORKER_CONFIG").map_err(|e| e.to_string())?;
+    let stdin = tokio::io::stdin();
+    let mut input = BufReader::new(stdin);
+    let raw = if std::env::var_os("XGOVERNOR_XIAOO_WORKER_CONFIG_STDIN").is_some() {
+        let mut raw = String::new();
+        if input.read_line(&mut raw).await.map_err(|e| e.to_string())? == 0 {
+            return Err("missing xiaoO worker bootstrap config".into());
+        }
+        raw
+    } else {
+        std::env::var("XGOVERNOR_XIAOO_WORKER_CONFIG").map_err(|e| e.to_string())?
+    };
     let config: WorkerConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let backend = Arc::new(HttpOperationBackend::new(&config));
     let mut role_settings = config.role_settings.clone();
     let mut state = RuntimeState::from_snapshot(config.loop_state, CancellationToken::new());
     emit(&WorkerResponse::Ready)?;
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut lines = input.lines();
     let (request_tx, mut request_rx) = mpsc::unbounded_channel::<Result<WorkerRequest, String>>();
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
