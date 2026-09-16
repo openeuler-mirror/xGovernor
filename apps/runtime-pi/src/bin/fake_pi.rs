@@ -129,6 +129,20 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
         std::process::exit(23);
     }
 
+    if message == "trigger-multiple-responses" {
+        for _ in 0..2 {
+            emit(serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "usage": {
+                    "input": 10, "output": 3, "cacheRead": 20, "cacheWrite": 4, "totalTokens": 37
+                }}
+            }));
+            emit(serde_json::json!({"type": "agent_end"}));
+        }
+        emit(serde_json::json!({"type": "agent_settled"}));
+        return;
+    }
+
     if message == "trigger-interaction" {
         run_interaction_scenario(&id, rx);
     } else {
@@ -178,9 +192,10 @@ fn run_interaction_scenario(id: &str, rx: &mpsc::Receiver<serde_json::Value>) {
         "assistantMessageEvent": {"type": "text_delta", "delta": text}
     }));
     emit(serde_json::json!({
-        "type": "agent_settled",
-        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+        "type": "message_end",
+        "message": {"role": "assistant", "usage": {"input": 1, "output": 1, "totalTokens": 2}}
     }));
+    emit(serde_json::json!({"type": "agent_settled"}));
 }
 
 fn run_cancellable_scenario(message: &str, rx: &mpsc::Receiver<serde_json::Value>) {
@@ -228,7 +243,8 @@ fn run_cancellable_scenario(message: &str, rx: &mpsc::Receiver<serde_json::Value
     }
 
     emit(serde_json::json!({
-        "type": "agent_settled",
-        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+        "type": "message_end",
+        "message": {"role": "assistant", "usage": {"input": 1, "output": 1, "totalTokens": 2}}
     }));
+    emit(serde_json::json!({"type": "agent_settled"}));
 }

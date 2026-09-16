@@ -44,6 +44,7 @@ struct ActiveTurn {
     aborted: bool,
     pending_interactions: HashMap<String, String>,
     output_sequence: u64,
+    usage: SessionUsage,
 }
 
 impl ActiveTurn {
@@ -321,6 +322,7 @@ async fn handle_worker_request(
                     aborted: false,
                     pending_interactions: HashMap::new(),
                     output_sequence: 0,
+                    usage: SessionUsage::default(),
                 });
                 drop(active);
                 write_native(
@@ -505,6 +507,7 @@ async fn handle_native_message(native: &NativePi, message: Value) {
     match message.get("type").and_then(Value::as_str).unwrap_or("") {
         "response" => handle_response(native, &message).await,
         "message_update" => handle_message_update(native, &message).await,
+        "message_end" => handle_message_end(native, &message).await,
         "tool_execution_start" => handle_tool_start(native, &message).await,
         "tool_execution_end" => handle_tool_end(native, &message).await,
         "extension_ui_request" => handle_interaction(native, &message).await,
@@ -548,6 +551,24 @@ async fn handle_response(native: &NativePi, message: &Value) {
             },
         );
     }
+}
+
+// Count only finalized responses emitted while this submitted turn is active.
+// Restored session history and agent_end snapshots are deliberately not scanned:
+// they can contain responses already charged by an earlier turn or checkpoint.
+async fn handle_message_end(native: &NativePi, event: &Value) {
+    let Some(message) = event.get("message") else {
+        return;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    let mut active = native.active_turn.lock().await;
+    let Some(turn) = active.as_mut() else { return };
+    let usage = extract_usage(message);
+    turn.usage.input_tokens = turn.usage.input_tokens.saturating_add(usage.input_tokens);
+    turn.usage.output_tokens = turn.usage.output_tokens.saturating_add(usage.output_tokens);
+    turn.usage.total_tokens = turn.usage.total_tokens.saturating_add(usage.total_tokens);
 }
 
 async fn handle_message_update(native: &NativePi, message: &Value) {
@@ -712,7 +733,7 @@ async fn handle_settled(native: &NativePi, message: &Value) {
     let Some(turn) = native.active_turn.lock().await.take() else {
         return;
     };
-    let usage = extract_usage(message);
+    let usage = turn.usage;
     if let Some(error) = message.get("error").filter(|value| !value.is_null()) {
         emit_event(
             native,

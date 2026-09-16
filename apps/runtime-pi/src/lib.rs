@@ -1047,20 +1047,29 @@ fn map_answer_to_pi_value(
 }
 
 fn extract_usage(message: &Value) -> SessionUsage {
-    let usage = message.get("usage");
+    let usage = &message["usage"];
+    let tokens = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let input_tokens = usage
+        .get("input")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| tokens("inputTokens"));
+    let output_tokens = usage
+        .get("output")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| tokens("outputTokens"));
     SessionUsage {
-        input_tokens: usage
-            .and_then(|u| u.get("inputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        output_tokens: usage
-            .and_then(|u| u.get("outputTokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
+        output_tokens,
+        // Pi's total includes cache reads and writes in addition to input/output.
         total_tokens: usage
-            .and_then(|u| u.get("totalTokens"))
+            .get("totalTokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0),
+            .unwrap_or_else(|| {
+                input_tokens
+                    .saturating_add(output_tokens)
+                    .saturating_add(tokens("cacheRead"))
+                    .saturating_add(tokens("cacheWrite"))
+            }),
     }
 }
 

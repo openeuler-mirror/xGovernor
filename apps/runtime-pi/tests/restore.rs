@@ -39,7 +39,7 @@ fn seed_valid_session_file(session_dir: &str, file_name: &str) -> String {
     std::fs::write(
         &path,
         "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
-         {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"stopReason\":\"end_turn\"}}\n",
+         {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"stopReason\":\"end_turn\",\"usage\":{\"input\":100000,\"output\":2000,\"totalTokens\":102000}}}\n",
     )
     .expect("seed a valid session jsonl file");
     path.to_string_lossy().into_owned()
@@ -164,7 +164,16 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
                     saw_output = true;
                 }
             }
-            SessionEvent::TurnCompleted { outcome, .. } => {
+            SessionEvent::TurnCompleted { outcome, usage, .. } => {
+                assert_eq!(
+                    usage,
+                    session_protocol::SessionUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                    },
+                    "restored history must not be charged again"
+                );
                 assert_eq!(outcome, SessionTurnOutcome::Complete);
                 saw_completed = true;
                 break;
