@@ -181,7 +181,7 @@ curl -sS -X POST http://127.0.0.1:8787/api/v1/sessions/open \
 
 turn 的输出、工具活动、终态都走 SSE：`GET /api/v1/sessions/:runtime_id/turns/:turn_id/events`。但 `turn_id` 是提交 turn 时服务端才签发的
 （`SessionSubmitReceipt.turn_id`），所以实践顺序是：提交 turn 拿到 `turn_id` → 立刻用它订阅事件流。事件流的注册表有 30s TTL
-（`STREAM_ENTRY_TTL`，见 `apps/server/src/httpserver/session.rs`），别拖太久再订阅。
+（可通过 `XGOVERNOR_STREAM_ENTRY_TTL_SECS` 配置正整数秒数，默认 30 秒，重启服务生效；见 `apps/server/src/httpserver/session.rs`），别拖太久再订阅。
 
 ## 5. 提交一个 turn（`POST /api/v1/sessions/turns`）
 

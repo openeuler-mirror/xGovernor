@@ -106,6 +106,7 @@ cargo run -p xgovernor-server
 | `XGOVERNOR_LEASE_STALE_SECS` | `45` | Heartbeat staleness window for lease takeover/expiry |
 | `XGOVERNOR_ORPHAN_THRESHOLD_SECS` | `1800` | No-heartbeat duration before the orphan reaper force-closes a session |
 | `XGOVERNOR_ORPHAN_REAPER_INTERVAL_SECS` | `600` | Orphan reaper polling interval |
+| `XGOVERNOR_STREAM_ENTRY_TTL_SECS` | `30` | Retention time for turn event streams awaiting an SSE subscriber (both listeners); positive integer seconds, invalid values warn and fall back to 30. Checked every 10 seconds; restart to apply. |
 | `XGOVERNOR_RECLAIM_SWEEP_INTERVAL_SECS` | `300` | Provider sandbox liveness sweep interval |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
 | `XGOVERNOR_E2B_TIMEOUT_SECS` | `3600` | Default E2B sandbox timeout; explicit provider `timeout_secs` overrides it |
