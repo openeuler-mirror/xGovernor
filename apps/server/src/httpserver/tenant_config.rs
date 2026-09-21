@@ -92,6 +92,8 @@ pub enum TenantConfigError {
     /// quota/principal would apply is ambiguous, so this is rejected rather
     /// than picking one arbitrarily.
     DuplicateTenantId(String),
+    /// Tenant identifiers must contain at least one non-whitespace character.
+    EmptyTenantId,
     /// A `[[tenant]]` block with zero tokens can never be reached by any
     /// request — almost certainly a mistake, not an intentionally-disabled
     /// tenant (comment the block out instead).
@@ -120,6 +122,10 @@ impl std::fmt::Display for TenantConfigError {
                 "tenant_id {tenant_id:?} appears in more than one [[tenant]] block — merge them \
                  into a single block"
             ),
+            Self::EmptyTenantId => write!(
+                f,
+                "tenant_id in [[tenant]] must not be empty or whitespace-only"
+            ),
             Self::EmptyTokenList(tenant_id) => write!(
                 f,
                 "tenant {tenant_id:?} has an empty tokens list — it can never be reached by any \
@@ -142,7 +148,7 @@ pub fn load_tenants_file(
 }
 
 /// Reads and parses `path` into the raw [`TenantsFile`] shape, *without* the
-/// duplicate-token/duplicate-tenant-id/empty-token-list validation
+/// tenant-id/token validation
 /// [`into_entries`] does — `httpserver::admin_tenants`'s create/patch/delete
 /// handlers need the raw, still-mutable struct (to add/edit/remove one
 /// `[[tenant]]` block) before re-running that same validation on the result
@@ -187,6 +193,9 @@ pub(crate) fn into_entries(
 
     let mut seen_tenant_ids = HashSet::new();
     for tenant in file.tenant {
+        if tenant.tenant_id.trim().is_empty() {
+            return Err(TenantConfigError::EmptyTenantId);
+        }
         if !seen_tenant_ids.insert(tenant.tenant_id.clone()) {
             return Err(TenantConfigError::DuplicateTenantId(tenant.tenant_id));
         }
@@ -331,6 +340,22 @@ mod tests {
         );
         let error = load_tenants_file(&path).unwrap_err();
         assert!(matches!(error, TenantConfigError::DuplicateToken(t) if t == "shared-token"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_only_tenant_id_is_rejected() {
+        for tenant_id in ["", " ", "\t\r\n", "\u{3000}"] {
+            let path = write_temp_toml(&format!(
+                "[admin]\ntokens = [\"a\"]\n[[tenant]]\ntenant_id = {}\ntokens = [\"tt\"]\n",
+                toml::Value::String(tenant_id.to_string())
+            ));
+            let error = load_tenants_file(&path).unwrap_err();
+            assert!(matches!(error, TenantConfigError::EmptyTenantId));
+            assert_eq!(
+                error.to_string(),
+                "tenant_id in [[tenant]] must not be empty or whitespace-only"
+            );
+        }
     }
 
     #[test]

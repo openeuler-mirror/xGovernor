@@ -14,6 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// also matching the file's own defaults. The bearer token itself is never
 /// part of this request — see [`TenantCreateResponse::token`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantCreateRequest {
     pub tenant_id: String,
     #[serde(default)]
@@ -52,6 +53,7 @@ pub struct TenantCreateResponse {
 /// `null`, `Some(v)` for a number) in an outer `Some(..)`. `#[serde(default)]`
 /// supplies the outer `None` when the key is missing entirely.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantPatchRequest {
     #[serde(
         default,
