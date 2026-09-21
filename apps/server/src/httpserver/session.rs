@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use xgovernor_core::{project_session_error, SecurityContext, SessionApplication};
 
-const STREAM_ENTRY_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_STREAM_ENTRY_TTL: Duration = Duration::from_secs(30);
 const STREAM_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_PENDING_STREAMS: usize = 1000;
 /// Cap on `GET /api/v1/sessions` — v1 has no real pagination
@@ -48,6 +48,7 @@ struct StreamEntry {
 #[derive(Clone)]
 pub struct SessionHttpState {
     application: SessionApplication,
+    stream_entry_ttl: Duration,
     streams: Arc<Mutex<HashMap<String, HashMap<String, StreamEntry>>>>,
 }
 
@@ -55,17 +56,27 @@ impl SessionHttpState {
     pub fn new(application: SessionApplication) -> Self {
         Self {
             application,
+            stream_entry_ttl: DEFAULT_STREAM_ENTRY_TTL,
             streams: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Configure how long an unclaimed turn event stream is retained.
+    /// The default is 30 seconds; the sweeper checks every 10 seconds.
+    pub fn with_stream_entry_ttl(mut self, ttl: Duration) -> Self {
+        assert!(!ttl.is_zero(), "stream entry TTL must be positive");
+        self.stream_entry_ttl = ttl;
+        self
+    }
+
     pub fn spawn_stream_sweeper(&self) -> tokio::task::JoinHandle<()> {
         let streams = Arc::clone(&self.streams);
+        let ttl = self.stream_entry_ttl;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(STREAM_SWEEP_INTERVAL);
             loop {
                 ticker.tick().await;
-                sweep_expired_streams(&streams).await;
+                sweep_expired_streams(&streams, ttl).await;
             }
         })
     }
@@ -100,23 +111,26 @@ async fn register_stream(
 }
 
 /// One sweep pass: drops every stream entry whose SSE consumer has not
-/// attached within [`STREAM_ENTRY_TTL`] of `submit_turn` registering it.
+/// attached within the configured `ttl` of `submit_turn` registering it.
 /// Split out from [`SessionHttpState::spawn_stream_sweeper`] so a test can
 /// drive exactly one pass synchronously (mirrors
 /// `xgovernor_core::orphan_reaper::sweep_once`).
-async fn sweep_expired_streams(streams: &Mutex<HashMap<String, HashMap<String, StreamEntry>>>) {
+async fn sweep_expired_streams(
+    streams: &Mutex<HashMap<String, HashMap<String, StreamEntry>>>,
+    ttl: Duration,
+) {
     let mut streams = streams.lock().await;
     let mut expired = 0usize;
     streams.retain(|_runtime_id, turns| {
         let before = turns.len();
-        turns.retain(|_turn_id, entry| entry.registered_at.elapsed() < STREAM_ENTRY_TTL);
+        turns.retain(|_turn_id, entry| entry.registered_at.elapsed() < ttl);
         expired += before - turns.len();
         !turns.is_empty()
     });
     if expired > 0 {
         tracing::debug!(
             expired,
-            ttl_secs = STREAM_ENTRY_TTL.as_secs(),
+            ttl_secs = ttl.as_secs(),
             "stream sweeper expired unclaimed turn event streams"
         );
     }
@@ -242,7 +256,7 @@ async fn close_session(
         .await;
     // Any turn stream still sitting unclaimed for this runtime_id will never
     // be attached to now that the session itself is closing — sweep it
-    // immediately rather than waiting out STREAM_ENTRY_TTL. Done regardless
+    // immediately rather than waiting out the configured stream TTL. Done regardless
     // of whether close succeeded: a failure (e.g. NotFound because it was
     // already closed through another path) still means nobody is coming
     // back for this runtime_id's streams either.
@@ -448,5 +462,54 @@ fn session_event_name(event: &SessionEvent) -> &'static str {
         SessionEvent::TurnCompleted { .. } => "turn_completed",
         SessionEvent::TurnFailed { .. } => "turn_failed",
         SessionEvent::Extension { .. } => "extension",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_sweeper_honors_configured_ttl() {
+        let streams = Mutex::new(HashMap::new());
+        let (sender, receiver) = mpsc::channel(1);
+        assert!(register_stream(&streams, "runtime", "turn", receiver).await);
+        streams
+            .lock()
+            .await
+            .get_mut("runtime")
+            .unwrap()
+            .get_mut("turn")
+            .unwrap()
+            .registered_at = Instant::now() - Duration::from_secs(60);
+
+        // A longer configured TTL preserves streams older than the default.
+        sweep_expired_streams(&streams, Duration::from_secs(300)).await;
+        assert_eq!(streams.lock().await["runtime"].len(), 1);
+        assert!(!sender.is_closed());
+
+        sweep_expired_streams(&streams, DEFAULT_STREAM_ENTRY_TTL).await;
+        assert!(streams.lock().await.is_empty());
+        assert!(sender.is_closed());
+    }
+
+    #[tokio::test]
+    async fn stream_sweeper_supports_ttl_shorter_than_default() {
+        let streams = Mutex::new(HashMap::new());
+        let (_sender, receiver) = mpsc::channel(1);
+        assert!(register_stream(&streams, "runtime", "turn", receiver).await);
+        streams
+            .lock()
+            .await
+            .get_mut("runtime")
+            .unwrap()
+            .get_mut("turn")
+            .unwrap()
+            .registered_at = Instant::now() - Duration::from_secs(5);
+
+        sweep_expired_streams(&streams, DEFAULT_STREAM_ENTRY_TTL).await;
+        assert_eq!(streams.lock().await["runtime"].len(), 1);
+        sweep_expired_streams(&streams, Duration::from_secs(1)).await;
+        assert!(streams.lock().await.is_empty());
     }
 }

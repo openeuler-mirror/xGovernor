@@ -1,6 +1,6 @@
 mod support;
 use agent_runtime_protocol::RuntimeStartRequest;
-use serde_json::{json};
+use serde_json::json;
 
 fn request(
     id: &str,

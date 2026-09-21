@@ -619,7 +619,9 @@ async fn main() {
         TenantAdminState::new(table, tenants_config_path.clone(), application.clone())
     });
 
-    let admin_state = SessionHttpState::new(application.clone());
+    let stream_entry_ttl = configured_duration_secs("XGOVERNOR_STREAM_ENTRY_TTL_SECS", 30);
+    let admin_state =
+        SessionHttpState::new(application.clone()).with_stream_entry_ttl(stream_entry_ttl);
     let _admin_stream_sweeper = admin_state.spawn_stream_sweeper();
     let admin_router = create_router(
         admin_state,
@@ -628,7 +630,7 @@ async fn main() {
         tenant_admin_state,
     );
 
-    let tenant_state = SessionHttpState::new(application);
+    let tenant_state = SessionHttpState::new(application).with_stream_entry_ttl(stream_entry_ttl);
     let _tenant_stream_sweeper = tenant_state.spawn_stream_sweeper();
     let tenant_router = create_router(tenant_state, token_table.clone(), Some(Role::Tenant), None);
 
