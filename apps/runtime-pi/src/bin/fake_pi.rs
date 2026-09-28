@@ -209,7 +209,7 @@ fn run_cancellable_scenario(message: &str, rx: &mpsc::Receiver<serde_json::Value
         "type": "tool_execution_start",
         "toolCallId": activity_id,
         "toolName": "noop",
-        "input": {}
+        "args": {"message": message, "options": {"enabled": true, "limit": 3}}
     }));
 
     let deadline = Instant::now() + Duration::from_millis(CANCEL_WINDOW_MS);
