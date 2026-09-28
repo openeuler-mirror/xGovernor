@@ -618,7 +618,7 @@ async fn handle_tool_start(native: &NativePi, message: &Value) {
                 .unwrap_or("tool")
                 .into(),
             status: SessionToolActivityStatus::Running,
-            summary: message.get("input").map(Value::to_string),
+            summary: message.get("args").map(Value::to_string),
             ext: Default::default(),
         },
     );

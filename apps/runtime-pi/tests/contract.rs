@@ -307,6 +307,7 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
     let mut events = submission.events.expect("new turn carries an event stream");
     let mut saw_output = false;
     let mut saw_tool_activity = false;
+    let mut saw_tool_input = false;
     let mut saw_completed = false;
     while let Some(event) = events.recv().await {
         match event {
@@ -315,7 +316,28 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
                     saw_output = true;
                 }
             }
-            session_protocol::SessionEvent::ToolActivity { phase, status, .. } => {
+            session_protocol::SessionEvent::ToolActivity {
+                activity_id,
+                phase,
+                name,
+                status,
+                summary,
+                ..
+            } => {
+                if phase == SessionToolActivityPhase::Begin {
+                    assert_eq!(activity_id, "call-1");
+                    assert_eq!(name, "noop");
+                    assert_eq!(status, SessionToolActivityStatus::Running);
+                    let summary = summary.expect("tool begin must preserve Pi args");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&summary).expect("args must be valid JSON"),
+                        json!({
+                            "message": "hello-from-contract-test",
+                            "options": {"enabled": true, "limit": 3}
+                        })
+                    );
+                    saw_tool_input = true;
+                }
                 if phase == SessionToolActivityPhase::End {
                     assert_eq!(status, SessionToolActivityStatus::Succeeded);
                     saw_tool_activity = true;
@@ -340,6 +362,7 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
         saw_tool_activity,
         "expected a tool activity to flow through"
     );
+    assert!(saw_tool_input, "expected tool input to flow through");
     assert!(saw_completed, "expected a terminal turn_completed event");
 
     // Confirm the spawned `fake_pi` process actually received
