@@ -38,6 +38,20 @@ struct CheckpointListQuery {
     offset: Option<usize>,
 }
 
+impl CheckpointListQuery {
+    fn validated_limit(&self) -> Result<usize, SessionWireError> {
+        let limit = self.limit.unwrap_or(DEFAULT_CHECKPOINT_LIST_LIMIT);
+        if !(1..=MAX_CHECKPOINT_LIST_LIMIT).contains(&limit) {
+            return Err(SessionWireError::InvalidRequest {
+                message: format!(
+                    "limit must be between 1 and {MAX_CHECKPOINT_LIST_LIMIT} (received {limit})"
+                ),
+            });
+        }
+        Ok(limit)
+    }
+}
+
 /// One pending stream: the receiving half of a turn's forwarded eventx w
 /// channel, plus when it was registered (for TTL expiry).
 struct StreamEntry {
@@ -382,10 +396,10 @@ async fn list_checkpoints(
     Extension(ctx): Extension<SecurityContext>,
     Query(query): Query<CheckpointListQuery>,
 ) -> Response {
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_CHECKPOINT_LIST_LIMIT)
-        .clamp(1, MAX_CHECKPOINT_LIST_LIMIT);
+    let limit = match query.validated_limit() {
+        Ok(limit) => limit,
+        Err(error) => return session_error(error),
+    };
     let offset = query.offset.unwrap_or(0);
     match state
         .application
