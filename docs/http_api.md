@@ -32,7 +32,7 @@
 | `/api/v1/sessions/turns`                               | POST | SessionTurnRequest        | 202 SessionSubmitReceipt     |
 | `/api/v1/sessions/{runtime_id}/turns/{turn_id}/events` | GET  | —                         | 200 SSE 流                    |
 | `/api/v1/sessions/interactions`                        | POST | SessionInteractionRequest | 202 SessionSubmitReceipt     |
-| `/api/v1/sessions/cancel`                              | POST | SessionCancelRequest      | 200 SessionControlResponse   |
+| `/api/v1/sessions/cancel`                              | POST | SessionCancelRequest      | 202（空响应体）               |
 | `/api/v1/sessions/fork`                                | POST | SessionForkRequest        | 200 SessionOpenResponse      |
 | `/api/v1/sessions/heartbeat`                           | POST | SessionHeartbeatRequest   | 200 SessionHeartbeatResponse |
 | `/api/v1/sessions/detach`                              | POST | SessionDetachRequest      | 200 SessionControlResponse   |
@@ -169,7 +169,8 @@
 
 统一形态 `{ "runtime_id": "…", "lease": {…} }`；cancel 额外可带 `turn_id`（`null` 表示取消当前活跃 turn）。
 
-- close / detach / cancel → `SessionControlResponse`：`{ "runtime_id", "status", "updated_at_ms" }`。
+- close / detach → `SessionControlResponse`：`{ "runtime_id", "status", "updated_at_ms" }`。
+- cancel 成功返回 202（空响应体），不要求持有写租约。指定 `turn_id` 时必须匹配该会话当前活跃的 turn；不存在、不属于该会话或已结束的 turn 返回 404 `not_found`。省略 `turn_id` 或传 `null` 时取消当前活跃 turn，无活跃 turn 时仍返回 202。
 - heartbeat → `{ "runtime_id", "accepted": true, "lease_expires_at_ms": … }`。匿名 heartbeat 直接 401 `lease_required`。
 - detach 释放租约但保留会话（runtime 保温）；close 终结会话。
 
