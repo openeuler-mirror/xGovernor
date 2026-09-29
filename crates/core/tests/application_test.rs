@@ -1354,7 +1354,7 @@ async fn cancel_delegates_to_the_runtime_without_a_lease_check() {
 
     // client-b does not hold the lease, but cancel is not lease-gated.
     application
-        .cancel(&admin_ctx(), "runtime-1", Some("turn-1"))
+        .cancel(&admin_ctx(), "runtime-1", None)
         .await
         .expect("cancel must not require holding the write lease");
 }
@@ -1488,6 +1488,7 @@ async fn submit_when_gate_frees(
 #[derive(Default)]
 struct HoldingRuntime {
     turn_sender: Mutex<Option<mpsc::Sender<RuntimeEvent>>>,
+    cancellations: Mutex<Vec<RuntimeCancelRequest>>,
 }
 
 #[async_trait]
@@ -1539,7 +1540,8 @@ impl AgentRuntime for HoldingRuntime {
         Ok(())
     }
 
-    async fn cancel(&self, _request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
+    async fn cancel(&self, request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
+        self.cancellations.lock().await.push(request);
         Ok(())
     }
 }
@@ -2679,6 +2681,7 @@ async fn active_turn_blocks_external_operations_and_checkpoint() {
         .insert(RuntimeCapability::Checkpoint);
     let runtime = Arc::new(HoldingRuntime {
         turn_sender: Mutex::new(None),
+        ..Default::default()
     });
     let app = SessionApplication::new(
         runtime,

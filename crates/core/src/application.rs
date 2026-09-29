@@ -1360,7 +1360,8 @@ impl SessionApplication {
         })
     }
 
-    /// Thin delegation to `runtime.cancel()`. Deliberately not lease-gated:
+    /// Validate exact-turn cancellation before delegating to `runtime.cancel()`.
+    /// Deliberately not lease-gated:
     /// cancelling your own in-flight turn should not require holding the
     /// write lease (see `docs/session_orchestration_skeleton.md`, Component
     /// B). Thin audit-logging wrapper (`docs/tenancy_design.md` §6) around
@@ -1383,6 +1384,18 @@ impl SessionApplication {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
+        if let Some(turn_id) = turn_id {
+            let active = self
+                .turn_gate
+                .active
+                .lock()
+                .expect("turn gate lock poisoned");
+            if active.get(runtime_id).map(String::as_str) != Some(turn_id) {
+                return Err(SessionDomainError::NotFound {
+                    runtime_id: runtime_id.to_string(),
+                });
+            }
+        }
         self.ensure_runtime_attached(ctx, &record).await?;
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
