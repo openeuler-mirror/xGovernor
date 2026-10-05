@@ -1250,6 +1250,47 @@ async fn detach_releases_only_the_callers_own_lease_and_leaves_the_runtime_runni
 }
 
 #[tokio::test]
+async fn open_rejects_an_explicitly_empty_runtime_id() {
+    // `runtime_id: None` is filled from the generator; an explicit `Some("")`
+    // used to be taken at face value and persisted, which is how a row with
+    // `runtime_id = ''` gets into the database in the first place. An empty id
+    // can never name a real session.
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        test_provider_managers(),
+        Arc::new(MemoryRepository::default()),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(TestEnvironment),
+        Arc::new(FixedTurnId),
+    );
+
+    let error = application
+        .open(
+            &admin_ctx(),
+            SessionOpenRequest {
+                runtime_id: Some(String::new()),
+                runtime_kind: None,
+                conversation_id: "conversation".into(),
+                sender_id: "sender".into(),
+                workspace: Default::default(),
+                deployment: Default::default(),
+                requested_capabilities: Default::default(),
+                llm: None,
+                ext: Default::default(),
+                lease: Default::default(),
+            },
+        )
+        .await
+        .err()
+        .expect("an explicitly empty runtime_id must be rejected");
+    assert!(
+        matches!(error, SessionDomainError::InvalidRequest { .. }),
+        "expected InvalidRequest for an empty runtime_id, got {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn heartbeat_without_lease_enforcement_is_a_no_op_accept() {
     let application = SessionApplication::new(
         Arc::new(CompletingRuntime::default()),
