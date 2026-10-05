@@ -1013,6 +1013,12 @@ impl SessionApplication {
             }
             return Err(error);
         }
+        // Record the session in the lease table as "exists, no holder yet" so
+        // the orphan reaper can reclaim it if the client dies before its first
+        // heartbeat: the reaper only walks that table.
+        if let Some(lease_table) = &self.lease_table {
+            lease_table.ensure_unclaimed(&record.runtime_id).await;
+        }
         Ok(project_session(&record))
     }
 

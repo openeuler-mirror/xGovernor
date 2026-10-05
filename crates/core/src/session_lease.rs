@@ -222,6 +222,24 @@ impl SessionLeaseTable {
         }
     }
 
+    /// Record that `session_id` exists but has no holder yet.
+    ///
+    /// Called by `open` so the orphan reaper can see a session that was never
+    /// claimed: the reaper only walks this table, so a session absent from it
+    /// is invisible and its backend is never reclaimed. An existing entry is
+    /// left untouched — a real holder must not be displaced by an `open` that
+    /// re-attaches to the same `runtime_id`.
+    pub async fn ensure_unclaimed(&self, session_id: &str) {
+        let now = match current_time_ms() {
+            Ok(now) => now,
+            Err(_) => return,
+        };
+        let mut table = self.shard_for(session_id).lock().await;
+        table
+            .entry(session_id.to_string())
+            .or_insert_with(|| fresh_lease(String::new(), None, None, now));
+    }
+
     /// Renew an existing lease. `Ok(())` when the caller is the current
     /// holder or when no lease is in place (e.g. after daemon restart wiped
     /// the table — in that case the heartbeat auto-re-acquires the lease so
