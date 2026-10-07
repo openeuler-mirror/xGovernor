@@ -21,6 +21,20 @@ struct HealthResponse {
 /// includes base64 file transfers: 2 MiB accommodates a 1 MiB binary chunk.
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+fn request_body_limit() -> usize {
+    if std::env::var("XGOVERNOR_DOCKER_ENABLED").as_deref() == Ok("1") {
+        std::env::var("XGOVERNOR_DOCKER_FILE_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4 * 1024 * 1024)
+            .min(64 * 1024 * 1024)
+            * 2
+            + 1024 * 1024
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    }
+}
+
 /// Per-request timeout for every non-SSE route. The SSE event-stream route
 /// is composed *outside* this layer entirely — see
 /// [`session::sse_session_router`]'s doc comment for why.
@@ -72,12 +86,12 @@ async fn operation_timeout(
     let budget = match request.uri().path() {
         "/api/v1/sessions/exec" => {
             let (parts, body) = request.into_parts();
-            let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+            let bytes = match axum::body::to_bytes(body, request_body_limit()).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        "exec request body exceeds 2 MiB",
+                        "exec request body exceeds configured limit",
                     )
                         .into_response()
                 }
@@ -85,7 +99,7 @@ async fn operation_timeout(
             let requested = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|v| v.get("timeout_ms").and_then(serde_json::Value::as_u64))
-                .unwrap_or(30_000);
+                .unwrap_or(60_000);
             request = axum::http::Request::from_parts(parts, axum::body::Body::from(bytes));
             Duration::from_millis(requested.min(3_600_000).saturating_add(30_000))
         }
@@ -108,7 +122,7 @@ async fn operation_timeout(
 fn apply_transport_defenses(router: Router) -> Router {
     router
         .layer(SharedConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(request_body_limit()))
         .layer(axum::middleware::from_fn(operation_timeout))
 }
 
@@ -152,3 +166,7 @@ pub fn create_router(
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
+
+#[cfg(test)]
+#[path = "router_tests.rs"]
+mod restored_http_tests;

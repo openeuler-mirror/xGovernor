@@ -527,3 +527,7 @@ mod tests {
         assert!(streams.lock().await.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "session_http_tests.rs"]
+mod restored_http_tests;
