@@ -13,12 +13,14 @@ pub mod diff;
 
 mod contract;
 mod error;
+mod execution;
 mod permission;
 mod types;
 
 pub use contract::{OperationBackend, OperationBackendCapabilities};
 pub use diff::{line_change_counts, FileChangeDelta};
 pub use error::{ExecutionState, OperationError};
+pub use execution::{OperationContext, OperationExecutionControl};
 pub use permission::{
     OperationPermissionControl, SandboxPermissionCapability, SandboxPermissionGrantId,
     SandboxPermissionGrantRequest, SandboxPermissionScope, SandboxPolicyDenial,

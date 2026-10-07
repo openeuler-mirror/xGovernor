@@ -6,7 +6,13 @@ use std::process::Command;
 fn public_contract_has_only_the_approved_dependencies() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let output = Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version", "1", "--manifest-path"])
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
         .arg(format!("{manifest_dir}/Cargo.toml"))
         .output()
         .expect("cargo metadata must run");

@@ -213,7 +213,7 @@ mod tests {
 
 /// Request-only LLM configuration. `api_key` must be consumed during request
 /// handling and must never be projected into a descriptor or persistent state.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LlmOverrideRequest {
     #[serde(default)]
@@ -226,6 +226,16 @@ pub struct LlmOverrideRequest {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for LlmOverrideRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmOverrideRequest")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Safe response/persistence projection: a key value cannot be represented.
