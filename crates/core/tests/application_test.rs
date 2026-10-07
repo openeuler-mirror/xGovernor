@@ -2131,7 +2131,7 @@ async fn tenant_can_delete_own_checkpoint_and_metadata() {
 }
 
 #[tokio::test]
-async fn checkpoint_delete_failure_preserves_metadata_and_cross_tenant_is_hidden() {
+async fn checkpoint_delete_failure_retains_intent_and_hides_checkpoint() {
     let repository = Arc::new(xgovernor_core::SqliteSessionRepository::open_in_memory().unwrap());
     repository
         .save_checkpoint(checkpoint_manager_record())
@@ -2167,7 +2167,26 @@ async fn checkpoint_delete_failure_preserves_metadata_and_cross_tenant_is_hidden
         .get_checkpoint("checkpoint-1")
         .await
         .unwrap()
-        .is_some());
+        .is_none());
+    let intents = repository.operation_intents().await.unwrap();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].0, "delete:checkpoint-1");
+    assert_eq!(intents[0].1["checkpoint"], "checkpoint-1");
+    assert!(matches!(
+        application
+            .delete_checkpoint(&tenant_ctx(), request())
+            .await,
+        Err(SessionDomainError::NotFound { .. })
+    ));
+    assert!(application.reconcile_snapshot_intents().await.is_err());
+    let retry = repository.operation_intents().await.unwrap();
+    assert_eq!(retry[0].1["retry_count"], 1);
+    assert!(retry[0].1["last_error"].as_str().is_some());
+    application.reconcile_snapshot_intents().await.unwrap();
+    assert_eq!(
+        repository.operation_intents().await.unwrap()[0].1["retry_count"],
+        1
+    );
 }
 
 /// An admin `ctx` has no `tenant_id`, so `open` never even reads this

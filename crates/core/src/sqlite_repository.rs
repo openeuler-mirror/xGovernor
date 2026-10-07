@@ -78,7 +78,8 @@ impl SqliteSessionRepository {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.pragma_update(None, "busy_timeout", 5_000i64);
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
+            "CREATE TABLE IF NOT EXISTS snapshot_operations (id TEXT PRIMARY KEY, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sessions (
                 runtime_id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
                 sender_id TEXT NOT NULL,
@@ -310,6 +311,52 @@ impl SessionRepository for SqliteSessionRepository {
         result.map_err(|error| internal_error(format!("sqlite save failed: {error}")))
     }
 
+    async fn save_operation_intent(
+        &self,
+        id: &str,
+        body: serde_json::Value,
+    ) -> Result<(), SessionDomainError> {
+        let conn = self.conn.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || { conn.lock().unwrap().execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map(|_|()).map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
+    }
+    async fn operation_intents(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value)>, SessionDomainError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = conn.lock().unwrap();
+            let mut q = db
+                .prepare("SELECT id,body FROM snapshot_operations ORDER BY id")
+                .map_err(|e| internal_error(e.to_string()))?;
+            let rows = q
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| internal_error(e.to_string()))?;
+            rows.map(|row| {
+                let (id, body) = row.map_err(|e| internal_error(e.to_string()))?;
+                Ok((
+                    id,
+                    serde_json::from_str(&body).map_err(|e| internal_error(e.to_string()))?,
+                ))
+            })
+            .collect()
+        })
+        .await
+        .map_err(|e| internal_error(e.to_string()))?
+    }
+    async fn delete_operation_intent(&self, id: &str) -> Result<(), SessionDomainError> {
+        let conn = self.conn.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            conn.lock()
+                .unwrap()
+                .execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
+                .map(|_| ())
+                .map_err(|e| internal_error(e.to_string()))
+        })
+        .await
+        .map_err(|e| internal_error(e.to_string()))?
+    }
     async fn save_checkpoint(
         &self,
         record: crate::CheckpointRecord,
@@ -331,7 +378,7 @@ impl SessionRepository for SqliteSessionRepository {
         let checkpoint_id = checkpoint_id.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<Option<crate::CheckpointRecord>, String> {
             let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            let mut stmt = conn.prepare("SELECT checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms FROM checkpoints WHERE checkpoint_id=?1").map_err(|e| e.to_string())?;
+            let mut stmt = conn.prepare("SELECT checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms FROM checkpoints WHERE checkpoint_id=?1 AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)").map_err(|e| e.to_string())?;
             let mut rows = stmt.query(params![checkpoint_id]).map_err(|e| e.to_string())?;
             let Some(row) = rows.next().map_err(|e| e.to_string())? else { return Ok(None); };
             let decode = |idx: usize| -> Result<String, String> { row.get(idx).map_err(|e| e.to_string()) };
@@ -377,7 +424,7 @@ impl SessionRepository for SqliteSessionRepository {
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
             let total: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM checkpoints WHERE (tenant_id = ?1 OR ?1 IS NULL)",
+                    "SELECT COUNT(*) FROM checkpoints WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)",
                     params![tenant_id],
                     |row| row.get(0),
                 )
@@ -386,7 +433,7 @@ impl SessionRepository for SqliteSessionRepository {
                 .prepare(
                     "SELECT checkpoint_id, source_runtime_id, tenant_id, created_by, created_at_ms
                      FROM checkpoints
-                     WHERE (tenant_id = ?1 OR ?1 IS NULL)
+                     WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)
                      ORDER BY created_at_ms DESC, checkpoint_id DESC
                      LIMIT ?2 OFFSET ?3",
                 )
@@ -589,6 +636,42 @@ mod tests {
         let repo = SqliteSessionRepository::open_in_memory().expect("open in-memory db");
         let loaded = repo.get("does-not-exist").await.expect("get must succeed");
         assert_eq!(loaded, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_intents_survive_reopen_and_hide_deleting_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let repo = SqliteSessionRepository::open(&path).unwrap();
+        let session = sample_record("source");
+        let cp = crate::CheckpointRecord {
+            checkpoint_id: "cp".into(),
+            source_runtime_id: "source".into(),
+            provider_snapshot_id: "snap".into(),
+            runtime_state: session.runtime,
+            workspace: session.workspace,
+            isolation: session.isolation,
+            capabilities: session.capabilities,
+            owner_ref: "admin".into(),
+            tenant_id: None,
+            created_by: None,
+            created_at_ms: 1,
+        };
+        repo.save_checkpoint(cp).await.unwrap();
+        repo.save_operation_intent(
+            "delete:cp",
+            serde_json::json!({"kind":"delete","checkpoint":"cp"}),
+        )
+        .await
+        .unwrap();
+        drop(repo);
+        let repo = SqliteSessionRepository::open(&path).unwrap();
+        assert_eq!(repo.operation_intents().await.unwrap().len(), 1);
+        assert!(repo.get_checkpoint("cp").await.unwrap().is_none());
+        assert_eq!(repo.list_checkpoints(None, 200, 0).await.unwrap().total, 0);
+        assert!(repo.delete_checkpoint("cp").await.unwrap());
+        repo.delete_operation_intent("delete:cp").await.unwrap();
+        assert!(repo.operation_intents().await.unwrap().is_empty());
     }
 
     #[tokio::test]

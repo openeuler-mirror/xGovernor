@@ -49,6 +49,12 @@ fn map_provider_error(error: provider_protocol::ProviderControlError) -> Session
                 capability,
             }
         }
+        provider_protocol::ProviderControlError::ResourceLimitExceeded { max, .. } => {
+            SessionDomainError::QuotaExceeded {
+                scope: "provider containers".into(),
+                limit: max as u32,
+            }
+        }
         error => SessionDomainError::Unavailable {
             message: error.to_string(),
         },
@@ -427,6 +433,8 @@ pub struct SessionApplication {
     lease_table: Option<Arc<SessionLeaseTable>>,
     /// Single-active-turn enforcement + `client_request_id` idempotency.
     turn_gate: Arc<TurnGate>,
+    snapshot_transactions: Arc<tokio::sync::Mutex<()>>,
+    snapshot_publication: Arc<tokio::sync::Mutex<()>>,
     /// tenant_id → count of sessions currently open for that tenant.
     tenant_sessions: Arc<Mutex<HashMap<String, usize>>>,
 }
@@ -494,6 +502,8 @@ impl SessionApplication {
             clock,
             lease_table: None,
             turn_gate: Arc::new(TurnGate::default()),
+            snapshot_transactions: Default::default(),
+            snapshot_publication: Default::default(),
             tenant_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -687,6 +697,7 @@ impl SessionApplication {
         {
             runtime_wire_capabilities
                 .insert(session_protocol::SessionRuntimeCapability::Checkpoint);
+            runtime_wire_capabilities.insert(session_protocol::SessionRuntimeCapability::Fork);
         }
         for requested in &request.requested_capabilities.sandbox {
             if !normalized
@@ -1135,6 +1146,7 @@ impl SessionApplication {
         runtime_id: &str,
         lease: SessionLeaseClaim,
     ) -> Result<SessionControlResponse, SessionDomainError> {
+        let _publication = self.snapshot_publication.lock().await;
         let record = self.require_session(ctx, runtime_id).await?;
         self.check_lease_holder(runtime_id, &lease).await?;
         self.finalize_closed_session(record, runtime_id, None).await
@@ -1668,11 +1680,14 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
-        let record = self.require_session(ctx, &request.runtime_id).await?;
+        let _transaction = self.snapshot_transactions.lock().await;
+        let mut record = self.require_session(ctx, &request.runtime_id).await?;
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
         let _guard = self.claim_operation(&request.runtime_id)?;
         self.ensure_runtime_attached(ctx, &record).await?;
+        self.refresh_docker_snapshot_capabilities(&mut record)
+            .await?;
         if matches!(
             request.requested_scope,
             Some(session_protocol::SessionCheckpointScope::WorkspaceOnly)
@@ -1698,12 +1713,28 @@ impl SessionApplication {
             });
         }
         let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
+        let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
+        let mut intent = serde_json::json!({"kind":"checkpoint","runtime_kind":record.runtime.runtime_kind,"provider":provider_id,"source":request.runtime_id,"checkpoint":checkpoint_id,"snapshot":format!("request:{checkpoint_id}")});
+        self.records
+            .save_operation_intent(&checkpoint_id, intent.clone())
+            .await?;
         let runtime_state = runtime
             .export_checkpoint_state(&request.runtime_id)
             .await
             .map_err(map_runtime_error)?;
+        intent["history"] =
+            serde_json::to_value(&runtime_state).map_err(|e| SessionDomainError::Internal {
+                message: e.to_string(),
+                source: None,
+            })?;
+        self.records
+            .save_operation_intent(&checkpoint_id, intent.clone())
+            .await?;
         let provider_snapshot = match manager
-            .checkpoint_instance(&request.runtime_id)
+            .checkpoint_instance_correlated(
+                &request.runtime_id,
+                serde_json::json!({"request_id":checkpoint_id}),
+            )
             .await
             .map_err(map_provider_error)
         {
@@ -1713,7 +1744,33 @@ impl SessionApplication {
                 return Err(error);
             }
         };
-        let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
+        intent["snapshot"] = serde_json::json!(provider_snapshot.snapshot_id.0);
+        self.records
+            .save_operation_intent(&checkpoint_id, intent)
+            .await?;
+        let _publication = self.snapshot_publication.lock().await;
+        if self
+            .records
+            .get(&request.runtime_id)
+            .await?
+            .is_none_or(|r| matches!(r.status, SessionStatus::Closed | SessionStatus::Failed))
+        {
+            return Err(SessionDomainError::Conflict {
+                message: "session closed during checkpoint".into(),
+            });
+        }
+
+        if manager
+            .inspect_instance(&request.runtime_id)
+            .await
+            .map_err(map_provider_error)?
+            .state
+            != provider_protocol::ProviderLifecycleState::Active
+        {
+            return Err(SessionDomainError::Unavailable {
+                message: "source is no longer active".into(),
+            });
+        }
         let created_at_ms = self.clock.now_ms();
         if let Err(error) = self
             .records
@@ -1741,6 +1798,7 @@ impl SessionApplication {
                 .await;
             return Err(error);
         }
+        self.records.delete_operation_intent(&checkpoint_id).await?;
         Ok(SessionCheckpointResult {
             checkpoint_id,
             runtime_id: request.runtime_id,
@@ -1754,6 +1812,7 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionLoadRequest,
     ) -> Result<SessionOpenResponse, SessionDomainError> {
+        let _transaction = self.snapshot_transactions.lock().await;
         let resolved_llm = request.llm.as_ref().and_then(|llm| {
             let provider = llm.provider.as_deref()?.trim();
             let model = llm.model.as_deref()?.trim();
@@ -1804,6 +1863,8 @@ impl SessionApplication {
                 })?;
         }
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
+        let intent_id = format!("load:{runtime_id}");
+        self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"load","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"target":runtime_id})).await?;
         let backend = match manager
             .load_instance_from_snapshot(
                 runtime_id.clone(),
@@ -1900,6 +1961,7 @@ impl SessionApplication {
             }
             return Err(error);
         }
+        self.records.delete_operation_intent(&intent_id).await?;
         Ok(project_session(&record))
     }
 
@@ -1962,6 +2024,7 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionCheckpointDeleteRequest,
     ) -> Result<SessionCheckpointDeleteResult, SessionDomainError> {
+        let _transaction = self.snapshot_transactions.lock().await;
         let checkpoint = self
             .records
             .get_checkpoint(&request.checkpoint_id)
@@ -1975,6 +2038,8 @@ impl SessionApplication {
         // discoverable and retryable rather than silently orphaning it.
         let registration = self.registration(&checkpoint.runtime_state.runtime_kind)?;
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
+        let intent_id = format!("delete:{}", request.checkpoint_id);
+        self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"delete","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"checkpoint":request.checkpoint_id,"snapshot":checkpoint.provider_snapshot_id,"history":checkpoint.runtime_state})).await?;
         manager
             .delete_snapshot(
                 provider_protocol::BackendId(provider_id),
@@ -1990,6 +2055,7 @@ impl SessionApplication {
         self.records
             .delete_checkpoint(&request.checkpoint_id)
             .await?;
+        self.records.delete_operation_intent(&intent_id).await?;
         Ok(SessionCheckpointDeleteResult {
             checkpoint_id: request.checkpoint_id,
             deleted: true,
@@ -2001,13 +2067,16 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionForkRequest,
     ) -> Result<SessionOpenResponse, SessionDomainError> {
-        let parent = self
+        let _transaction = self.snapshot_transactions.lock().await;
+        let mut parent = self
             .require_session(ctx, &request.parent_runtime_id)
             .await?;
         self.check_lease_holder(&request.parent_runtime_id, &request.lease)
             .await?;
         let _guard = self.claim_operation(&request.parent_runtime_id)?;
         self.ensure_runtime_attached(ctx, &parent).await?;
+        self.refresh_docker_snapshot_capabilities(&mut parent)
+            .await?;
         let registration = self.registration_for_record(&parent)?;
         let runtime = Arc::clone(&registration.runtime);
 
@@ -2037,6 +2106,17 @@ impl SessionApplication {
                 })?;
         }
 
+        let intent_id = format!("fork:{runtime_id}");
+        let intent_provider = provider_for_isolation(registration, &parent.isolation)
+            .ok()
+            .map(|p| p.0)
+            .unwrap_or_default();
+        let mut intent = serde_json::json!({"kind":"fork","provider":intent_provider,"runtime_kind":parent.runtime.runtime_kind,"target":runtime_id,"source":request.parent_runtime_id,"snapshot":format!("request:{intent_id}")});
+        if !intent_provider.is_empty() {
+            self.records
+                .save_operation_intent(&intent_id, intent.clone())
+                .await?;
+        }
         let exported = match runtime
             .export_checkpoint_state(&request.parent_runtime_id)
             .await
@@ -2050,6 +2130,14 @@ impl SessionApplication {
                 return Err(error);
             }
         };
+        intent["history"] =
+            serde_json::to_value(&exported).map_err(|e| SessionDomainError::Internal {
+                message: e.to_string(),
+                source: None,
+            })?;
+        self.records
+            .save_operation_intent(&intent_id, intent.clone())
+            .await?;
         let (provider_id, manager) = match provider_for_isolation(registration, &parent.isolation) {
             Ok(pair) => pair,
             Err(error) => {
@@ -2061,7 +2149,10 @@ impl SessionApplication {
             }
         };
         let snapshot = match manager
-            .checkpoint_instance(&request.parent_runtime_id)
+            .checkpoint_instance_correlated(
+                &request.parent_runtime_id,
+                serde_json::json!({"request_id":intent_id}),
+            )
             .await
             .map_err(map_provider_error)
         {
@@ -2074,6 +2165,10 @@ impl SessionApplication {
                 return Err(error);
             }
         };
+        intent["snapshot"] = serde_json::json!(snapshot.snapshot_id.0);
+        self.records
+            .save_operation_intent(&intent_id, intent)
+            .await?;
         let loaded = manager
             .load_instance_from_snapshot(
                 runtime_id.clone(),
@@ -2142,6 +2237,28 @@ impl SessionApplication {
                 return Err(error);
             }
         };
+        let _publication = self.snapshot_publication.lock().await;
+        if self
+            .records
+            .get(&request.parent_runtime_id)
+            .await?
+            .is_none_or(|r| matches!(r.status, SessionStatus::Closed | SessionStatus::Failed))
+        {
+            return Err(SessionDomainError::Conflict {
+                message: "parent closed during fork".into(),
+            });
+        }
+        if manager
+            .inspect_instance(&request.parent_runtime_id)
+            .await
+            .map_err(map_provider_error)?
+            .state
+            != provider_protocol::ProviderLifecycleState::Active
+        {
+            return Err(SessionDomainError::Unavailable {
+                message: "fork source is no longer active".into(),
+            });
+        }
         let record = SessionRecord {
             runtime_id: runtime_id.clone(),
             conversation_id,
@@ -2237,6 +2354,49 @@ impl SessionApplication {
     /// explicit new `open`. On a successful restoration, a row left at
     /// `running` by the restart (the in-flight turn was orphaned, per §1.3)
     /// falls back to `idle`.
+    // Legacy records did not advertise snapshots. Refresh only after the existing
+    // attach path has checked the container policy and helper protocol.
+    async fn refresh_docker_snapshot_capabilities(
+        &self,
+        record: &mut SessionRecord,
+    ) -> Result<(), SessionDomainError> {
+        if provider_id_from_metadata(&record.isolation.metadata) != Some("docker") {
+            return Ok(());
+        }
+        let registration = self.registration_for_record(record)?;
+        let (_, manager) = provider_for_isolation(registration, &record.isolation)?;
+        let status = manager
+            .inspect_instance(&record.runtime_id)
+            .await
+            .map_err(map_provider_error)?;
+        if status
+            .capabilities
+            .lifecycle
+            .contains(&provider_protocol::ProviderCapability::Snapshot)
+        {
+            record
+                .capabilities
+                .sandbox
+                .insert(crate::SandboxCapability::Snapshot);
+            record
+                .capabilities
+                .runtime
+                .insert(RuntimeCapability::Checkpoint);
+            record.capabilities.runtime.insert(RuntimeCapability::Fork);
+        } else {
+            record
+                .capabilities
+                .sandbox
+                .remove(&crate::SandboxCapability::Snapshot);
+            record
+                .capabilities
+                .runtime
+                .remove(&RuntimeCapability::Checkpoint);
+            record.capabilities.runtime.remove(&RuntimeCapability::Fork);
+        }
+        self.records.save(record.clone()).await
+    }
+
     async fn ensure_runtime_attached(
         &self,
         _ctx: &SecurityContext,
@@ -2260,6 +2420,9 @@ impl SessionApplication {
         {
             Ok(backend) => backend,
             Err(error) => {
+                if matches!(error, SessionDomainError::Unavailable { .. }) {
+                    return Err(error);
+                }
                 self.mark_restoration_failed(record, &error).await;
                 return Err(error);
             }
@@ -2317,6 +2480,7 @@ impl SessionApplication {
         if record.status == SessionStatus::Running {
             let mut updated = record.clone();
             updated.status = SessionStatus::Idle;
+            updated.last_error=Some("previous turn interrupted by service restart; tool effects were not replayed or rolled back".into());
             updated.updated_at_ms = self.clock.now_ms();
             self.records.save(updated).await?;
         }
@@ -2385,6 +2549,108 @@ impl SessionApplication {
         })
     }
 
+    /// Reconcile abandoned branch operations. A live transaction owns the same lock.
+    pub async fn reconcile_snapshot_intents(&self) -> Result<(), SessionDomainError> {
+        let Ok(_transaction) = self.snapshot_transactions.try_lock() else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for (id, mut body) in self.records.operation_intents().await? {
+            if body["retry_at_ms"].as_u64().unwrap_or(0) > self.clock.now_ms() {
+                continue;
+            }
+            if let Err(error) = self.reconcile_snapshot_intent(&id, &body).await {
+                let attempts = body["retry_count"].as_u64().unwrap_or(0).saturating_add(1);
+                body["retry_count"] = serde_json::json!(attempts);
+                body["last_error"] = serde_json::json!(error.to_string());
+                body["retry_at_ms"] = serde_json::json!(self
+                    .clock
+                    .now_ms()
+                    .saturating_add((1000u64 << attempts.min(5)).min(30_000)));
+                self.records.save_operation_intent(&id, body).await?;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn reconcile_snapshot_intent(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), SessionDomainError> {
+        let kind = body["runtime_kind"].as_str().unwrap_or("");
+        let registration = self.registration(kind)?;
+        let provider = body["provider"].as_str().unwrap_or("");
+        let manager = registration.providers.get(provider).ok_or_else(|| {
+            SessionDomainError::Unavailable {
+                message: "snapshot provider unavailable".into(),
+            }
+        })?;
+        let published = if body["kind"] == "delete" {
+            false
+        } else if let Some(checkpoint) = body["checkpoint"].as_str() {
+            self.records.get_checkpoint(checkpoint).await?.is_some()
+        } else {
+            false
+        };
+        if let Some(target) = body["target"].as_str() {
+            if self.records.get(target).await?.is_none() {
+                let _ = registration.runtime.stop(target).await;
+                manager
+                    .abort_pending_snapshot_load(target)
+                    .await
+                    .map_err(map_provider_error)?;
+                match manager.stop_instance(target).await {
+                    Ok(_) => {}
+                    Err(provider_protocol::ProviderControlError::NotFound { .. }) => {}
+                    Err(e) => return Err(map_provider_error(e)),
+                }
+            }
+        }
+        if !published {
+            if let Some(snapshot) = body["snapshot"].as_str() {
+                match manager
+                    .delete_snapshot(
+                        provider_protocol::BackendId(provider.into()),
+                        provider_protocol::ProviderSnapshotId(snapshot.into()),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(provider_protocol::ProviderControlError::NotFound { .. }) => {}
+                    Err(e) => return Err(map_provider_error(e)),
+                }
+            }
+            if let Some(history) = body.get("history") {
+                let state = serde_json::from_value(history.clone()).map_err(|e| {
+                    SessionDomainError::Internal {
+                        message: e.to_string(),
+                        source: None,
+                    }
+                })?;
+                registration
+                    .runtime
+                    .delete_checkpoint_state(&state)
+                    .await
+                    .map_err(map_runtime_error)?;
+            }
+        }
+        if body["kind"] == "delete" {
+            self.records
+                .delete_checkpoint(body["checkpoint"].as_str().unwrap())
+                .await?;
+        }
+        self.records.delete_operation_intent(id).await?;
+        Ok(())
+    }
+
     pub async fn tenant_has_active_sessions(
         &self,
         tenant_id: &str,
@@ -2442,6 +2708,21 @@ pub trait SessionRepository: Send + Sync {
         tenant_id: Option<&str>,
         limit: usize,
     ) -> Result<SessionListPage, SessionDomainError>;
+    async fn save_operation_intent(
+        &self,
+        _id: &str,
+        _body: serde_json::Value,
+    ) -> Result<(), SessionDomainError> {
+        Ok(())
+    }
+    async fn operation_intents(
+        &self,
+    ) -> Result<Vec<(String, serde_json::Value)>, SessionDomainError> {
+        Ok(vec![])
+    }
+    async fn delete_operation_intent(&self, _id: &str) -> Result<(), SessionDomainError> {
+        Ok(())
+    }
     async fn save_checkpoint(
         &self,
         _record: crate::CheckpointRecord,
