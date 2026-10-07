@@ -134,6 +134,7 @@ pub struct InstanceManager {
     config: InstanceManagerConfig,
     instances: Mutex<HashMap<String, BoundInstance>>,
     quota: Mutex<QuotaState>,
+    restore_errors: Mutex<HashMap<String, ProviderControlError>>,
     /// Striped per-`runtime_id` locks. Lazily created, opportunistically
     /// removed once unreferenced (see `release_runtime_lock`) so this map
     /// does not grow without bound across a long-running daemon's lifetime
@@ -162,6 +163,7 @@ impl InstanceManager {
             config,
             instances: Mutex::new(HashMap::new()),
             quota: Mutex::new(QuotaState::default()),
+            restore_errors: Mutex::new(HashMap::new()),
             runtime_locks: Mutex::new(HashMap::new()),
             admission,
             pending_release: Mutex::new(VecDeque::new()),
@@ -307,6 +309,9 @@ impl InstanceManager {
     /// admissions).
     fn rehydrate_one(&self, instance_id: &str, owner_ref: &str) {
         if let Ok(mut state) = self.quota_state() {
+            if state.owners_by_instance.contains_key(instance_id) {
+                return;
+            }
             *state.counts.entry(owner_ref.to_string()).or_insert(0) += 1;
             state.total += 1;
             state
@@ -342,6 +347,7 @@ impl InstanceManager {
         owner_ref: String,
         provider_options: Value,
     ) -> Result<ProviderInstance, ProviderControlError> {
+        let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0u32;
         let mut delay = self.config.retry.base_delay;
         loop {
@@ -359,7 +365,7 @@ impl InstanceManager {
                     reason: ProviderLifecycleReason::Acquire,
                     resource_limits: ProviderResourceLimits::default(),
                     provider_options: provider_options.clone(),
-                    correlation: Value::Null,
+                    correlation: serde_json::json!({"request_id": request_id}),
                 })
                 .await;
             drop(permit);
@@ -419,6 +425,15 @@ impl InstanceManager {
         &self,
         runtime_id: &str,
     ) -> Result<ProviderSnapshot, ProviderControlError> {
+        self.checkpoint_instance_correlated(runtime_id, Value::Null)
+            .await
+    }
+
+    pub async fn checkpoint_instance_correlated(
+        &self,
+        runtime_id: &str,
+        correlation: Value,
+    ) -> Result<ProviderSnapshot, ProviderControlError> {
         let record = self
             .instances
             .lock()
@@ -444,7 +459,7 @@ impl InstanceManager {
                 backend_id: record.instance.backend_id.clone(),
                 instance_id: record.instance.instance_id.clone(),
                 reason: ProviderLifecycleReason::UserRequested,
-                correlation: Value::Null,
+                correlation,
             })
             .await
     }
@@ -543,7 +558,7 @@ impl InstanceManager {
                 reason: ProviderLifecycleReason::Restore,
                 resource_limits: ProviderResourceLimits::default(),
                 provider_options,
-                correlation: Value::Null,
+                correlation: serde_json::json!({"request_id":format!("load:{runtime_id}")}),
             })
             .await
         {
@@ -663,6 +678,26 @@ impl InstanceManager {
     /// automatic background retry — see [`Self::spawn_retry_loop`]. Either
     /// path can win the race to clean it up; both are serialized against
     /// each other by the same per-`runtime_id` lock `start_instance` uses.
+    /// Retire a Docker create intent whose session was never published.
+    pub async fn abort_pending_snapshot_load(
+        &self,
+        runtime_id: &str,
+    ) -> Result<(), ProviderControlError> {
+        if self.kind.0 != "docker" {
+            return Ok(());
+        }
+        self.lifecycle
+            .delete(ProviderDeleteRequest {
+                backend_id: BackendId("docker".into()),
+                instance_id: None,
+                snapshot_id: None,
+                reason: ProviderLifecycleReason::ErrorCleanup,
+                correlation: serde_json::json!({"abort_load_request":format!("load:{runtime_id}")}),
+            })
+            .await
+            .map(|_| ())
+    }
+
     pub async fn stop_instance(&self, runtime_id: &str) -> Result<(), ProviderControlError> {
         let lock = self.get_runtime_lock(runtime_id);
         let guard = lock.clone().lock_owned().await;
@@ -852,15 +887,63 @@ impl InstanceManager {
         })
     }
 
+    /// Authoritative IDs for provider-scoped orphan cleanup; errors must fail closed.
+    pub async fn ledger_instance_ids(&self) -> Result<Vec<String>, ProviderControlError> {
+        Ok(self
+            .ledger
+            .list_active(&self.kind)
+            .await?
+            .into_iter()
+            .map(|e| e.instance.instance_id.0)
+            .collect())
+    }
+
     pub async fn reconcile(&self) -> Result<ReconcileOutcome, ProviderControlError> {
         let active = self.ledger.list_active(&self.kind).await?;
 
         let mut confirmed = Vec::new();
         let mut orphaned = Vec::new();
 
+        let mut unavailable = None;
         for entry in active {
+            let registered = self
+                .instances
+                .lock()
+                .expect("instance lock poisoned")
+                .contains_key(&entry.runtime_id);
+            if registered {
+                // Inspect live Docker identities without reattaching: attach may
+                // retire a dirty execution and must never race a running tool.
+                if self.kind.0 == "docker" {
+                    match self
+                        .lifecycle
+                        .inspect(provider_protocol::ProviderInspectRequest {
+                            backend_id: entry.instance.backend_id.clone(),
+                            instance_id: Some(entry.instance.instance_id.clone()),
+                            reason: ProviderLifecycleReason::Reconcile,
+                            correlation: Value::Null,
+                        })
+                        .await
+                    {
+                        Err(ProviderControlError::NotFound { .. }) => {
+                            self.instances.lock().unwrap().remove(&entry.runtime_id);
+                            self.release_instance(&entry.instance.instance_id.0);
+                            self.soft_delete_orphan(&entry, "container explicitly missing")
+                                .await;
+                            orphaned.push(entry);
+                        }
+                        Err(error) => unavailable = Some(error),
+                        Ok(_) => {}
+                    }
+                }
+                continue;
+            }
             match self.attach.attach(&entry.instance).await {
                 Ok(backend) => {
+                    self.restore_errors
+                        .lock()
+                        .unwrap()
+                        .remove(&entry.runtime_id);
                     self.instances
                         .lock()
                         .expect("InstanceManager registry lock poisoned")
@@ -874,7 +957,11 @@ impl InstanceManager {
                     self.rehydrate_one(entry.instance.instance_id.0.as_str(), &entry.owner_ref);
                     confirmed.push(entry);
                 }
-                Err(error) => {
+                Err(error @ ProviderControlError::NotFound { .. }) => {
+                    self.restore_errors
+                        .lock()
+                        .unwrap()
+                        .remove(&entry.runtime_id);
                     tracing::warn!(
                         target: "instance_manager",
                         runtime_id = %entry.runtime_id,
@@ -885,9 +972,18 @@ impl InstanceManager {
                     self.soft_delete_orphan(&entry, "re-attach failed").await;
                     orphaned.push(entry);
                 }
+                Err(error) => {
+                    self.restore_errors
+                        .lock()
+                        .unwrap()
+                        .insert(entry.runtime_id.clone(), error.clone());
+                    unavailable = Some(error);
+                }
             }
         }
-
+        if let Some(error) = unavailable {
+            return Err(error);
+        }
         Ok(ReconcileOutcome {
             confirmed,
             orphaned,
@@ -968,8 +1064,15 @@ impl InstanceManager {
             .expect("InstanceManager registry lock poisoned")
             .get(runtime_id)
             .map(|record| record.backend.clone())
-            .ok_or_else(|| ProviderControlError::NotFound {
-                resource_ref: runtime_id.to_string(),
+            .ok_or_else(|| {
+                self.restore_errors
+                    .lock()
+                    .unwrap()
+                    .get(runtime_id)
+                    .cloned()
+                    .unwrap_or_else(|| ProviderControlError::NotFound {
+                        resource_ref: runtime_id.to_string(),
+                    })
             })
     }
 }
