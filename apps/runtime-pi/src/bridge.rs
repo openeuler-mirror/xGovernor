@@ -130,7 +130,39 @@ fn router(bridge: Arc<Bridge>) -> Router {
         .route("/v1/exec", post(exec_handler))
         .route("/v1/glob", post(glob_handler))
         .route("/v1/grep", post(grep_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(129 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(operation_context))
         .with_state(bridge)
+}
+
+async fn operation_context(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let turn = request
+        .headers()
+        .get("x-xgovernor-turn")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let operation = request
+        .headers()
+        .get("x-xgovernor-operation")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    match (turn, operation) {
+        (Some(turn_id), Some(operation_id)) if !turn_id.is_empty() && !operation_id.is_empty() => {
+            backend::execution::OPERATION_CONTEXT
+                .scope(
+                    operation_protocol::OperationContext {
+                        turn_id,
+                        operation_id,
+                    },
+                    next.run(request),
+                )
+                .await
+        }
+        _ => next.run(request).await,
+    }
 }
 
 /// Extractor pulling `Authorization: Bearer <token>` out of the request and
@@ -165,6 +197,16 @@ impl FromRequestParts<Arc<Bridge>> for AuthedSession {
         let entry = sessions
             .get(token)
             .ok_or_else(|| unauthorized_response("unknown bearer token"))?;
+        if entry.backend.backend_id() == "docker"
+            && parts.uri.path() != "/v1/workspace-root"
+            && backend::execution::OPERATION_CONTEXT
+                .try_with(|_| ())
+                .is_err()
+        {
+            return Err(bad_request_response(
+                "missing Docker tool execution context".into(),
+            ));
+        }
         Ok(AuthedSession {
             backend: Arc::clone(&entry.backend),
             workspace_root: BackendPath(entry.workspace_root.0.clone()),

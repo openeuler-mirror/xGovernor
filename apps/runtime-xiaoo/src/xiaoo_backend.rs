@@ -60,7 +60,7 @@ struct ExecBody {
     shell: Option<String>,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
-    env: Option<Vec<(String, String)>>,
+    env: Option<std::collections::HashMap<String, String>>,
     extra: Option<Value>,
 }
 #[derive(Deserialize)]
@@ -114,7 +114,9 @@ pub struct WorkerConfig {
     pub(crate) supports_grep: bool,
 }
 
+#[derive(Clone)]
 pub struct HttpOperationBackend {
+    turn_id: Option<String>,
     client: reqwest::Client,
     base: String,
     token: String,
@@ -127,6 +129,7 @@ pub struct HttpOperationBackend {
 impl HttpOperationBackend {
     pub fn new(config: &WorkerConfig) -> Self {
         Self {
+            turn_id: None,
             client: reqwest::Client::new(),
             base: config.bridge_url.trim_end_matches('/').into(),
             token: config.bridge_token.clone(),
@@ -141,21 +144,34 @@ impl HttpOperationBackend {
             },
         }
     }
+    /// Immutable scope: spawned or late tool requests retain their original turn.
+    pub fn for_turn(&self, turn_id: String) -> Self {
+        let mut scoped = self.clone();
+        scoped.turn_id = Some(turn_id);
+        scoped
+    }
     async fn post<T: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &T,
     ) -> Result<R, xiaoo_api::backend::OperationError> {
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}{}", self.base, path))
             .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| xiaoo_api::backend::OperationError::Transport {
-                message: e.to_string(),
-            })?;
+            .json(body);
+        if let Some(turn_id) = &self.turn_id {
+            request = request
+                .header("x-xgovernor-turn", turn_id)
+                .header("x-xgovernor-operation", uuid::Uuid::new_v4().to_string());
+        }
+        let response =
+            request
+                .send()
+                .await
+                .map_err(|e| xiaoo_api::backend::OperationError::Transport {
+                    message: e.to_string(),
+                })?;
         if !response.status().is_success() {
             return Err(xiaoo_api::backend::OperationError::Transport {
                 message: response.text().await.unwrap_or_default(),
@@ -244,7 +260,13 @@ impl xiaoo_api::backend::OperationFileSystem for HttpOperationBackend {
             .await?;
         Ok(xiaoo_api::backend::PathStat {
             exists: r.get("exists").and_then(Value::as_bool).unwrap_or(false),
-            kind: None,
+            kind: match r.get("kind").and_then(Value::as_str) {
+                Some("file") => Some(xiaoo_api::backend::PathKind::File),
+                Some("directory") => Some(xiaoo_api::backend::PathKind::Directory),
+                Some("symlink") => Some(xiaoo_api::backend::PathKind::Symlink),
+                Some("other") => Some(xiaoo_api::backend::PathKind::Other),
+                _ => None,
+            },
             size_bytes: r.get("size_bytes").and_then(Value::as_u64),
             modified_at: None,
         })
@@ -345,7 +367,7 @@ impl xiaoo_api::backend::OperationExec for HttpOperationBackend {
                     shell: request.shell,
                     cwd: request.cwd.map(|p| p.0),
                     timeout_ms: request.timeout_ms,
-                    env: request.env,
+                    env: request.env.map(|values| values.into_iter().collect()),
                     extra: request.extra,
                 },
             )
@@ -534,5 +556,148 @@ assert sys.stdin.readline() == "next-request\n"
         stdin.write_all(b"next-request\n").await.unwrap();
         drop(stdin);
         assert!(child.wait().await.unwrap().success());
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use operation_protocol::capability::*;
+    use operation_protocol::{OperationBackend, OperationBackendCapabilities, OperationError};
+    use std::sync::{Arc, Mutex};
+    use xiaoo_api::backend::{OperationExec as _, OperationFileSystem as _};
+
+    struct CorrelatedBackend {
+        inner: Arc<dyn OperationBackend>,
+        calls: Mutex<Vec<operation_protocol::OperationContext>>,
+    }
+    #[async_trait]
+    impl OperationBackend for CorrelatedBackend {
+        fn backend_id(&self) -> &str {
+            "docker"
+        }
+        fn capabilities(&self) -> OperationBackendCapabilities {
+            self.inner.capabilities()
+        }
+        fn paths(&self) -> &dyn OperationPathResolver {
+            self.inner.paths()
+        }
+        fn files(&self) -> &dyn OperationFileSystem {
+            self.inner.files()
+        }
+        fn search(&self) -> &dyn OperationSearch {
+            self.inner.search()
+        }
+        fn exec(&self) -> &dyn OperationExec {
+            self
+        }
+        fn export(&self) -> &dyn OperationExport {
+            self.inner.export()
+        }
+        async fn shutdown(&self) -> Result<(), OperationError> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl OperationExec for CorrelatedBackend {
+        fn default_shell(&self) -> Option<&str> {
+            self.inner.exec().default_shell()
+        }
+        async fn exec(
+            &self,
+            request: operation_protocol::capability::exec::ExecRequest,
+        ) -> Result<operation_protocol::capability::exec::ExecResult, OperationError> {
+            self.calls.lock().unwrap().push(
+                backend::execution::OPERATION_CONTEXT
+                    .try_with(Clone::clone)
+                    .expect("bridge must scope tools"),
+            );
+            self.inner.exec().exec(request).await
+        }
+    }
+    #[tokio::test]
+    async fn bridge_roundtrip_preserves_binary_paths_env_stat_and_immutable_turns() {
+        use xiaoo_api::backend::{
+            BackendPath, ExecRequest, PathKind, ReadBytesRequest, WriteBytesRequest, WriteMode,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let inner =
+            backend::local::local_backend(dir.path().into(), None, None, Some("/bin/bash".into()))
+                .unwrap();
+        let backend = Arc::new(CorrelatedBackend {
+            inner,
+            calls: Mutex::new(Vec::new()),
+        });
+        let bridge = xgovernor_runtime_pi::bridge::Bridge::spawn().unwrap();
+        bridge.register(
+            "test-token".into(),
+            backend.clone(),
+            operation_protocol::BackendPath(dir.path().display().to_string()),
+            Arc::new(tokio::sync::RwLock::new(())),
+        );
+        let config = WorkerConfig {
+            llm: PersistedLlm {
+                provider: "unused".into(),
+                model: "unused".into(),
+                api_key_env: "UNUSED".into(),
+                api_base: None,
+            },
+            loop_state: xiaoo_api::runtime::RuntimeState::new("test".into()).to_snapshot(),
+            role_settings: Default::default(),
+            bridge_url: bridge.base_url(),
+            bridge_token: "test-token".into(),
+            backend_id: "docker".into(),
+            workspace_root: dir.path().display().to_string(),
+            home_dir: None,
+            supports_atomic_write: true,
+            supports_grep: true,
+        };
+        let base = HttpOperationBackend::new(&config);
+        let old = base.for_turn("old".into());
+        let new = base.for_turn("new".into());
+        let path = BackendPath(dir.path().join("quote ' $ name.bin").display().to_string());
+        let bytes = vec![0, 255, 10, 128];
+        old.write_bytes(WriteBytesRequest {
+            path: path.clone(),
+            content: bytes.clone(),
+            mode: WriteMode::AtomicOverwrite,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            old.read_bytes(ReadBytesRequest { path: path.clone() })
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(old.stat(&path).await.unwrap().kind, Some(PathKind::File));
+        assert_eq!(
+            old.stat(&BackendPath(dir.path().display().to_string()))
+                .await
+                .unwrap()
+                .kind,
+            Some(PathKind::Directory)
+        );
+        for scoped in [&new, &old] {
+            let result = scoped
+                .exec(ExecRequest {
+                    command: "printf '%s' \"$XG_TEST\"; printf err >&2; exit 7".into(),
+                    shell: Some("/bin/bash".into()),
+                    env: Some(vec![("XG_TEST".into(), "safe '$ literal".into())]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.stdout, b"safe '$ literal");
+            assert_eq!(result.stderr, b"err");
+            assert_eq!(result.exit_code, Some(7));
+        }
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.turn_id.as_str()).collect::<Vec<_>>(),
+            ["new", "old"]
+        );
+        assert_ne!(calls[0].operation_id, calls[1].operation_id);
+        bridge.unregister("test-token");
     }
 }

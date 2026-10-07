@@ -84,6 +84,10 @@ fn main() {
         record_command(&command);
         match command.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "prompt" => handle_prompt(&command, &rx),
+            "get_state" => emit(serde_json::json!({
+                "type":"response","command":"get_state","id":command.get("id"),"success":true,
+                "data":{"isStreaming":false,"pendingMessageCount":0}
+            })),
             "set_model" => emit(serde_json::json!({
                 "type": "response",
                 "command": "set_model",
@@ -122,6 +126,14 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
     }));
 
     if message.starts_with("/xgovernor-model ") {
+        return;
+    }
+
+    if message == "trigger-model-error" {
+        emit(
+            serde_json::json!({"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"synthetic upstream error"}}),
+        );
+        emit(serde_json::json!({"type":"agent_settled"}));
         return;
     }
 

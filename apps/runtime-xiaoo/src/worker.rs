@@ -86,7 +86,7 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                 let (runtime, usage_meter) = build_runtime(
                     &config.llm,
                     request.llm.as_ref().and_then(|llm| llm.model.as_deref()),
-                    backend.clone(),
+                    Arc::new(backend.for_turn(request.turn_id.clone())),
                     &role_settings,
                 )
                 .await
