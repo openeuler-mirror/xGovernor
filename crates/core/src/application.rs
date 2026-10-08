@@ -608,6 +608,7 @@ impl SessionApplication {
             .runtime_id
             .clone()
             .unwrap_or_else(|| self.runtime_ids.next_runtime_id());
+        Self::require_non_empty_runtime_id(&runtime_id)?;
         if let Some(mut record) = self.records.get(&runtime_id).await? {
             // Re-attach branch: an existing `runtime_id` belonging to another
             // tenant must 404, not silently attach the caller to it
@@ -2318,11 +2319,26 @@ impl SessionApplication {
     /// (never `Forbidden`), so cross-tenant probing gets no distinguishing
     /// echo (`docs/tenancy_design.md` §3.2). This is the single ownership
     /// check point every session-lookup path in this crate funnels through.
+    /// An empty `runtime_id` can never name a real session: `open` fills a
+    /// missing id from the generator, and the generator never returns one.
+    /// Rows carrying `runtime_id = ''` are leftovers, but `require_session`
+    /// decides "does this session exist?" by asking the repository, so such a
+    /// row would otherwise be treated as a live session and accept turns.
+    fn require_non_empty_runtime_id(runtime_id: &str) -> Result<(), SessionDomainError> {
+        if runtime_id.is_empty() {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "runtime_id must not be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     async fn require_session(
         &self,
         ctx: &SecurityContext,
         runtime_id: &str,
     ) -> Result<SessionRecord, SessionDomainError> {
+        Self::require_non_empty_runtime_id(runtime_id)?;
         let record =
             self.records
                 .get(runtime_id)
