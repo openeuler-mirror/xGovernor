@@ -3,7 +3,7 @@
 `provider-protocol`(控制面) + `operation-protocol`(操作面) 两份契约的**具体实现**。每个子模块是一个真实的资源供应方：
 
 - **`local/`** — 本地进程沙箱：workspace 目录 + bubblewrap(Linux)/seatbelt(macOS) 隔离策略。没有独立的常驻进程，"实例"本质就是一份目录+策略配置。
-- **`docker/`** — 实验性 Linux Docker 工具后端，仅 Pi 管理员验证；用受控镜像实现无宿主挂载的容器执行。见 [原型说明](../../scripts/docker-prototype/README.md)。
+- **`docker/`** — 实验性 Linux Docker 工具后端；用受控镜像实现无宿主挂载的容器执行。见 [原型说明](../../scripts/docker-prototype/README.md)。
 - **`e2b/`** — E2B 远程沙箱：通过 E2B 平台 API 创建/查询/删除远程沙箱，操作面经 `envd`(沙箱内 HTTP 服务)转发。
 - **`ledger` / `sqlite_ledger.rs`** — provider 实例的持久化账本(SQLite)，记录哪些实例处于活跃状态，供进程重启后的 reconcile 使用。
 - **`process_group.rs`** — 本地子进程的进程组管理(批量终止、注册/反注册)，`local` 模块的支撑设施。
