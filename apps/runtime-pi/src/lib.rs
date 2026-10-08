@@ -553,7 +553,10 @@ pub struct PiSessionEnvironment {
 }
 
 impl PiSessionEnvironment {
-    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self { self.docker_snapshots=enabled; self }
+    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self {
+        self.docker_snapshots = enabled;
+        self
+    }
     pub fn new(
         default_local_root: impl Into<String>,
         configured_backends: impl IntoIterator<Item = String>,
@@ -583,27 +586,45 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             });
         }
 
-        if ext.backend_id == DOCKER_BACKEND_ID {
+        let docker_network_mode = if ext.backend_id == DOCKER_BACKEND_ID {
             if !ctx.is_admin() {
                 return Err(SessionDomainError::InvalidRequest {
                     message: "Docker prototype is administrator-only".into(),
                 });
             }
-            if let Some(options) = request.deployment.options.get("provider_options") {
-                if !options.is_object()
-                    || options
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .any(|key| key != "workspace_root")
+            let options = request.deployment.options.get("provider_options");
+            if let Some(options) = options {
+                let Some(object) = options.as_object() else {
+                    return Err(SessionDomainError::InvalidRequest {
+                        message: "Docker provider_options must be an object".into(),
+                    });
+                };
+                if object
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "workspace_root" | "network_mode"))
+                    || object
+                        .get("workspace_root")
+                        .is_some_and(|root| root != "/workspace")
                 {
                     return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker prototype does not accept runtime Docker configuration"
+                        message: "Docker accepts only the fixed /workspace root and network_mode"
                             .into(),
                     });
                 }
             }
-        }
+            let mode = options
+                .and_then(|value| value.get("network_mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("default");
+            if !matches!(mode, "none" | "default" | "bridge") {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "Docker network_mode must be 'none', 'default', or 'bridge'".into(),
+                });
+            }
+            Some(mode)
+        } else {
+            None
+        };
         if ext.backend_id == DOCKER_BACKEND_ID {
             if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
                 if !url.starts_with("https://") {
@@ -665,50 +686,61 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             }
         };
 
-        let (boundary, network, mut capabilities): (_, _, BTreeSet<SandboxCapability>) = match ext.backend_id.as_str() {
-            LOCAL_BACKEND_ID => (
-                IsolationBoundary::Host,
-                NetworkIsolation::None,
-                [
-                    SandboxCapability::Exec,
-                    SandboxCapability::FileRead,
-                    SandboxCapability::FileWrite,
-                    SandboxCapability::Network,
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            E2B_BACKEND_ID => (
-                IsolationBoundary::Remote,
-                // E2B is remote, but this integration does not disable the
-                // sandbox's internet access; do not overstate network isolation.
-                NetworkIsolation::None,
-                [
-                    SandboxCapability::Exec,
-                    SandboxCapability::FileRead,
-                    SandboxCapability::FileWrite,
-                    SandboxCapability::Snapshot,
-                    SandboxCapability::Network,
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            DOCKER_BACKEND_ID => (
-                IsolationBoundary::Container,
-                NetworkIsolation::None,
-                [
-                    SandboxCapability::Exec,
-                    SandboxCapability::FileRead,
-                    SandboxCapability::FileWrite,
-                    SandboxCapability::Network,
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            _ => unreachable!("backend profile checked above"),
-        };
+        let (boundary, network, mut capabilities): (_, _, BTreeSet<SandboxCapability>) =
+            match ext.backend_id.as_str() {
+                LOCAL_BACKEND_ID => (
+                    IsolationBoundary::Host,
+                    NetworkIsolation::None,
+                    [
+                        SandboxCapability::Exec,
+                        SandboxCapability::FileRead,
+                        SandboxCapability::FileWrite,
+                        SandboxCapability::Network,
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                E2B_BACKEND_ID => (
+                    IsolationBoundary::Remote,
+                    // E2B is remote, but this integration does not disable the
+                    // sandbox's internet access; do not overstate network isolation.
+                    NetworkIsolation::None,
+                    [
+                        SandboxCapability::Exec,
+                        SandboxCapability::FileRead,
+                        SandboxCapability::FileWrite,
+                        SandboxCapability::Snapshot,
+                        SandboxCapability::Network,
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                DOCKER_BACKEND_ID => {
+                    let isolated = docker_network_mode == Some("none");
+                    let mut capabilities = BTreeSet::from([
+                        SandboxCapability::Exec,
+                        SandboxCapability::FileRead,
+                        SandboxCapability::FileWrite,
+                    ]);
+                    if !isolated {
+                        capabilities.insert(SandboxCapability::Network);
+                    }
+                    (
+                        IsolationBoundary::Container,
+                        if isolated {
+                            NetworkIsolation::Isolated
+                        } else {
+                            NetworkIsolation::None
+                        },
+                        capabilities,
+                    )
+                }
+                _ => unreachable!("backend profile checked above"),
+            };
 
-        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots { capabilities.insert(SandboxCapability::Snapshot); }
+        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots {
+            capabilities.insert(SandboxCapability::Snapshot);
+        }
         let llm = resolve_llm(request.llm.as_ref())?.map(|config| config.descriptor());
 
         Ok(NormalizedSessionEnvironment {
@@ -1802,6 +1834,41 @@ mod tests {
             .normalize(&SecurityContext::admin("test"), &request)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn docker_network_mode_controls_isolation_and_network_capability() {
+        let normalizer = PiSessionEnvironment::new("/unused", ["docker".into()]);
+        let mut request = open_request(session_protocol::WorkspaceSpec::DaemonDefault);
+        request
+            .ext
+            .insert(EXT_NAMESPACE.into(), json!({"backend_id":"docker"}));
+
+        for mode in ["default", "bridge"] {
+            request.deployment.options = json!({
+                "provider_options": {"network_mode": mode}
+            });
+            let normalized = normalizer
+                .normalize(&SecurityContext::admin("test"), &request)
+                .await
+                .unwrap();
+            assert_eq!(normalized.isolation.network, NetworkIsolation::None);
+            assert!(normalized
+                .sandbox_capabilities
+                .contains(&SandboxCapability::Network));
+        }
+
+        request.deployment.options = json!({
+            "provider_options": {"network_mode": "none"}
+        });
+        let normalized = normalizer
+            .normalize(&SecurityContext::admin("test"), &request)
+            .await
+            .unwrap();
+        assert_eq!(normalized.isolation.network, NetworkIsolation::Isolated);
+        assert!(!normalized
+            .sandbox_capabilities
+            .contains(&SandboxCapability::Network));
     }
 
     fn pi_normalizer() -> PiSessionEnvironment {

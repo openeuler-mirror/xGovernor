@@ -537,7 +537,8 @@ impl DockerProvider {
         if request.backend_id.0 != "docker" {
             return Err(invalid("backend must be docker"));
         }
-        Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
+        let network_mode =
+            Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
         let _snapshots = self.snapshot_lock.lock().await;
         match request.source {
             ProviderLoadSource::Instance(id) => {
@@ -546,6 +547,7 @@ impl DockerProvider {
                     return Err(invalid("instance owner mismatch"));
                 }
                 self.validate_container(&value, None)?;
+                super::validate_requested_network_mode(&value, network_mode)?;
                 let control = self.control(&id.0)?;
                 let _gate = control.gate.lock().await;
                 if control.state()? != "paused" {

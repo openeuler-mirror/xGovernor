@@ -510,13 +510,8 @@ async fn main() {
         None
     };
 
-    let docker_enabled = match std::env::var("XGOVERNOR_DOCKER_ENABLED").as_deref() {
-        Ok("1") => true,
-        Ok("0") | Err(std::env::VarError::NotPresent) => false,
-        _ => panic!("XGOVERNOR_DOCKER_ENABLED must be 0 or 1"),
-    };
-    let mut docker_snapshots = false;
-    let _docker_retry_loop = if docker_enabled {
+    let docker_snapshots;
+    let _docker_retry_loop = {
         let mut config =
             backend::docker::DockerConfig::from_env().expect("invalid Docker configuration");
         if std::env::var_os("XGOVERNOR_DOCKER_STATE_DIR").is_none() {
@@ -568,8 +563,6 @@ async fn main() {
         });
         runtime_managers.insert("docker".into(), manager);
         Some(retry)
-    } else {
-        None
     };
 
     // Snapshot the configured `backend_id`s before `PiRuntime::new` moves
@@ -612,18 +605,21 @@ async fn main() {
             RuntimeRegistration::with_providers(
                 pi_runtime.clone(),
                 runtime_managers.clone(),
-                Arc::new(PiSessionEnvironment::new(
-                    default_workspace_root.clone(),
-                    configured_backend_ids.clone(),
-                ).with_docker_snapshots(docker_snapshots)),
+                Arc::new(
+                    PiSessionEnvironment::new(
+                        default_workspace_root.clone(),
+                        configured_backend_ids.clone(),
+                    )
+                    .with_docker_snapshots(docker_snapshots),
+                ),
             ),
             RuntimeRegistration::with_providers(
                 xiaoo_runtime.clone(),
                 runtime_managers.clone(),
-                Arc::new(XiaooSessionEnvironment::new(
-                    default_workspace_root,
-                    configured_backend_ids,
-                ).with_docker_snapshots(docker_snapshots)),
+                Arc::new(
+                    XiaooSessionEnvironment::new(default_workspace_root, configured_backend_ids)
+                        .with_docker_snapshots(docker_snapshots),
+                ),
             ),
         ],
         Arc::new(session_repository),
@@ -647,7 +643,9 @@ async fn main() {
     let snapshot_recovery = application.clone();
     let _snapshot_recovery = tokio::spawn(async move {
         loop {
-            if let Err(error)=snapshot_recovery.reconcile_snapshot_intents().await {tracing::warn!(%error,"snapshot operation recovery pending");}
+            if let Err(error) = snapshot_recovery.reconcile_snapshot_intents().await {
+                tracing::warn!(%error,"snapshot operation recovery pending");
+            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });

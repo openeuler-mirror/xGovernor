@@ -6,6 +6,7 @@ use crate::OperationAttach;
 use async_trait::async_trait;
 use operation_protocol::OperationBackend;
 use provider_protocol::*;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -15,6 +16,29 @@ const LABEL: &str = "io.xgovernor.docker-prototype";
 const OWNER: &str = "io.xgovernor.owner";
 const REQUEST: &str = "io.xgovernor.request";
 const WORKSPACE: &str = "/workspace";
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DockerNetworkMode {
+    None,
+    Default,
+    Bridge,
+}
+
+impl Default for DockerNetworkMode {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DockerProviderOptions {
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    network_mode: DockerNetworkMode,
+}
 
 mod config;
 mod control;
@@ -124,7 +148,10 @@ impl DockerProvider {
             || h["CapAdd"].as_array().is_some_and(|a| !a.is_empty())
             || value["Mounts"].as_array().is_none_or(|a| !a.is_empty())
             || h["PortBindings"].as_object().is_some_and(|a| !a.is_empty())
-            || !matches!(h["NetworkMode"].as_str(), Some("default" | "bridge"))
+            || !matches!(
+                h["NetworkMode"].as_str(),
+                Some("none" | "default" | "bridge")
+            )
             || h["PidMode"] != ""
             || h["IpcMode"] != "private"
             || h["Devices"].as_array().is_some_and(|a| !a.is_empty())
@@ -318,22 +345,29 @@ impl DockerProvider {
     fn validate_request_options(
         provider_options: &Value,
         resource_limits: &ProviderResourceLimits,
-    ) -> Result<(), ProviderControlError> {
-        if let Some(options) = provider_options.as_object() {
-            if options.keys().any(|key| key != "workspace_root")
-                || options
-                    .get("workspace_root")
-                    .is_some_and(|root| root != WORKSPACE)
-            {
-                return Err(invalid("Docker prototype accepts only the fixed /workspace root; runtime Docker options are forbidden"));
+    ) -> Result<DockerNetworkMode, ProviderControlError> {
+        let options = if provider_options.is_null() {
+            DockerProviderOptions {
+                workspace_root: None,
+                network_mode: DockerNetworkMode::default(),
             }
-        } else if !provider_options.is_null() {
-            return Err(invalid("provider_options must be an object"));
+        } else {
+            serde_json::from_value::<DockerProviderOptions>(provider_options.clone())
+                .map_err(|error| invalid(format!("invalid Docker provider_options: {error}")))?
+        };
+        if options
+            .workspace_root
+            .as_deref()
+            .is_some_and(|root| root != WORKSPACE)
+        {
+            return Err(invalid(
+                "Docker prototype requires the fixed /workspace root",
+            ));
         }
         if *resource_limits != ProviderResourceLimits::default() {
             return Err(invalid("prototype resources are fixed by the server"));
         }
-        Ok(())
+        Ok(options.network_mode)
     }
     async fn create_container(
         &self,
@@ -343,7 +377,8 @@ impl DockerProvider {
         if request.backend_id.0 != "docker" {
             return Err(invalid("Docker backend_id must be docker"));
         }
-        Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
+        let network_mode =
+            Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
         if self.config.free_bytes().await? < self.config.limits.reserve_bytes {
             return Err(transport("Docker filesystem reserve exhausted"));
         }
@@ -368,6 +403,7 @@ impl DockerProvider {
                     return Err(invalid("creation identity mismatch"));
                 }
                 self.validate_container(&value, None)?;
+                validate_requested_network_mode(&value, network_mode)?;
                 let id = value["Id"]
                     .as_str()
                     .ok_or_else(|| transport("missing container ID"))?;
@@ -406,7 +442,7 @@ impl DockerProvider {
             .await?;
         let image_id = String::from_utf8_lossy(&image.stdout).trim().to_string();
         self.journal.set(&name,"creating",0,json!({"owner":request.owner_ref,"request_id":request_id,"image_id":image_id,"limits":self.config.limits}))?;
-        let create = args(&[
+        let mut create = args(&[
             "create",
             "--name",
             &name,
@@ -446,6 +482,21 @@ impl DockerProvider {
             &image_id,
             "infinity",
         ]);
+        if network_mode != DockerNetworkMode::Default {
+            let network_arg = match network_mode {
+                DockerNetworkMode::None => "none",
+                DockerNetworkMode::Bridge => "bridge",
+                DockerNetworkMode::Default => unreachable!(),
+            };
+            let insert_at = create
+                .iter()
+                .position(|arg| arg == "--cpus")
+                .expect("create command always has resource flags");
+            create.splice(
+                insert_at..insert_at,
+                ["--network".into(), network_arg.into()],
+            );
+        }
         if let Err(error) = self.config.checked(create).await {
             // A lost create response is resolved by the same stable name on retry.
             match self.raw_inspect(&name).await {
@@ -462,9 +513,34 @@ impl DockerProvider {
             let _ = self.config.checked(args(&["rm", "-f", &name])).await;
             return Err(error);
         }
+        if let Err(error) = validate_requested_network_mode(&value, network_mode) {
+            let _ = self.config.checked(args(&["rm", "-f", &name])).await;
+            return Err(error);
+        }
         self.journal
             .set(&name, "created", 0, json!({"id":value["Id"]}))?;
         self.instance(&value)
+    }
+}
+
+fn validate_requested_network_mode(
+    value: &Value,
+    requested: DockerNetworkMode,
+) -> Result<(), ProviderControlError> {
+    let actual = value["HostConfig"]["NetworkMode"].as_str();
+    let matches = match requested {
+        DockerNetworkMode::None => actual == Some("none"),
+        // Docker's daemon default is represented as `default` or `bridge`
+        // depending on the engine version and API path.
+        DockerNetworkMode::Default => matches!(actual, Some("default" | "bridge")),
+        DockerNetworkMode::Bridge => actual == Some("bridge"),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(invalid(
+            "existing container network mode differs from the requested Docker network_mode",
+        ))
     }
 }
 
