@@ -597,6 +597,12 @@ async fn main() {
     }
     let orphan_interval = configured_duration_secs("XGOVERNOR_ORPHAN_REAPER_INTERVAL_SECS", 600);
     let reclaim_interval = configured_duration_secs("XGOVERNOR_RECLAIM_SWEEP_INTERVAL_SECS", 300);
+    // Validate the e2b duration knobs at startup too, so an invalid value is
+    // reported when the server boots rather than only when the first e2b
+    // instance is created. Defaults mirror backend::e2b (DEFAULT_TIMEOUT_SECS,
+    // ACTIVITY_REFRESH_THROTTLE); the e2b code keeps reading them itself.
+    let _ = configured_duration_secs("XGOVERNOR_E2B_TIMEOUT_SECS", 3600);
+    let _ = configured_duration_secs("XGOVERNOR_E2B_ACTIVITY_REFRESH_SECS", 60);
     let lease_table = Arc::new(SessionLeaseTable::with_stale_threshold_ms(
         lease_stale.as_millis().min(u64::MAX as u128) as u64,
     ));

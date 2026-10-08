@@ -222,6 +222,27 @@ async fn open_session(
     }
 }
 
+/// Body for an accepted turn whose event stream could not be registered
+/// because the pending-stream table is at capacity. The turn itself keeps
+/// running, so the status code stays `202`; the extra fields explain why a
+/// later `GET .../events` will answer `404`.
+fn unattachable_receipt_body(
+    receipt: &session_protocol::SessionSubmitReceipt,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(receipt).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "stream_attachable".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "reason".to_string(),
+            serde_json::Value::String("pending_stream_limit".to_string()),
+        );
+    }
+    body
+}
+
 async fn submit_turn(
     State(state): State<Arc<SessionHttpState>>,
     Extension(ctx): Extension<SecurityContext>,
@@ -233,16 +254,29 @@ async fn submit_turn(
             // duplicate `client_request_id`: no new stream exists, and the
             // original turn's stream (if still unclaimed) must not be
             // clobbered.
-            if let Some(events) = submission.events {
+            // `None` also means "nothing to attach", so a replayed receipt
+            // stays a plain 202 with no extra fields.
+            let stream_attachable = if let Some(events) = submission.events {
                 register_stream(
                     &state.streams,
                     &submission.receipt.runtime_id,
                     &submission.receipt.turn_id,
                     events,
                 )
-                .await;
+                .await
+            } else {
+                true
+            };
+            if stream_attachable {
+                (StatusCode::ACCEPTED, Json(submission.receipt)).into_response()
+            } else {
+                // The turn is accepted and keeps running; only its event
+                // stream is missing. Say so in the body — otherwise the
+                // follow-up GET .../events 404 is indistinguishable from a
+                // turn that never existed.
+                (StatusCode::ACCEPTED, Json(unattachable_receipt_body(&submission.receipt)))
+                    .into_response()
             }
-            (StatusCode::ACCEPTED, Json(submission.receipt)).into_response()
         }
         Err(error) => session_error(project_session_error(error)),
     }
@@ -482,6 +516,37 @@ fn session_event_name(event: &SessionEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unattachable_receipt_body_marks_the_receipt_without_dropping_fields() {
+        let receipt = session_protocol::SessionSubmitReceipt {
+            runtime_id: "runtime-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            accepted_kind: session_protocol::SessionAcceptedInputKind::Turn,
+        };
+
+        // The plain receipt is untouched when the stream is attachable: the
+        // successful path serialises the struct directly.
+        let plain = serde_json::to_value(&receipt).unwrap();
+        assert!(plain.get("stream_attachable").is_none());
+
+        let body = unattachable_receipt_body(&receipt);
+        assert_eq!(
+            body.get("stream_attachable"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            body.get("reason"),
+            Some(&serde_json::Value::String(
+                "pending_stream_limit".to_string()
+            ))
+        );
+        // Every original field is still present, so existing clients that
+        // only read runtime_id/turn_id/accepted_kind keep working.
+        for key in ["runtime_id", "turn_id", "accepted_kind"] {
+            assert_eq!(body.get(key), plain.get(key), "field {key} must survive");
+        }
+    }
 
     #[tokio::test]
     async fn stream_sweeper_honors_configured_ttl() {
