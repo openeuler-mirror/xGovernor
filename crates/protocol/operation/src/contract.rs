@@ -36,5 +36,9 @@ pub trait OperationBackend: Send + Sync {
     fn permission_control(&self) -> Option<&dyn OperationPermissionControl> {
         None
     }
+    /// Optional turn execution control, independent of basic tool operations.
+    fn execution_control(&self) -> Option<&dyn crate::OperationExecutionControl> {
+        None
+    }
     async fn shutdown(&self) -> Result<(), OperationError>;
 }

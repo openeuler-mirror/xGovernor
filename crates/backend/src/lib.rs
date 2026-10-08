@@ -16,7 +16,9 @@
 //! are deferred to a future phase, to be picked up once a `AgentRuntime`
 //! implementation actually needs multi-session sandbox sharing.
 
+pub mod docker;
 pub mod e2b;
+pub mod execution;
 pub mod ledger;
 pub mod local;
 pub mod process_group;
