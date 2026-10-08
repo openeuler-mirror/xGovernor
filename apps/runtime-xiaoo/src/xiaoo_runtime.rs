@@ -1,3 +1,4 @@
+use backend::execution::OperationExecutionExt;
 use agent_runtime_protocol::{
     decode_worker_response, encode_worker_request, worker_error_event, AgentRuntime,
     RuntimeCancelRequest, RuntimeCapability, RuntimeCapabilityContext, RuntimeError, RuntimeEvent,
@@ -26,6 +27,8 @@ use crate::{
 };
 
 struct XiaooWorkerInstance {
+    backend: Arc<dyn operation_protocol::OperationBackend>,
+    completion: Mutex<()>,
     bridge: Arc<Bridge>,
     bridge_token: String,
     child: Mutex<Child>,
@@ -342,6 +345,8 @@ impl XiaooRuntime {
         self.instances.write().await.insert(
             request.runtime_id.clone(),
             Arc::new(XiaooWorkerInstance {
+                backend,
+                completion: Mutex::new(()),
                 bridge: Arc::clone(&self.bridge),
                 bridge_token,
                 child: Mutex::new(child),
@@ -412,17 +417,53 @@ impl XiaooRuntime {
                     }
                 })?,
             );
+            instance
+                .backend
+                .begin_turn(&input.turn_id)
+                .await
+                .map_err(operation_error)?;
             *active = Some(input.turn_id.clone());
         }
         if let Err(error) = self
             .send_worker(&instance, WorkerRequest::SubmitTurn(input.clone()))
             .await
         {
+            let _ = instance.backend.finish_turn(&input.turn_id).await;
             instance.active_turn.lock().await.take();
             return Err(error);
         }
         instance.persisted.lock().await.role_settings = role_settings;
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, mut internal_rx) = mpsc::channel(64);
+        let (output, rx) = mpsc::channel(64);
+        let terminal_instance = Arc::clone(&instance);
+        let terminal_turn = input.turn_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = internal_rx.recv().await {
+                if matches!(
+                    event,
+                    RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
+                ) {
+                    let _completion = terminal_instance.completion.lock().await;
+                    while terminal_instance
+                        .backend
+                        .finish_turn(&terminal_turn)
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    let mut active = terminal_instance.active_turn.lock().await;
+                    if active.as_deref() == Some(terminal_turn.as_str()) {
+                        active.take();
+                    }
+                    drop(active);
+                    let _ = output.send(event).await;
+                    break;
+                }
+                // Continue draining even if the SSE consumer disconnects.
+                let _ = output.send(event).await;
+            }
+        });
         tokio::spawn(async move {
             loop {
                 let mut line = String::new();
@@ -448,11 +489,6 @@ impl XiaooRuntime {
                                 .lock()
                                 .await
                                 .insert(interaction_id.clone(), input.turn_id.clone());
-                        }
-                        if terminal {
-                            // Export immediately after a terminal SSE event must see an idle
-                            // worker and the preceding persisted State response.
-                            instance.active_turn.lock().await.take();
                         }
                         if tx.send(event).await.is_err() || terminal {
                             break;
@@ -484,10 +520,6 @@ impl XiaooRuntime {
                         break;
                     }
                 }
-            }
-            let mut active = instance.active_turn.lock().await;
-            if active.as_deref() == Some(input.turn_id.as_str()) {
-                active.take();
             }
         });
         Ok(rx)
@@ -524,19 +556,30 @@ impl XiaooRuntime {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let instance = self.instance_for(runtime_id).await?;
+        let _completion = instance.completion.lock().await;
         let active = instance.active_turn.lock().await.clone();
-        if active
-            .as_deref()
-            .is_some_and(|active| turn_id.is_none() || turn_id == Some(active))
+        if let Some(selected) =
+            active.filter(|active| turn_id.is_none() || turn_id == Some(active.as_str()))
         {
-            self.send_worker(
-                &instance,
-                WorkerRequest::Cancel(RuntimeCancelRequest {
-                    runtime_id: runtime_id.into(),
-                    turn_id: turn_id.map(str::to_owned),
-                }),
-            )
-            .await?;
+            instance
+                .backend
+                .block_turn(&selected)
+                .map_err(operation_error)?;
+            let abort = self
+                .send_worker(
+                    &instance,
+                    WorkerRequest::Cancel(RuntimeCancelRequest {
+                        runtime_id: runtime_id.into(),
+                        turn_id: Some(selected.clone()),
+                    }),
+                )
+                .await;
+            instance
+                .backend
+                .cancel_turn(&selected)
+                .await
+                .map_err(operation_error)?;
+            abort?;
         }
         Ok(())
     }
@@ -640,5 +683,128 @@ fn to_runtime_error(error: SessionDomainError) -> RuntimeError {
         error => RuntimeError::Internal {
             message: error.to_string(),
         },
+    }
+}
+
+fn operation_error(error: operation_protocol::OperationError) -> SessionDomainError {
+    SessionDomainError::Unavailable {
+        message: error.to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests {
+    use super::*;
+    use operation_protocol::capability::*;
+    use operation_protocol::{OperationBackend, OperationBackendCapabilities, OperationError};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Semaphore;
+
+    struct CleanupBackend {
+        inner: Arc<dyn OperationBackend>,
+        calls: std::sync::Mutex<Vec<String>>,
+        finishing: Semaphore,
+        release: Semaphore,
+        hold: AtomicBool,
+    }
+    #[async_trait]
+    impl OperationBackend for CleanupBackend {
+        fn backend_id(&self) -> &str {
+            "local"
+        }
+        fn capabilities(&self) -> OperationBackendCapabilities {
+            self.inner.capabilities()
+        }
+        fn paths(&self) -> &dyn OperationPathResolver {
+            self.inner.paths()
+        }
+        fn files(&self) -> &dyn OperationFileSystem {
+            self.inner.files()
+        }
+        fn search(&self) -> &dyn OperationSearch {
+            self.inner.search()
+        }
+        fn exec(&self) -> &dyn OperationExec {
+            self.inner.exec()
+        }
+        fn export(&self) -> &dyn OperationExport {
+            self.inner.export()
+        }
+        fn execution_control(&self) -> Option<&dyn operation_protocol::OperationExecutionControl> { Some(self) }
+        async fn shutdown(&self) -> Result<(), OperationError> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl operation_protocol::OperationExecutionControl for CleanupBackend {
+        async fn begin_turn(&self, id: &str) -> Result<(), OperationError> {
+            self.calls.lock().unwrap().push(format!("begin:{id}"));
+            Ok(())
+        }
+        fn block_turn(&self, id: &str) -> Result<(), OperationError> {
+            self.calls.lock().unwrap().push(format!("block:{id}"));
+            Ok(())
+        }
+        async fn cancel_turn(&self, id: &str) -> Result<(), OperationError> {
+            self.calls.lock().unwrap().push(format!("cancel:{id}"));
+            Ok(())
+        }
+        async fn finish_turn(&self, id: &str) -> Result<(), OperationError> {
+            self.calls.lock().unwrap().push(format!("finish:{id}"));
+            if self.hold.swap(false, Ordering::SeqCst) {
+                self.finishing.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            Ok(())
+        }
+    }
+    fn turn(id: &str) -> RuntimeTurnInput {
+        serde_json::from_value(json!({"runtime_id":"test","turn_id":id,"text":"synthetic"}))
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn cancellation_waits_for_cleanup_and_old_cancel_cannot_touch_new_turn() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let dir=tempfile::tempdir().unwrap();
+            let script=dir.path().join("worker.py");
+            std::fs::write(&script,r#"#!/usr/bin/python3
+import json,sys
+json.loads(sys.stdin.readline())
+print('{"kind":"ready"}',flush=True)
+for line in sys.stdin:
+    req=json.loads(line)
+    if req['kind']=='cancel':
+        print('{"kind":"event","event":{"kind":"completed","outcome":"cancelled","usage":{}}}',flush=True)
+    elif req['kind']=='shutdown': break
+"#).unwrap();
+            std::fs::set_permissions(&script,std::fs::Permissions::from_mode(0o700)).unwrap();
+            let backend=Arc::new(CleanupBackend {
+                inner:backend::local::local_backend(dir.path().into(),None,None,None).unwrap(),
+                calls:std::sync::Mutex::new(Vec::new()),finishing:Semaphore::new(0),release:Semaphore::new(0),hold:AtomicBool::new(true),
+            });
+            let runtime=XiaooRuntime { bridge:Bridge::spawn().unwrap(),instances:RwLock::new(HashMap::new()),worker_executable:script };
+            let start:RuntimeStartRequest=serde_json::from_value(json!({
+                "runtime_id":"test","conversation_id":"test","sender_id":"test",
+                "workspace":{"workspace_id":"test","root":dir.path(),"access":"read_write"},
+                "ext":{"xiaoo":{"backend_id":"local","provider":"openai","model":"test","api_key_env":"PATH"}}
+            })).unwrap();
+            runtime.start_inner(start,RuntimeExecutionContext {operation_backend:backend.clone()}).await.unwrap();
+            let mut events=runtime.submit_turn_inner(turn("one")).await.unwrap();
+            runtime.cancel_inner("test",Some("old")).await.unwrap();
+            assert_eq!(*backend.calls.lock().unwrap(),["begin:one"]);
+            runtime.cancel_inner("test",Some("one")).await.unwrap();
+            backend.finishing.acquire().await.unwrap().forget();
+            assert!(events.try_recv().is_err(),"terminal must wait for cleanup");
+            assert!(runtime.submit_turn_inner(turn("two")).await.is_err(),"new turn must wait for cleanup");
+            backend.release.add_permits(1);
+            assert!(matches!(events.recv().await,Some(RuntimeEvent::Completed { .. })));
+            let mut next=runtime.submit_turn_inner(turn("two")).await.unwrap();
+            runtime.cancel_inner("test",Some("one")).await.unwrap();
+            assert_eq!(*backend.calls.lock().unwrap(),["begin:one","block:one","cancel:one","finish:one","begin:two"]);
+            runtime.cancel_inner("test",Some("two")).await.unwrap();
+            assert!(matches!(next.recv().await,Some(RuntimeEvent::Completed { .. })));
+            runtime.stop_inner("test").await.unwrap();
+        }).await.unwrap();
     }
 }

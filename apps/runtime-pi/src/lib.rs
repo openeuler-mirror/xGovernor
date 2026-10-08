@@ -2,6 +2,7 @@ pub mod bridge;
 mod session_file;
 pub mod worker;
 
+use backend::execution::OperationExecutionExt;
 pub use worker::run_worker_from_env;
 
 use agent_runtime_protocol::{
@@ -150,6 +151,7 @@ fn resolve_extension_dir(ext: &PiRuntimeExt) -> String {
 
 const LOCAL_BACKEND_ID: &str = "local";
 const E2B_BACKEND_ID: &str = "e2b";
+const DOCKER_BACKEND_ID: &str = "docker";
 const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
 const PI_LLM_STATE_FILE: &str = ".xgovernor-llm.json";
 const PI_MODEL_COMMAND: &str = "xgovernor-model";
@@ -160,7 +162,7 @@ pub const PI_WORKER_ENV: &str = "XGOVERNOR_PI_WORKER";
 /// caller selected them. When `api_base` is present, the bundled extension
 /// registers that endpoint as an OpenAI-compatible provider before selecting
 /// the model; otherwise Pi's built-in provider catalogue is used.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PiLlmConfig {
     provider: String,
@@ -170,6 +172,16 @@ struct PiLlmConfig {
     #[serde(default)]
     api_key: Option<String>,
     credential_source: String,
+}
+
+impl std::fmt::Debug for PiLlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PiLlmConfig")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl PiLlmConfig {
@@ -291,16 +303,35 @@ async fn probe_llm_endpoint(
     Ok(())
 }
 
+async fn private_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), SessionDomainError> {
+    let error = |e: std::io::Error| SessionDomainError::Unavailable {
+        message: format!("private configuration write failed: {e}"),
+    };
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await.map_err(error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(error)?;
+    }
+    file.write_all(bytes).await.map_err(error)
+}
+
 async fn persist_llm_config(
     session_dir: &std::path::Path,
     config: &PiLlmConfig,
 ) -> Result<(), SessionDomainError> {
-    let bytes = serde_json::to_vec(config).expect("PiLlmConfig always serializes");
-    tokio::fs::write(session_dir.join(PI_LLM_STATE_FILE), bytes)
-        .await
-        .map_err(|error| SessionDomainError::Unavailable {
-            message: format!("failed to persist pi session llm configuration: {error}"),
-        })
+    let mut stored = config.clone();
+    if stored.credential_source.starts_with("env:") {
+        stored.api_key = None;
+    }
+    let bytes = serde_json::to_vec(&stored).expect("PiLlmConfig always serializes");
+    private_write(&session_dir.join(PI_LLM_STATE_FILE), &bytes).await
 }
 
 async fn load_llm_config(
@@ -316,8 +347,13 @@ async fn load_llm_config(
             })
         }
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
+    serde_json::from_slice::<PiLlmConfig>(&bytes)
+        .map(|mut config| {
+            if let Some(name) = config.credential_source.strip_prefix("env:") {
+                config.api_key = std::env::var(name).ok();
+            }
+            Some(config)
+        })
         .map_err(|error| SessionDomainError::Unavailable {
             message: format!(
                 "pi session llm configuration '{}' is corrupt: {error}",
@@ -338,41 +374,31 @@ async fn configure_pi_launch(
         .arg(&config.provider)
         .arg("--model")
         .arg(&config.model);
-    if let Some(api_key) = &config.api_key {
-        command.arg("--api-key").arg(api_key);
-    }
-
-    // Pi has no generic `--base-url` flag. A request carrying api_base gets
-    // an isolated models.json, scoped to this one child process. The wire
-    // protocol currently has no provider API-kind field, so api_base means
-    // OpenAI Chat Completions compatible until that contract is extended.
-    if let Some(api_base) = &config.api_base {
-        let agent_dir = session_dir.join(".pi-agent");
-        tokio::fs::create_dir_all(&agent_dir)
-            .await
-            .map_err(|error| SessionDomainError::Unavailable {
-                message: format!("failed to create isolated pi agent directory: {error}"),
-            })?;
-        let mut provider = json!({
-            "baseUrl": api_base,
-            "api": "openai-completions",
-            "models": [{ "id": config.model }],
-        });
-        provider["apiKey"] = json!(config.api_key.as_deref().unwrap_or("xgovernor-keyless"));
-        let models = json!({ "providers": { config.provider.clone(): provider } });
-        tokio::fs::write(
-            agent_dir.join("models.json"),
-            serde_json::to_vec_pretty(&models).expect("models.json always serializes"),
-        )
+    // Pi resolves apiKey strings through its environment. Never put credentials
+    // in argv or models.json, including when the caller used an inline override.
+    command.env(
+        "XGOVERNOR_PI_MODEL_API_KEY",
+        config.api_key.as_deref().unwrap_or("xgovernor-keyless"),
+    );
+    let agent_dir = session_dir.join(".pi-agent");
+    tokio::fs::create_dir_all(&agent_dir)
         .await
         .map_err(|error| SessionDomainError::Unavailable {
-            message: format!("failed to write isolated pi models.json: {error}"),
+            message: error.to_string(),
         })?;
-        command.env("PI_CODING_AGENT_DIR", agent_dir);
-        if config.api_key.is_none() {
-            command.arg("--api-key").arg("xgovernor-keyless");
-        }
+    let mut provider = json!({"apiKey":"${XGOVERNOR_PI_MODEL_API_KEY}"});
+    if let Some(base) = &config.api_base {
+        provider["baseUrl"] = json!(base);
+        provider["api"] = json!("openai-completions");
+        provider["models"] = json!([{"id":config.model}]);
     }
+    let models = json!({"providers":{config.provider.clone():provider}});
+    private_write(
+        &agent_dir.join("models.json"),
+        &serde_json::to_vec_pretty(&models).unwrap(),
+    )
+    .await?;
+    command.env("PI_CODING_AGENT_DIR", agent_dir);
     persist_llm_config(session_dir, config).await
 }
 
@@ -523,9 +549,11 @@ fn to_runtime_error(error: SessionDomainError) -> RuntimeError {
 pub struct PiSessionEnvironment {
     default_local_root: String,
     configured_backends: BTreeSet<String>,
+    docker_snapshots: bool,
 }
 
 impl PiSessionEnvironment {
+    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self { self.docker_snapshots=enabled; self }
     pub fn new(
         default_local_root: impl Into<String>,
         configured_backends: impl IntoIterator<Item = String>,
@@ -533,6 +561,7 @@ impl PiSessionEnvironment {
         Self {
             default_local_root: default_local_root.into(),
             configured_backends: configured_backends.into_iter().collect(),
+            docker_snapshots: false,
         }
     }
 }
@@ -554,9 +583,44 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             });
         }
 
+        if ext.backend_id == DOCKER_BACKEND_ID {
+            if !ctx.is_admin() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "Docker prototype is administrator-only".into(),
+                });
+            }
+            if let Some(options) = request.deployment.options.get("provider_options") {
+                if !options.is_object()
+                    || options
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .any(|key| key != "workspace_root")
+                {
+                    return Err(SessionDomainError::InvalidRequest {
+                        message: "Docker prototype does not accept runtime Docker configuration"
+                            .into(),
+                    });
+                }
+            }
+        }
+        if ext.backend_id == DOCKER_BACKEND_ID {
+            if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
+                if !url.starts_with("https://") {
+                    return Err(SessionDomainError::InvalidRequest {
+                        message: "Docker prototype Git workspaces require HTTPS".into(),
+                    });
+                }
+            }
+        }
+        let sandbox_root = if ext.backend_id == DOCKER_BACKEND_ID {
+            "/workspace"
+        } else {
+            E2B_WORKSPACE_ROOT
+        };
         let provider_is_sandbox = match ext.backend_id.as_str() {
             LOCAL_BACKEND_ID => false,
-            E2B_BACKEND_ID => true,
+            E2B_BACKEND_ID | DOCKER_BACKEND_ID => true,
             other => {
                 return Err(SessionDomainError::InvalidRequest {
                     message: format!("backend_id '{other}' has no declared PI isolation profile"),
@@ -572,16 +636,17 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             (session_protocol::WorkspaceSpec::LocalPath { path }, LOCAL_BACKEND_ID) => {
                 (path.clone(), None, Value::Null)
             }
-            (session_protocol::WorkspaceSpec::DaemonDefault, E2B_BACKEND_ID) => {
-                (E2B_WORKSPACE_ROOT.to_string(), None, Value::Null)
-            }
+            (
+                session_protocol::WorkspaceSpec::DaemonDefault,
+                E2B_BACKEND_ID | DOCKER_BACKEND_ID,
+            ) => (sandbox_root.to_string(), None, Value::Null),
             (
                 session_protocol::WorkspaceSpec::Git {
                     url,
                     reference,
                     subdirectory,
                 },
-                E2B_BACKEND_ID,
+                E2B_BACKEND_ID | DOCKER_BACKEND_ID,
             ) => {
                 let metadata = serde_json::to_value(GitWorkspaceMetadata {
                     url: url.clone(),
@@ -589,7 +654,7 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                     subdirectory: subdirectory.clone(),
                 })
                 .expect("GitWorkspaceMetadata serialization is infallible");
-                (E2B_WORKSPACE_ROOT.to_string(), reference.clone(), metadata)
+                (sandbox_root.to_string(), reference.clone(), metadata)
             }
             (workspace, backend_id) => {
                 return Err(SessionDomainError::InvalidRequest {
@@ -600,7 +665,7 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             }
         };
 
-        let (boundary, network, capabilities) = match ext.backend_id.as_str() {
+        let (boundary, network, mut capabilities): (_, _, BTreeSet<SandboxCapability>) = match ext.backend_id.as_str() {
             LOCAL_BACKEND_ID => (
                 IsolationBoundary::Host,
                 NetworkIsolation::None,
@@ -628,9 +693,22 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 .into_iter()
                 .collect(),
             ),
+            DOCKER_BACKEND_ID => (
+                IsolationBoundary::Container,
+                NetworkIsolation::None,
+                [
+                    SandboxCapability::Exec,
+                    SandboxCapability::FileRead,
+                    SandboxCapability::FileWrite,
+                    SandboxCapability::Network,
+                ]
+                .into_iter()
+                .collect(),
+            ),
             _ => unreachable!("backend profile checked above"),
         };
 
+        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots { capabilities.insert(SandboxCapability::Snapshot); }
         let llm = resolve_llm(request.llm.as_ref())?.map(|config| config.descriptor());
 
         Ok(NormalizedSessionEnvironment {
@@ -712,6 +790,8 @@ struct PiInstance {
     child: Mutex<Child>,
     stdout: Mutex<BufReader<ChildStdout>>,
     current_turn: Mutex<Option<CurrentTurn>>,
+    backend: Arc<dyn OperationBackend>,
+    completion: Mutex<()>,
     /// Bearer token this instance's backend is registered under on the
     /// shared [`Bridge`]. `stop()` unregisters it so a dangling token can't
     /// keep proxying to a backend whose sandbox is about to be torn down.
@@ -1127,6 +1207,16 @@ async fn read_worker_turn(
             }
             terminal_sent = event.is_terminal();
             if terminal_sent {
+                let _completion = instance.completion.lock().await;
+                loop {
+                    match instance.backend.finish_turn(&turn_id).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!(%error,%turn_id,"Pi terminal waiting for Docker cleanup");
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
                 let mut current = instance.current_turn.lock().await;
                 if current
                     .as_ref()
@@ -1481,6 +1571,8 @@ impl PiRuntime {
             child: Mutex::new(child),
             stdout: Mutex::new(stdout),
             current_turn: Mutex::new(None),
+            backend,
+            completion: Mutex::new(()),
             bridge_token,
             persisted_state,
         });
@@ -1551,9 +1643,16 @@ impl PiRuntime {
             });
         }
 
+        if let Err(error) = instance.backend.begin_turn(&input.turn_id).await {
+            instance.current_turn.lock().await.take();
+            return Err(SessionDomainError::Unavailable {
+                message: error.to_string(),
+            });
+        }
         if let Err(error) =
             send_worker_request(&instance, WorkerRequest::SubmitTurn(input.clone())).await
         {
+            let _ = instance.backend.finish_turn(&input.turn_id).await;
             instance.current_turn.lock().await.take();
             return Err(error);
         }
@@ -1598,22 +1697,39 @@ impl PiRuntime {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let instance = self.instance_for(runtime_id).await?;
+        let _completion = instance.completion.lock().await;
         let active = instance.current_turn.lock().await;
-        let should_cancel = active
+        let selected = active
             .as_ref()
-            .is_some_and(|active| turn_id.is_none() || turn_id == Some(active.turn_id.as_str()));
+            .filter(|active| turn_id.is_none() || turn_id == Some(active.turn_id.as_str()))
+            .map(|active| active.turn_id.clone());
         drop(active);
-        if !should_cancel {
+        let Some(selected) = selected else {
             return Ok(());
-        }
-        send_worker_request(
+        };
+        // Mark the backend scope cancelled before asking Pi to abort. Concurrent
+        // terminal delivery waits for this same completion lock.
+        instance.backend.block_turn(&selected).map_err(|error| {
+            SessionDomainError::Unavailable {
+                message: error.to_string(),
+            }
+        })?;
+        let abort = send_worker_request(
             &instance,
             WorkerRequest::Cancel(RuntimeCancelRequest {
                 runtime_id: runtime_id.into(),
-                turn_id: turn_id.map(str::to_owned),
+                turn_id: Some(selected.clone()),
             }),
         )
-        .await
+        .await;
+        instance
+            .backend
+            .cancel_turn(&selected)
+            .await
+            .map_err(|error| SessionDomainError::Unavailable {
+                message: error.to_string(),
+            })?;
+        abort
     }
 }
 
@@ -1651,6 +1767,41 @@ mod tests {
             .into_iter()
             .collect();
         request
+    }
+
+    #[tokio::test]
+    async fn docker_admission_is_admin_only_and_has_no_snapshots() {
+        let normalizer = PiSessionEnvironment::new("/unused", ["docker".into()]);
+        let mut request = open_request(session_protocol::WorkspaceSpec::DaemonDefault);
+        request
+            .ext
+            .insert(EXT_NAMESPACE.into(), json!({"backend_id":"docker"}));
+        let normalized = normalizer
+            .normalize(&SecurityContext::admin("test"), &request)
+            .await
+            .unwrap();
+        assert_eq!(normalized.workspace.root, "/workspace");
+        assert_eq!(normalized.isolation.boundary, IsolationBoundary::Container);
+        assert!(!normalized
+            .sandbox_capabilities
+            .contains(&SandboxCapability::Snapshot));
+        assert!(normalizer
+            .normalize(&SecurityContext::tenant("t", "p"), &request)
+            .await
+            .is_err());
+        request.workspace = session_protocol::WorkspaceSpec::LocalPath {
+            path: "/tmp".into(),
+        };
+        assert!(normalizer
+            .normalize(&SecurityContext::admin("test"), &request)
+            .await
+            .is_err());
+        request.workspace = session_protocol::WorkspaceSpec::DaemonDefault;
+        request.deployment.options = json!({"provider_options":{"privileged":true}});
+        assert!(normalizer
+            .normalize(&SecurityContext::admin("test"), &request)
+            .await
+            .is_err());
     }
 
     fn pi_normalizer() -> PiSessionEnvironment {

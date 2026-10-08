@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+backend = { path = "../../crates/backend" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,7 +31,6 @@ prompt.workspace = true
 tool.workspace = true
 
 [dev-dependencies]
-backend = { path = "../../crates/backend" }
 tempfile.workspace = true
 
 [[bin]]

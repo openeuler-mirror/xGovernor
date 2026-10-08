@@ -45,6 +45,7 @@ struct ActiveTurn {
     pending_interactions: HashMap<String, String>,
     output_sequence: u64,
     usage: SessionUsage,
+    model_error: Option<String>,
 }
 
 impl ActiveTurn {
@@ -96,11 +97,14 @@ pub(crate) async fn spawn_worker_process(
     let stdout = child.stdout.take().expect("Pi worker stdout was piped");
     let mut stdout = BufReader::new(stdout);
     let mut ready = String::new();
-    stdout.read_line(&mut ready).await.map_err(|error| {
-        xgovernor_core::SessionDomainError::Unavailable {
+    timeout(Duration::from_secs(20), stdout.read_line(&mut ready))
+        .await
+        .map_err(|_| xgovernor_core::SessionDomainError::Unavailable {
+            message: "Pi worker readiness timed out".into(),
+        })?
+        .map_err(|error| xgovernor_core::SessionDomainError::Unavailable {
             message: format!("failed to read Pi worker readiness: {error}"),
-        }
-    })?;
+        })?;
     match agent_runtime_protocol::decode_worker_response(&ready) {
         Ok(WorkerResponse::Ready) => Ok((child, stdin, stdout)),
         Ok(WorkerResponse::Error { error }) => {
@@ -144,6 +148,30 @@ pub async fn run_worker_from_env() -> Result<(), String> {
         .ok_or_else(|| "Pi stdout was not piped".to_string())?;
     let reader_native = Arc::clone(&native);
     let reader = tokio::spawn(async move { read_native_events(reader_native, stdout).await });
+    // Spawn success is not readiness: the native process may fail during
+    // initialization. A local RPC response validates startup without a model call.
+    if let Err(message) = write_native_for_response(
+        &native,
+        json!({"type":"get_state","id":format!("startup-{}",Uuid::new_v4())}),
+    )
+    .await
+    {
+        let _ = response_tx.send(WorkerResponse::Error {
+            error: RuntimeError::WorkerUnavailable {
+                message,
+                retryable: true,
+            },
+        });
+        {
+            let mut child = native.child.lock().await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        let _ = reader.await;
+        drop(native);
+        drop(response_tx);
+        return writer.await.map_err(|error| error.to_string())?;
+    }
     let _ = response_tx.send(WorkerResponse::Ready);
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -270,6 +298,23 @@ async fn handle_worker_request(
 
     match request {
         WorkerRequest::SubmitTurn(request) => {
+            let context_path = native.session_dir.join("xgovernor-turn.json");
+            let pending = context_path.with_extension("pending");
+            tokio::fs::write(
+                &pending,
+                serde_json::to_vec(&serde_json::json!({"turn_id":request.turn_id})).unwrap(),
+            )
+            .await
+            .map_err(|e| RuntimeError::WorkerUnavailable {
+                message: e.to_string(),
+                retryable: true,
+            })?;
+            tokio::fs::rename(&pending, &context_path)
+                .await
+                .map_err(|e| RuntimeError::WorkerUnavailable {
+                    message: e.to_string(),
+                    retryable: true,
+                })?;
             if let Some(value) = request.ext.get(EXT_NAMESPACE) {
                 let next: PiRoleConfig = serde_json::from_value(value.clone()).map_err(|e| {
                     RuntimeError::InvalidRequest {
@@ -323,6 +368,7 @@ async fn handle_worker_request(
                     pending_interactions: HashMap::new(),
                     output_sequence: 0,
                     usage: SessionUsage::default(),
+                    model_error: None,
                 });
                 drop(active);
                 write_native(
@@ -565,6 +611,17 @@ async fn handle_message_end(native: &NativePi, event: &Value) {
     }
     let mut active = native.active_turn.lock().await;
     let Some(turn) = active.as_mut() else { return };
+    turn.model_error = if message.get("stopReason").and_then(Value::as_str) == Some("error") {
+        Some(
+            message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("Pi model response failed")
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let usage = extract_usage(message);
     turn.usage.input_tokens = turn.usage.input_tokens.saturating_add(usage.input_tokens);
     turn.usage.output_tokens = turn.usage.output_tokens.saturating_add(usage.output_tokens);
@@ -734,7 +791,13 @@ async fn handle_settled(native: &NativePi, message: &Value) {
         return;
     };
     let usage = turn.usage;
-    if let Some(error) = message.get("error").filter(|value| !value.is_null()) {
+    let model_error = turn.model_error.map(Value::String);
+    if let Some(error) = message
+        .get("error")
+        .filter(|value| !value.is_null())
+        .or(model_error.as_ref())
+        .filter(|_| !turn.aborted)
+    {
         emit_event(
             native,
             RuntimeEvent::Failed {

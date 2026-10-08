@@ -34,6 +34,7 @@ pub use xiaoo_runtime::XiaooRuntime;
 
 pub const EXT_NAMESPACE: &str = "xiaoo";
 pub const LOCAL_BACKEND_ID: &str = "local";
+pub const DOCKER_BACKEND_ID: &str = "docker";
 pub const E2B_BACKEND_ID: &str = "e2b";
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
@@ -153,9 +154,11 @@ pub(crate) struct XiaooPersistedState {
 pub struct XiaooSessionEnvironment {
     default_local_root: String,
     configured_backends: BTreeSet<String>,
+    docker_snapshots: bool,
 }
 
 impl XiaooSessionEnvironment {
+    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self { self.docker_snapshots=enabled; self }
     pub fn new(
         default_local_root: impl Into<String>,
         configured_backends: impl IntoIterator<Item = String>,
@@ -163,6 +166,7 @@ impl XiaooSessionEnvironment {
         Self {
             default_local_root: default_local_root.into(),
             configured_backends: configured_backends.into_iter().collect(),
+            docker_snapshots: false,
         }
     }
 }
@@ -239,7 +243,34 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                 message: format!("xiaoo backend_id '{}' is not configured", ext.backend_id),
             });
         }
-        let sandboxed = ext.backend_id == E2B_BACKEND_ID;
+        if ext.backend_id == DOCKER_BACKEND_ID {
+            if !ctx.is_admin() {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: "Docker is administrator-only".into(),
+                });
+            }
+            if let Some(options) = request.deployment.options.get("provider_options") {
+                if !options.is_object()
+                    || options
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .any(|(k, v)| k != "workspace_root" || v != "/workspace")
+                {
+                    return Err(SessionDomainError::InvalidRequest {
+                        message: "Docker configuration is controlled by the server".into(),
+                    });
+                }
+            }
+            if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
+                if !url.starts_with("https://") {
+                    return Err(SessionDomainError::InvalidRequest {
+                        message: "Docker Git workspaces require HTTPS".into(),
+                    });
+                }
+            }
+        }
+        let sandboxed = matches!(ext.backend_id.as_str(), E2B_BACKEND_ID | DOCKER_BACKEND_ID);
         enforce_workspace_axiom(ctx, &request.workspace, sandboxed)?;
         let (root, boundary, network, metadata) =
             match (&request.workspace, ext.backend_id.as_str()) {
@@ -274,6 +305,25 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                     NetworkIsolation::Restricted,
                     json!({"url": url, "reference": reference, "subdirectory": subdirectory}),
                 ),
+                (session_protocol::WorkspaceSpec::DaemonDefault, DOCKER_BACKEND_ID) => (
+                    "/workspace".into(),
+                    IsolationBoundary::Container,
+                    NetworkIsolation::None,
+                    Value::Null,
+                ),
+                (
+                    session_protocol::WorkspaceSpec::Git {
+                        url,
+                        reference,
+                        subdirectory,
+                    },
+                    DOCKER_BACKEND_ID,
+                ) => (
+                    "/workspace".into(),
+                    IsolationBoundary::Container,
+                    NetworkIsolation::None,
+                    json!({"url":url,"reference":reference,"subdirectory":subdirectory}),
+                ),
                 (workspace, backend_id) => {
                     return Err(SessionDomainError::InvalidRequest {
                         message: format!(
@@ -290,6 +340,7 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
         if ext.backend_id == E2B_BACKEND_ID {
             sandbox.extend([SandboxCapability::Snapshot, SandboxCapability::Network]);
         }
+        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots { sandbox.insert(SandboxCapability::Snapshot); }
         Ok(NormalizedSessionEnvironment {
             workspace: xgovernor_core::WorkspaceFacts {
                 workspace_id: format!("xiaoo:{}", ext.backend_id),
@@ -302,7 +353,7 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                 boundary,
                 workspace_access: WorkspaceAccess::ReadWrite,
                 network,
-                metadata: json!({"backend_id": ext.backend_id}),
+                metadata: json!({"backend_id": ext.backend_id, "controller_boundary":"host"}),
             },
             sandbox_capabilities: sandbox,
             llm: Some(ResolvedLlm {
@@ -844,5 +895,58 @@ mod role_tests {
             assert!(settings.for_turn(&ext).is_err());
         }
         assert_eq!(settings, RoleSettings::default());
+    }
+}
+
+#[cfg(test)]
+mod docker_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn docker_requires_admin_and_server_controlled_workspace() {
+        let normalizer = XiaooSessionEnvironment::new("/unused", ["docker".into()]);
+        // This test never contacts a model; PATH supplies a nonempty existing env value.
+        let mut request: session_protocol::SessionOpenRequest = serde_json::from_value(json!({
+            "runtime_kind":"xiaoo", "conversation_id":"test", "sender_id":"test",
+            "workspace":{"kind":"daemon_default"},
+            "ext":{"xiaoo":{"backend_id":"docker","provider":"openai","model":"test","api_key_env":"PATH"}}
+        })).unwrap();
+        let admin = SecurityContext::admin("test");
+        let facts = normalizer.normalize(&admin, &request).await.unwrap();
+        assert_eq!(facts.workspace.root, "/workspace");
+        assert_eq!(facts.isolation.boundary, IsolationBoundary::Container);
+        assert_eq!(facts.isolation.network, NetworkIsolation::None);
+        assert_eq!(facts.isolation.metadata["controller_boundary"], "host");
+        assert!(!facts
+            .sandbox_capabilities
+            .contains(&SandboxCapability::Snapshot));
+        assert!(normalizer
+            .normalize(&SecurityContext::tenant("t", "p"), &request)
+            .await
+            .is_err());
+        request.workspace = session_protocol::WorkspaceSpec::LocalPath {
+            path: "/tmp".into(),
+        };
+        assert!(normalizer.normalize(&admin, &request).await.is_err());
+        request.workspace = session_protocol::WorkspaceSpec::Git {
+            url: "http://example.com/repo".into(),
+            reference: None,
+            subdirectory: None,
+        };
+        assert!(normalizer.normalize(&admin, &request).await.is_err());
+        request.workspace = session_protocol::WorkspaceSpec::Git {
+            url: "https://example.com/repo".into(),
+            reference: None,
+            subdirectory: None,
+        };
+        assert!(normalizer.normalize(&admin, &request).await.is_ok());
+        for options in [
+            json!({"privileged":true}),
+            json!({"image":"arbitrary"}),
+            json!({"workspace_root":"/tmp"}),
+        ] {
+            request.deployment.options = json!({"provider_options":options});
+            assert!(normalizer.normalize(&admin, &request).await.is_err());
+        }
     }
 }

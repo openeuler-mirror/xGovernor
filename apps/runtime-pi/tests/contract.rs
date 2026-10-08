@@ -118,13 +118,16 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
     };
     assert_eq!(flag_value("--provider"), Some("openai"));
     assert_eq!(flag_value("--model"), Some("gpt-4.1-mini"));
-    assert_eq!(flag_value("--api-key"), Some("open-key"));
+    assert_eq!(flag_value("--api-key"), None);
+    assert!(!launch_args.iter().any(|arg| arg == "open-key"));
 
     let commands: Vec<Value> = std::fs::read_to_string(session_dir.join("fake_pi_commands.jsonl"))
         .expect("command log")
         .lines()
         .map(|line| serde_json::from_str(line).expect("command JSON"))
         .collect();
+    assert_eq!(commands[0]["type"], "get_state");
+    let commands = &commands[1..];
     assert!(commands[0]
         .get("message")
         .and_then(Value::as_str)
@@ -752,4 +755,38 @@ async fn operations_against_an_unknown_runtime_id_return_not_found() {
         .await
         .expect_err("must be not found");
     assert!(matches!(error, RuntimeError::NotFound { .. }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_pi_exit_during_startup_does_not_publish_a_ready_runtime() {
+    let workspace = TempDir::new().unwrap();
+    let runtime = new_pi_runtime();
+    let mut ext = pi_runtime_ext();
+    ext.get_mut(EXT_NAMESPACE).unwrap()["executable"] = json!("/bin/false");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.start(
+            RuntimeStartRequest {
+                runtime_id: "failed-native-start".into(),
+                conversation_id: "test".into(),
+                sender_id: "test".into(),
+                workspace: workspace_facts(workspace.path().to_str().unwrap()),
+                state: None,
+                llm: None,
+                ext,
+            },
+            support::runtime_context(workspace.path().to_str().unwrap()).await,
+        ),
+    )
+    .await
+    .expect("native exit must fail promptly");
+    assert!(
+        matches!(result, Err(RuntimeError::WorkerUnavailable { .. })),
+        "{result:?}"
+    );
+    assert!(!runtime
+        .check_alive("failed-native-start")
+        .await
+        .unwrap_or(false));
 }

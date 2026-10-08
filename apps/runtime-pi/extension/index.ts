@@ -19,6 +19,8 @@
  */
 
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
 	type BashOperations,
@@ -168,7 +170,13 @@ interface WorkspaceRootResponse {
 // BridgeClient: thin fetch() wrapper around the 8 bridge endpoints.
 // ---------------------------------------------------------------------------
 
+const toolContext = new AsyncLocalStorage<{ turn: string; operation: string; signal?: AbortSignal }>();
 class BridgeClient {
+    turn = "";
+    withTool<T>(id: string, work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+        if (signal?.aborted) return Promise.reject(new Error("tool cancelled"));
+        return toolContext.run({ turn: this.turn, operation: id || randomUUID(), signal }, work);
+    }
 	constructor(
 		private readonly baseUrl: string,
 		private readonly token: string,
@@ -176,6 +184,9 @@ class BridgeClient {
 
 	private async post<TResponse>(endpoint: string, body: unknown, signal?: AbortSignal): Promise<TResponse> {
 		const url = `${this.baseUrl}${endpoint}`;
+        const context = toolContext.getStore();
+        signal = signal ?? context?.signal;
+        if (signal?.aborted) throw new Error("tool cancelled");
 		let response: Response;
 		try {
 			response = await fetch(url, {
@@ -183,6 +194,7 @@ class BridgeClient {
 				headers: {
 					"Content-Type": "application/json",
 					Authorization: `Bearer ${this.token}`,
+                    ...(context ? { "x-xgovernor-turn": context.turn, "x-xgovernor-operation": context.operation } : {}),
 				},
 				body: JSON.stringify(body ?? {}),
 				signal,
@@ -356,7 +368,7 @@ function rewriteHostCwdPath(workspaceRoot: string, inputPath: string): string {
 
 /** Cap on results fetched to synthesize a directory listing via /v1/glob("*",
  * dir). See CONTRACT.md "Implementation notes" on LsOperations.readdir. */
-const LS_READDIR_LIMIT = 10_000;
+const LS_READDIR_LIMIT = 1000;
 
 // ---------------------------------------------------------------------------
 // Pluggable *Operations implementations, backed by BridgeClient.
@@ -525,7 +537,8 @@ function registerGrepTool(pi: ExtensionAPI, client: BridgeClient, workspaceRoot:
 			"Search file contents for a pattern via the xGovernor sandbox backend. Matching happens entirely server-side.",
 		promptSnippet: "Search file contents for patterns",
 		parameters: grepSchema,
-		async execute(_id, params) {
+		async execute(_id, params, signal) {
+            return client.withTool(_id, async () => {
 			const baseDir = resolveAgainstWorkspace(workspaceRoot, params.path);
 			const mode: GrepMode = params.mode ?? "content";
 			const limit = params.limit && params.limit > 0 ? params.limit : DEFAULT_GREP_LIMIT;
@@ -539,14 +552,15 @@ function registerGrepTool(pi: ExtensionAPI, client: BridgeClient, workspaceRoot:
 			});
 
 			if (result.entries.length === 0) {
-				return { content: [{ type: "text", text: "No matches found" }], details: undefined };
+				return { content: [{ type: "text" as const, text: "No matches found" }], details: undefined };
 			}
 
 			let text = result.entries.join("\n");
 			if (result.entries.length >= limit) {
 				text += `\n\n[${limit} matches limit reached]`;
 			}
-			return { content: [{ type: "text", text }], details: undefined };
+			return { content: [{ type: "text" as const, text }], details: undefined };
+            }, signal);
 		},
 	});
 }
@@ -564,9 +578,12 @@ export default function (pi: ExtensionAPI): void {
     type RoleConfig = { system_prompt?: string; max_turns?: number; tools_enabled?: boolean };
     let role: RoleConfig = {};
     let turns = 0;
-    const sandboxTools = ["read", "write", "edit", "bash", "find", "grep"];
+    const sandboxTools = ["read", "write", "edit", "bash", "ls", "find", "grep"];
     pi.on("before_agent_start", async () => {
         const configPath = process.env.XGOVERNOR_PI_ROLE_FILE;
+        if (configPath) {
+            client.turn = JSON.parse(readFileSync(path.join(path.dirname(configPath), "xgovernor-turn.json"), "utf8")).turn_id;
+        }
         role = configPath ? JSON.parse(readFileSync(configPath, "utf8")) as RoleConfig : {};
         turns = 0;
         pi.setActiveTools(role.tools_enabled === false ? [] : sandboxTools);
@@ -634,37 +651,37 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerTool({
 		...readTool,
 		async execute(id, params, signal, onUpdate) {
-			return readTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => readTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 	pi.registerTool({
 		...writeTool,
 		async execute(id, params, signal, onUpdate) {
-			return writeTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => writeTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 	pi.registerTool({
 		...editTool,
 		async execute(id, params, signal, onUpdate) {
-			return editTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => editTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 	pi.registerTool({
 		...bashTool,
 		async execute(id, params, signal, onUpdate) {
-			return bashTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => bashTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 	pi.registerTool({
 		...lsTool,
 		async execute(id, params, signal, onUpdate) {
-			return lsTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => lsTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 	pi.registerTool({
 		...findTool,
 		async execute(id, params, signal, onUpdate) {
-			return findTool.execute(id, params, signal, onUpdate);
+			return client.withTool(id, () => findTool.execute(id, params, signal, onUpdate), signal);
 		},
 	});
 
