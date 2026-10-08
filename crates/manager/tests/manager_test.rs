@@ -23,9 +23,11 @@ struct FakeLifecycle {
     next_id: AtomicU64,
     fail_create_remaining: AtomicU32,
     fail_create_permanently: AtomicBool,
+    fail_inspect: AtomicBool,
     fail_delete_remaining: AtomicU32,
     live_instances: Mutex<Vec<ProviderInstance>>,
     create_calls: AtomicU32,
+    create_ids: Mutex<Vec<Value>>,
     delete_calls: AtomicU32,
     gate: Mutex<Option<Arc<CreateGate>>>,
 }
@@ -36,9 +38,11 @@ impl FakeLifecycle {
             next_id: AtomicU64::new(0),
             fail_create_remaining: AtomicU32::new(0),
             fail_create_permanently: AtomicBool::new(false),
+            fail_inspect: AtomicBool::new(false),
             fail_delete_remaining: AtomicU32::new(0),
             live_instances: Mutex::new(Vec::new()),
             create_calls: AtomicU32::new(0),
+            create_ids: Mutex::new(Vec::new()),
             delete_calls: AtomicU32::new(0),
             gate: Mutex::new(None),
         }
@@ -90,6 +94,10 @@ impl ProviderLifecycle for FakeLifecycle {
         &self,
         _request: ProviderCreateRequest,
     ) -> Result<ProviderInstance, ProviderControlError> {
+        self.create_ids
+            .lock()
+            .unwrap()
+            .push(_request.correlation["request_id"].clone());
         self.create_calls.fetch_add(1, Ordering::SeqCst);
 
         let gate = self.gate.lock().unwrap().clone();
@@ -165,7 +173,35 @@ impl ProviderLifecycle for FakeLifecycle {
         &self,
         _request: ProviderInspectRequest,
     ) -> Result<ProviderInstanceStatus, ProviderControlError> {
-        unimplemented!("not exercised by these tests")
+        if self.fail_inspect.load(Ordering::SeqCst) {
+            return Err(ProviderControlError::Transport {
+                message: "offline".into(),
+            });
+        }
+        let id = _request.instance_id.unwrap();
+        let i = self
+            .live_instances
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|i| i.instance_id == id)
+            .cloned()
+            .ok_or_else(|| ProviderControlError::NotFound {
+                resource_ref: id.0.clone(),
+            })?;
+        Ok(ProviderInstanceStatus {
+            backend_id: i.backend_id,
+            provider: i.provider,
+            instance_id: Some(id),
+            state: i.state,
+            endpoint: i.endpoint,
+            snapshot: i.snapshot,
+            capabilities: i.capabilities,
+            resources: i.resources,
+            last_error: None,
+            metadata: i.metadata,
+            updated_at_ms: 0,
+        })
     }
 
     async fn list_instances(&self) -> Result<Vec<ProviderInstance>, ProviderControlError> {
@@ -207,12 +243,14 @@ impl OperationBackend for FakeBackend {
 
 struct FakeAttach {
     fail: AtomicBool,
+    missing: AtomicBool,
 }
 
 impl FakeAttach {
     fn new() -> Self {
         Self {
             fail: AtomicBool::new(false),
+            missing: AtomicBool::new(false),
         }
     }
 }
@@ -223,6 +261,11 @@ impl OperationAttach for FakeAttach {
         &self,
         instance: &ProviderInstance,
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
+        if self.missing.load(Ordering::SeqCst) {
+            return Err(ProviderControlError::NotFound {
+                resource_ref: instance.instance_id.0.clone(),
+            });
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(ProviderControlError::Transport {
                 message: "fake attach failure".to_string(),
@@ -530,6 +573,10 @@ async fn create_retries_a_transient_error_then_succeeds() {
     let backend = start(&manager, "r1", "owner-a").await.unwrap();
     assert_eq!(backend.backend_id(), "fake-0");
     assert_eq!(lifecycle.create_calls.load(Ordering::SeqCst), 3);
+    let ids = lifecycle.create_ids.lock().unwrap();
+    assert!(ids[0].as_str().is_some());
+    assert!(ids.iter().all(|id| id == &ids[0]));
+
     assert_eq!(manager.active_count("owner-a"), 1);
 }
 
@@ -648,6 +695,9 @@ async fn reconcile_rehydrates_registry_and_quota_from_the_ledger() {
     assert_eq!(manager.active_count("owner-a"), 1);
     assert_eq!(manager.global_active_count(), 1);
     assert!(manager.backend_for("runtime-restart-1").is_ok());
+    manager.reconcile().await.unwrap();
+    assert_eq!(manager.active_count("owner-a"), 1);
+    assert_eq!(manager.global_active_count(), 1);
 }
 
 /// Regression test for the real E2E finding (`docs/pi_session_restore_
@@ -738,7 +788,7 @@ async fn reconcile_orphans_a_ledger_row_the_provider_no_longer_reports() {
     // is modeled by making `FakeAttach` fail, not by leaving
     // `lifecycle`'s `list_instances()` empty (which no longer has any
     // bearing on reconcile's outcome).
-    attach.fail.store(true, Ordering::SeqCst);
+    attach.missing.store(true, Ordering::SeqCst);
     ledger.rows.lock().unwrap().insert(
         "runtime-orphan-1".to_string(),
         ActiveLedgerEntry {
@@ -943,4 +993,83 @@ async fn reconcile_after_restart_rebuilds_a_local_instance_from_the_ledger_alone
 
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_file(&ledger_path);
+}
+
+#[tokio::test]
+async fn reconcile_preserves_ledger_on_transport_failure_then_recovers() {
+    let lifecycle = Arc::new(FakeLifecycle::new());
+    let attach = Arc::new(FakeAttach::new());
+    let ledger = Arc::new(FakeLedger::default());
+    ledger.rows.lock().unwrap().insert(
+        "runtime-offline".into(),
+        ActiveLedgerEntry {
+            runtime_id: "runtime-offline".into(),
+            owner_ref: "owner-a".into(),
+            instance: lifecycle.instance("still-exists".into()),
+        },
+    );
+    let manager = InstanceManager::new(
+        lifecycle,
+        attach.clone(),
+        ledger.clone(),
+        ProviderKind("fake".into()),
+        InstanceManagerConfig::new(2, 2),
+    );
+    attach.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        manager.reconcile().await,
+        Err(ProviderControlError::Transport { .. })
+    ));
+    assert_eq!(ledger.rows.lock().unwrap().len(), 1);
+    assert!(matches!(
+        manager.backend_for("runtime-offline"),
+        Err(ProviderControlError::Transport { .. })
+    ));
+    attach.fail.store(false, Ordering::SeqCst);
+    assert_eq!(manager.reconcile().await.unwrap().confirmed.len(), 1);
+    assert_eq!(manager.global_active_count(), 1);
+}
+
+#[tokio::test]
+async fn docker_reconcile_preserves_live_registry_on_outage_and_retires_only_missing() {
+    let lifecycle = Arc::new(FakeLifecycle::new());
+    let ledger = Arc::new(FakeLedger::default());
+    let mut instance = lifecycle.instance("docker-test".into());
+    instance.provider = ProviderKind("docker".into());
+    lifecycle
+        .live_instances
+        .lock()
+        .unwrap()
+        .push(instance.clone());
+    ledger.rows.lock().unwrap().insert(
+        "runtime".into(),
+        ActiveLedgerEntry {
+            runtime_id: "runtime".into(),
+            owner_ref: "owner".into(),
+            instance,
+        },
+    );
+    let manager = InstanceManager::new(
+        lifecycle.clone(),
+        Arc::new(FakeAttach::new()),
+        ledger.clone(),
+        ProviderKind("docker".into()),
+        InstanceManagerConfig::new(2, 2),
+    );
+    manager.reconcile().await.unwrap();
+    lifecycle.fail_inspect.store(true, Ordering::SeqCst);
+    assert!(manager.reconcile().await.is_err());
+    assert!(manager.backend_for("runtime").is_ok());
+    assert_eq!(ledger.rows.lock().unwrap().len(), 1);
+    lifecycle.fail_inspect.store(false, Ordering::SeqCst);
+    manager.reconcile().await.unwrap();
+    assert_eq!(manager.global_active_count(), 1);
+    lifecycle.live_instances.lock().unwrap().clear();
+    assert_eq!(manager.reconcile().await.unwrap().orphaned.len(), 1);
+    assert!(matches!(
+        manager.backend_for("runtime"),
+        Err(ProviderControlError::NotFound { .. })
+    ));
+    assert_eq!(manager.global_active_count(), 0);
+    assert!(ledger.rows.lock().unwrap().is_empty());
 }
