@@ -365,3 +365,12 @@
 Pi 用受信扩展替换真实 system prompt，限定沙箱工具集合，关闭个人扩展/skills/template/theme 发现。其 checkpoint 导出会冻结当时完整 JSONL 和角色配置；每次 load/fork 获得独立会话目录。正常 turn 持久化只保存本会话的实时状态，不重复复制历史。快照的模型环境凭证保留环境变量引用；inline key 放在权限为 0600 的独立私有文件中，opaque state/SQLite 只含引用，删除 checkpoint 时释放。关闭源 session 后 checkpoint 仍有效，必须显式调用 checkpoint/delete 清理。
 
 Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式仅含实时会话目录的 state 不可直接作为新分支使用，需要在升级后的服务上重新 checkpoint。当前本地 provider 不提供环境快照；完整 MCTS 分支需使用具备 snapshot 能力的 provider（如 E2B）。
+
+
+### Docker 工具后端（实验性，仅管理员 / Pi）
+
+显式启用 `XGOVERNOR_DOCKER_ENABLED=1` 后，open 可使用 `ext.runtime_pi.backend_id: "docker"`，workspace 支持 `daemon_default` 和 HTTPS `git`，根目录固定 `/workspace`。`local_path` 和租户 Docker 请求返回 400；不能用 `deployment.options.provider_options` 指定镜像、挂载、特权或 daemon 配置。
+
+Docker 会话的工具隔离投影为 `container`，`controller_boundary` 为 `host`，网络隔离为 `none`。沿用 exec/files/turns/close 接口，不声明 Snapshot；checkpoint/fork 不支持。镜像和资源由服务端控制，原型最多两个容器，每个 1 CPU、1 GiB 内存、128 PID。close 删除容器及工作区，正常服务重启重新附着原容器。完整 turn 取消传播暂未实现。
+
+构建、配置、测试、清理及限制见 [Docker 原型说明](../scripts/docker-prototype/README.md)。

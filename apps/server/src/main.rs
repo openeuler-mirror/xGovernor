@@ -510,6 +510,68 @@ async fn main() {
         None
     };
 
+    let docker_enabled = match std::env::var("XGOVERNOR_DOCKER_ENABLED").as_deref() {
+        Ok("1") => true,
+        Ok("0") | Err(std::env::VarError::NotPresent) => false,
+        _ => panic!("XGOVERNOR_DOCKER_ENABLED must be 0 or 1"),
+    };
+    let mut docker_snapshots = false;
+    let _docker_retry_loop = if docker_enabled {
+        let mut config =
+            backend::docker::DockerConfig::from_env().expect("invalid Docker configuration");
+        if std::env::var_os("XGOVERNOR_DOCKER_STATE_DIR").is_none() {
+            config.state_dir = xgovernor_data_dir().join("docker-state");
+        }
+        docker_snapshots = config.limits.snapshot_enabled;
+        let max = config.limits.max_containers;
+        let monitor_ms = config.limits.monitor_ms;
+        let provider = Arc::new(
+            backend::docker::DockerProvider::new(config).expect("invalid Docker provider"),
+        );
+        if let Err(error) = provider.preflight().await {
+            tracing::warn!(%error,"Docker unavailable; retaining ledger and retrying in background");
+        }
+        let manager = Arc::new(InstanceManager::new(
+            provider.clone(),
+            provider.clone(),
+            open_provider_ledger(&db_path, "docker"),
+            ProviderKind("docker".into()),
+            InstanceManagerConfig::new(max, max),
+        ));
+        if let Err(error) = manager.reconcile().await {
+            tracing::warn!(%error,"Docker recovery pending");
+        }
+        let recovering = manager.clone();
+        let retry = tokio::spawn(async move {
+            let mut delay = monitor_ms;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                let result = async {
+                    provider.preflight().await?;
+                    provider.maintenance().await?;
+                    recovering.reconcile().await?;
+                    provider
+                        .cleanup_unbound(&recovering.ledger_instance_ids().await?)
+                        .await?;
+                    Ok::<(), provider_protocol::ProviderControlError>(())
+                }
+                .await;
+                recovering.retry_pending_releases_once().await;
+                match result {
+                    Ok(()) => delay = monitor_ms,
+                    Err(error) => {
+                        tracing::warn!(%error,"Docker unavailable or recovery pending");
+                        delay = (delay * 2).min(30_000);
+                    }
+                }
+            }
+        });
+        runtime_managers.insert("docker".into(), manager);
+        Some(retry)
+    } else {
+        None
+    };
+
     // Snapshot the configured `backend_id`s before `PiRuntime::new` moves
     // the map — `PiSessionEnvironment` must admit exactly the backends the
     // runtime can actually provision (and no others), so the two stay in
@@ -553,7 +615,7 @@ async fn main() {
                 Arc::new(PiSessionEnvironment::new(
                     default_workspace_root.clone(),
                     configured_backend_ids.clone(),
-                )),
+                ).with_docker_snapshots(docker_snapshots)),
             ),
             RuntimeRegistration::with_providers(
                 xiaoo_runtime.clone(),
@@ -561,7 +623,7 @@ async fn main() {
                 Arc::new(XiaooSessionEnvironment::new(
                     default_workspace_root,
                     configured_backend_ids,
-                )),
+                ).with_docker_snapshots(docker_snapshots)),
             ),
         ],
         Arc::new(session_repository),
@@ -581,6 +643,14 @@ async fn main() {
             eprintln!("refusing to start: failed to restore tenant session quotas: {error}");
             std::process::exit(1);
         });
+
+    let snapshot_recovery = application.clone();
+    let _snapshot_recovery = tokio::spawn(async move {
+        loop {
+            if let Err(error)=snapshot_recovery.reconcile_snapshot_intents().await {tracing::warn!(%error,"snapshot operation recovery pending");}
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     // Component C (docs/session_orchestration_skeleton.md): force-close any
     // session whose lease has carried no live heartbeat for over the configured threshold, so a
