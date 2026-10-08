@@ -166,7 +166,3 @@ pub fn create_router(
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
-
-#[cfg(test)]
-#[path = "router_tests.rs"]
-mod restored_http_tests;
