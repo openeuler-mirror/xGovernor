@@ -1,0 +1,16 @@
+[package]
+name = "xgovernor-thinkthread-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.89"
+
+[dependencies]
+thinkthread-management = { git = "https://gitcode.com/aideveloper/capsule_public.git", rev = "378fd41df1773e00dc01e4ddb5b28ac1df987719", version = "=2.2.0" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

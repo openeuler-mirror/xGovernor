@@ -2234,6 +2234,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2453,6 +2459,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5fed54709c5b3a53d09bb1c113ea4f5ceafd1e772ddcb0030a82e1d56c087b08"
 dependencies = [
  "new_debug_unreachable",
+]
+
+[[package]]
+name = "thinkthread-management"
+version = "2.2.0"
+source = "git+https://gitcode.com/aideveloper/capsule_public.git?rev=378fd41df1773e00dc01e4ddb5b28ac1df987719#378fd41df1773e00dc01e4ddb5b28ac1df987719"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2934,6 +2954,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
@@ -3456,6 +3477,17 @@ dependencies = [
  "xgovernor-manager",
  "xgovernor-runtime-pi",
  "xgovernor-runtime-xiaoo",
+]
+
+[[package]]
+name = "xgovernor-thinkthread-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "thinkthread-management",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

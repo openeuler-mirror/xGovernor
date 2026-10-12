@@ -55,6 +55,7 @@ The system is organized around explicit boundaries, each owned by a contract cra
 | `crates/core` | Domain + application layer: `SessionApplication`, session records with **opaque runtime state**, multi-runtime registration through `AgentRuntime`, lease table, orphan reaper, admission gates, wire projections. |
 | `crates/backend` | Provider implementations used by `InstanceManager`: local directory sandbox, E2B remote sandbox, SQLite provider-instance ledger. |
 | `crates/manager` | `InstanceManager`: unified provider-instance orchestration — per-owner quota + global ceiling, per-runtime_id create idempotency, attach-failure compensating delete, delete-failure pending-release retry queue, create-path semaphore admission with backoff, startup reconcile against the ledger. |
+| `crates/thinkthread-client` | Explicit Host configuration and a pinned Management SDK client; preparation only, not registered with the server or Session execution. See [client documentation](./crates/thinkthread-client/README.md). |
 | `apps/runtime-mock` | A mock `AgentRuntime` over **real** local and E2B providers (dispatched by `ext.runtime_mock.backend_id`) — proves the full plumbing, including in-sandbox `git clone` for git workspaces, without pretending to be an LLM. |
 | `apps/runtime-pi` | The **real** Pi runtime and worker: the runtime supervises a per-session worker over shared NDJSON; the worker owns Pi's native RPC process; tools route through the bridge into `local` / `e2b`. |
 | `apps/runtime-xiaoo` | The xiaoO `AgentRuntime` and worker: xiaoO tools execute through the same host-injected operation backend and Local/E2B provider boundary. |
@@ -82,7 +83,7 @@ Honest gaps (see Roadmap): the operation plane is not yet exposed as HTTP routes
 
 | Component | Version | Notes |
 |---|---|---|
-| Rust toolchain | **≥ 1.74** (edition 2021) | developed and verified with rustc/cargo **1.94.0**; non-test code needs ≥ 1.70 (`Option::is_some_and`), the test suite additionally uses `std::io::Error::other` (1.74+) |
+| Rust toolchain | **≥ 1.89** (workspace edition 2021; Management SDK edition 2024) | the pinned Management SDK requires 1.89; developed and verified with rustc/cargo **1.94.0**; non-test code needs ≥ 1.70 (`Option::is_some_and`), the test suite additionally uses `std::io::Error::other` (1.74+) |
 | pi | **≥ 0.84.2** | `npm install -g @earendil-works/pi-coding-agent`; the bridge extension (`apps/runtime-pi/extension`) declares `peerDependencies: ^0.84.2` and type-checks against exactly 0.84.2; the full pipeline is verified end-to-end on pi **0.84.2** |
 | Node.js | **≥ 22.19.0** | only needed to `npm install` / typecheck the TS bridge extension; the `pi` binary itself (Bun-compiled) loads and runs the extension |
 | E2B | no SDK dependency | the e2b provider is a self-contained reqwest client against the E2B REST API (`api.e2b.dev` + the sandbox's envd HTTP); requires `E2B_API_KEY` at runtime |
