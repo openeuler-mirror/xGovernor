@@ -128,7 +128,7 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
         session_dir
             .parent()
             .expect("the session dir has a parent")
-            .join("fake_pi_commands.jsonl"),
+            .join("fake_pi_commands.ndjson"),
     )
     .expect("command log")
     .lines()
