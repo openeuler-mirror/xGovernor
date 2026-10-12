@@ -5,6 +5,7 @@ use operation_protocol::{
         OperationExec, OperationExport, OperationFileSystem, OperationPathResolver, OperationSearch,
     },
     BackendPath, OperationBackend, OperationBackendCapabilities, OperationError,
+    OperationExecutionControl,
 };
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Method, StatusCode};
@@ -14,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use super::control::E2bExecutionControl;
 use super::error::E2bFailure;
 use super::exec::E2bExec;
 use super::filesystem::E2bFileSystem;
@@ -70,6 +72,7 @@ pub(crate) struct E2bBackendState {
     pub(crate) envd_file_upload_multipart: bool,
     pub(crate) http: reqwest::Client,
     pub(crate) lifecycle: Mutex<E2bLifecycle>,
+    pub(crate) execution: E2bExecutionControl,
     /// Timeout (seconds) this sandbox was provisioned with — resent verbatim
     /// on each keep-alive refresh via `POST /sandboxes/{id}/timeout`.
     pub(crate) timeout_secs: u64,
@@ -112,6 +115,7 @@ impl E2bOperationBackend {
 
 impl E2bBackendState {
     pub(crate) fn ensure_active(&self) -> Result<(), OperationError> {
+        self.execution.check_context()?;
         let lifecycle = self
             .lifecycle
             .lock()
@@ -352,6 +356,10 @@ impl OperationBackend for E2bOperationBackend {
         &self.files as &dyn OperationExport
     }
 
+    fn execution_control(&self) -> Option<&dyn OperationExecutionControl> {
+        Some(self)
+    }
+
     async fn shutdown(&self) -> Result<(), OperationError> {
         if !self.state.begin_shutdown()? {
             return Ok(());
@@ -359,6 +367,7 @@ impl OperationBackend for E2bOperationBackend {
         match self.state.delete_sandbox().await {
             Ok(()) => {
                 self.state.finish_shutdown()?;
+                self.state.execution.confirm_shutdown();
                 Ok(())
             }
             Err(error) => {
@@ -366,6 +375,24 @@ impl OperationBackend for E2bOperationBackend {
                 Err(error)
             }
         }
+    }
+}
+
+#[async_trait]
+impl OperationExecutionControl for E2bOperationBackend {
+    async fn begin_turn(&self, turn_id: &str) -> Result<(), OperationError> {
+        self.state.ensure_active()?;
+        self.state.execution.begin_turn(turn_id)
+    }
+    fn block_turn(&self, turn_id: &str) -> Result<(), OperationError> {
+        self.state.execution.block_turn(turn_id);
+        Ok(())
+    }
+    async fn cancel_turn(&self, turn_id: &str) -> Result<(), OperationError> {
+        self.state.execution.drain(turn_id, false).await
+    }
+    async fn finish_turn(&self, turn_id: &str) -> Result<(), OperationError> {
+        self.state.execution.drain(turn_id, true).await
     }
 }
 

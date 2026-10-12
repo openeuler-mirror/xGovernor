@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::backend::{parse_error_message, E2bBackendState, DEFAULT_SHELL};
+use super::control::Flight;
 use super::error::E2bFailure;
+use crate::execution::OPERATION_CONTEXT;
 
 pub(crate) struct E2bExec {
     state: Arc<E2bBackendState>,
@@ -58,6 +60,7 @@ impl E2bExec {
                 env: HashMap::new(),
                 cwd: cwd.map(str::to_string),
                 connect_timeout_ms: None,
+                execution_timeout_ms: None,
             },
         )
         .await
@@ -133,6 +136,7 @@ impl E2bExec {
                 env,
                 cwd: request.cwd.map(|path| path.0),
                 connect_timeout_ms: Self::connect_timeout_ms(timeout_ms),
+                execution_timeout_ms: timeout_ms,
             },
             timeout_ms,
         ))
@@ -145,6 +149,7 @@ pub(crate) struct E2bStartProcess {
     pub(crate) env: HashMap<String, String>,
     pub(crate) cwd: Option<String>,
     pub(crate) connect_timeout_ms: Option<u64>,
+    pub(crate) execution_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -254,6 +259,74 @@ pub(crate) async fn start_process(
     state: &E2bBackendState,
     request: E2bStartProcess,
 ) -> Result<E2bExecOutput, E2bExecFailure> {
+    let context = OPERATION_CONTEXT.try_with(Clone::clone).ok();
+    let Some(context) = context else {
+        return start_process_raw(state, request, None).await;
+    };
+    let flight = state.execution.register(context).map_err(|error| {
+        E2bExecFailure::operation(E2bFailure::protocol(error.to_string()), error)
+    })?;
+    let state = state.self_weak.upgrade().expect("live E2B backend");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    // The task retains ownership even when a bridge request is aborted.
+    tokio::spawn(async move {
+        let mut args = vec![
+            "-u".into(),
+            "-c".into(),
+            include_str!("process_guard.py").into(),
+            flight
+                .prefix
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            request.execution_timeout_ms.unwrap_or(0).to_string(),
+            request.cmd,
+        ];
+        args.extend(request.args);
+        let guarded = E2bStartProcess {
+            cmd: "python3".into(),
+            args,
+            ..request
+        };
+        let start = start_process_raw(&state, guarded, Some(&flight));
+        tokio::pin!(start);
+        let result = loop {
+            tokio::select! {
+                result = &mut start => break result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    let cancel = { let status = flight.status.lock().unwrap(); status.ready && status.cancelled };
+                    if cancel {
+                        // The tag is registered before Start and belongs to this
+                        // exact backend/operation, rather than a PID name guess.
+                        let signal = super::backend::connect_json::<Value>(&state,
+                            "/process.Process/SendSignal", json!({"process":{"tag":flight.tag},"signal":"SIGNAL_SIGTERM"}));
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), signal).await;
+                    }
+                }
+            }
+        };
+        {
+            let mut status = flight.status.lock().unwrap();
+            status.clean = status.ready
+                && result
+                    .as_ref()
+                    .is_ok_and(|output| output.exit_code.is_some_and(|code| code >= 0));
+            status.done = true;
+        }
+        let _ = sender.send(result);
+    });
+    receiver.await.map_err(|_| {
+        E2bExecFailure::transport(E2bFailure::protocol(
+            "E2B process supervisor task lost; cleanup unknown",
+        ))
+    })?
+}
+
+async fn start_process_raw(
+    state: &E2bBackendState,
+    request: E2bStartProcess,
+    flight: Option<&Arc<Flight>>,
+) -> Result<E2bExecOutput, E2bExecFailure> {
     state.ensure_active().map_err(|error| {
         E2bExecFailure::operation(E2bFailure::protocol(error.to_string()), error)
     })?;
@@ -266,7 +339,7 @@ pub(crate) async fn start_process(
         },
         "pty": null,
         "stdin": false,
-        "tag": format!("xgovernor-{}", uuid::Uuid::new_v4()),
+        "tag": flight.map(|flight| flight.tag.clone()).unwrap_or_else(|| format!("xgovernor-{}", uuid::Uuid::new_v4())),
     });
 
     let mut builder = state
@@ -319,7 +392,10 @@ pub(crate) async fn start_process(
     while let Some(next) = stream.next().await {
         match next {
             Ok(chunk) => {
-                if let Err(failure) = decoder.push(chunk.as_ref()) {
+                if let Err(failure) = decoder
+                    .push(chunk.as_ref())
+                    .and_then(|()| decoder.strip_guard_prefix(flight))
+                {
                     failure.log(
                         "read_process_stream",
                         Some(state.sandbox_id.as_str()),
@@ -563,6 +639,22 @@ impl ConnectStartStreamDecoder {
         Ok(std::mem::take(&mut self.collector).into_output())
     }
 
+    fn strip_guard_prefix(&mut self, flight: Option<&Arc<Flight>>) -> Result<(), E2bFailure> {
+        if let Some(flight) = flight {
+            let mut status = flight.status.lock().unwrap();
+            if !status.ready && self.collector.stdout.len() >= flight.prefix.len() {
+                if !self.collector.stdout.starts_with(&flight.prefix) {
+                    return Err(E2bFailure::protocol(
+                        "E2B process supervisor acknowledgement mismatch",
+                    ));
+                }
+                self.collector.stdout.drain(..flight.prefix.len());
+                status.ready = true;
+            }
+        }
+        Ok(())
+    }
+
     fn completed(&self) -> bool {
         self.collector.completed
     }
@@ -666,6 +758,7 @@ mod tests {
             envd_file_upload_multipart: false,
             http: reqwest::Client::new(),
             lifecycle: Mutex::new(E2bLifecycle::Active),
+            execution: Default::default(),
             timeout_secs: 3600,
             activity_refresh_throttle: crate::e2b::backend::ACTIVITY_REFRESH_THROTTLE,
             last_refresh: Mutex::new(Instant::now()),
@@ -820,6 +913,34 @@ mod tests {
                 assert_eq!(state, ExecutionState::RunningOrCompleted);
             }
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn supervisor_prefix_is_removed_across_every_frame_boundary() {
+        let control = super::super::control::E2bExecutionControl::default();
+        control.begin_turn("turn").unwrap();
+        let flight = control
+            .register(operation_protocol::OperationContext {
+                turn_id: "turn".into(),
+                operation_id: "operation".into(),
+            })
+            .unwrap();
+        let output = b"\0\xfforiginal stdout";
+        for split in 0..=flight.prefix.len() {
+            flight.status.lock().unwrap().ready = false;
+            let mut decoder = ConnectStartStreamDecoder::default();
+            let first = base64::engine::general_purpose::STANDARD.encode(&flight.prefix[..split]);
+            let mut remaining = flight.prefix[split..].to_vec();
+            remaining.extend(output);
+            let second = base64::engine::general_purpose::STANDARD.encode(remaining);
+            for chunk in [first, second] {
+                let event = format!(r#"{{"event":{{"data":{{"stdout":"{chunk}"}}}}}}"#);
+                decoder.push(&framed_payloads(&[event.as_bytes()])).unwrap();
+                decoder.strip_guard_prefix(Some(&flight)).unwrap();
+            }
+            assert!(flight.status.lock().unwrap().ready);
+            assert_eq!(decoder.collector.stdout, output);
         }
     }
 
