@@ -1,4 +1,3 @@
-use backend::execution::OperationExecutionExt;
 use agent_runtime_protocol::{
     decode_worker_response, encode_worker_request, worker_error_event, AgentRuntime,
     RuntimeCancelRequest, RuntimeCapability, RuntimeCapabilityContext, RuntimeError, RuntimeEvent,
@@ -7,6 +6,7 @@ use agent_runtime_protocol::{
     RuntimeStateSnapshot, RuntimeTurnRequest as RuntimeTurnInput, WorkerRequest, WorkerResponse,
 };
 use async_trait::async_trait;
+use backend::execution::OperationExecutionExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -731,7 +731,9 @@ mod lifecycle_tests {
         fn export(&self) -> &dyn OperationExport {
             self.inner.export()
         }
-        fn execution_control(&self) -> Option<&dyn operation_protocol::OperationExecutionControl> { Some(self) }
+        fn execution_control(&self) -> Option<&dyn operation_protocol::OperationExecutionControl> {
+            Some(self)
+        }
         async fn shutdown(&self) -> Result<(), OperationError> {
             Ok(())
         }

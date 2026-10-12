@@ -22,17 +22,11 @@ struct HealthResponse {
 const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 fn request_body_limit() -> usize {
-    if std::env::var("XGOVERNOR_DOCKER_ENABLED").as_deref() == Ok("1") {
-        std::env::var("XGOVERNOR_DOCKER_FILE_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(4 * 1024 * 1024)
-            .min(64 * 1024 * 1024)
-            * 2
-            + 1024 * 1024
-    } else {
-        MAX_REQUEST_BODY_BYTES
-    }
+    std::env::var("XGOVERNOR_DOCKER_FILE_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|bytes| bytes.min(64 * 1024 * 1024) * 2 + 1024 * 1024)
+        .unwrap_or(MAX_REQUEST_BODY_BYTES)
 }
 
 /// Per-request timeout for every non-SSE route. The SSE event-stream route

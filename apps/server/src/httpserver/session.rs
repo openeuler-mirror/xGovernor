@@ -274,7 +274,10 @@ async fn submit_turn(
                 // stream is missing. Say so in the body — otherwise the
                 // follow-up GET .../events 404 is indistinguishable from a
                 // turn that never existed.
-                (StatusCode::ACCEPTED, Json(unattachable_receipt_body(&submission.receipt)))
+                (
+                    StatusCode::ACCEPTED,
+                    Json(unattachable_receipt_body(&submission.receipt)),
+                )
                     .into_response()
             }
         }

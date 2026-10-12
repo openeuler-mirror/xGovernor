@@ -158,7 +158,10 @@ pub struct XiaooSessionEnvironment {
 }
 
 impl XiaooSessionEnvironment {
-    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self { self.docker_snapshots=enabled; self }
+    pub fn with_docker_snapshots(mut self, enabled: bool) -> Self {
+        self.docker_snapshots = enabled;
+        self
+    }
     pub fn new(
         default_local_root: impl Into<String>,
         configured_backends: impl IntoIterator<Item = String>,
@@ -340,7 +343,9 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
         if ext.backend_id == E2B_BACKEND_ID {
             sandbox.extend([SandboxCapability::Snapshot, SandboxCapability::Network]);
         }
-        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots { sandbox.insert(SandboxCapability::Snapshot); }
+        if ext.backend_id == DOCKER_BACKEND_ID && self.docker_snapshots {
+            sandbox.insert(SandboxCapability::Snapshot);
+        }
         Ok(NormalizedSessionEnvironment {
             workspace: xgovernor_core::WorkspaceFacts {
                 workspace_id: format!("xiaoo:{}", ext.backend_id),
