@@ -160,3 +160,6 @@ pub fn create_router(
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
+
+#[cfg(test)]
+mod tests;
