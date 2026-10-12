@@ -1682,6 +1682,7 @@ async fn second_submit_while_a_turn_is_active_is_rejected_with_conflict() {
 #[derive(Default)]
 struct CountingRuntime {
     submissions: std::sync::atomic::AtomicU32,
+    state_export: bool,
 }
 
 #[async_trait]
@@ -1691,7 +1692,11 @@ impl AgentRuntime for CountingRuntime {
     }
 
     fn capabilities(&self) -> BTreeSet<agent_runtime_protocol::RuntimeCapability> {
-        BTreeSet::new()
+        if self.state_export {
+            BTreeSet::from([agent_runtime_protocol::RuntimeCapability::StateExport])
+        } else {
+            BTreeSet::new()
+        }
     }
 
     async fn start(
@@ -2841,3 +2846,6 @@ async fn active_turn_blocks_external_operations_and_checkpoint() {
         Err(SessionDomainError::Conflict { .. })
     ));
 }
+
+#[path = "application_test/session_contract.rs"]
+mod session_contract;
