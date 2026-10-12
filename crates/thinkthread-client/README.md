@@ -31,3 +31,44 @@ cargo test -p xgovernor-thinkthread-client
 The fixture covers connection framing and failure boundaries. It provides no
 native Runtime, Ready, ownership, checkpoint, isolation, model, or production
 readiness evidence.
+
+## Lifecycle probe
+
+The Unix example `lifecycle_probe` uses the fixed SDK to create a run-owned Root,
+check inactive/running projections, start twice, execute two distinct managed
+Messages, read stable terminal projections, stop twice, remove the Root, and
+verify absence. This is a lifecycle subset; it does not prove native checkpoint
+Ready, paired save/restore, queued/active cancellation, or production readiness.
+
+```bash
+cargo run -p xgovernor-thinkthread-client --example lifecycle_probe -- \
+  /absolute/protected-config.json /absolute/new-journal.ndjson
+```
+
+The JSON configuration contains `host_executable`, `wait_timeout_ms` (1–300000),
+`context` in the public SDK ClientContext shape, and `create` in the public SDK
+ThinkThreadCreateRequest shape. Every context root, home and search directory
+must be explicit and absolute. `create.fs` must equal `context.fsRoot`. Profile,
+model and executable references must already be provisioned in an isolated
+matching deployment. Environment values are read only for the named
+`context.environmentKeys`; do not put credential values in the JSON.
+
+Use a matching alpha8 installation and the Linux 6.12+ validation baseline.
+The probe does not install a Runtime, create profiles, select a fallback Host,
+or infer binary provenance from a filename. Keep the selected environment and
+model credential files protected.
+
+The new journal is mode 0600. It syncs each operation UUID before sending a
+mutation and records only public operation/target IDs, checks and safe error
+categories, never native reply text or environment values. Request errors,
+nonterminal/truncated replies, partial batch outcomes, or unconfirmed absence
+fail the probe. Unknown delivery is retained without automatic mutation retry,
+global resource discovery, or destructive force-stop. Failed runs can retain
+resources: use the journal's exact run-owned IDs and public SDK operation queries
+for explicit reconciliation before cleanup; closing the Management client does
+not stop a native Runtime.
+
+Default lifecycle/checkpoint tests use a Python transport fixture. They verify
+SDK framing, caller checks, exact revision and reconnect identity, not native
+Session/Fs state. A restore main result can be committed even when execution
+startup/continuation fails; preserve that partial result and the failed outcome.
