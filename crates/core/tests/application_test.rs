@@ -2849,3 +2849,6 @@ async fn active_turn_blocks_external_operations_and_checkpoint() {
 
 #[path = "application_test/session_contract.rs"]
 mod session_contract;
+
+#[path = "application_test/cancel_checkpoint.rs"]
+mod cancel_contract;
