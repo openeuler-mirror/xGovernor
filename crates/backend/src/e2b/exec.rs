@@ -434,7 +434,15 @@ impl StartStreamCollector {
                     .exit_code
                     .or_else(|| parse_status_exit_code(end.status.as_deref().unwrap_or_default()));
                 if let Some(error) = end.error.filter(|value| !value.trim().is_empty()) {
-                    self.stderr.extend(error.as_bytes());
+                    let reported_exit = error
+                        .trim()
+                        .strip_prefix("exit status ")
+                        .and_then(|value| value.parse::<i32>().ok());
+                    // envd repeats normal nonzero exit metadata in end.error.
+                    // A matching exit report is process metadata, not stderr data.
+                    if reported_exit.is_none() || reported_exit != self.exit_code {
+                        self.stderr.extend(error.as_bytes());
+                    }
                 }
                 self.completed = true;
             }
@@ -818,5 +826,46 @@ mod tests {
     #[test]
     fn parses_status_exit_code() {
         assert_eq!(parse_status_exit_code("exit status 124"), Some(124));
+    }
+    #[test]
+    fn exit_metadata_does_not_change_stderr_bytes() {
+        let bytes = b"diagnostic\x00\xff";
+        let stderr = base64::engine::general_purpose::STANDARD.encode(bytes);
+        for code in [0, 7, 124] {
+            let event = format!(r#"{{"event":{{"data":{{"stderr":"{stderr}"}}}}}}"#);
+            let end = format!(
+                r#"{{"event":{{"end":{{"exitCode":{code},"error":"exit status {code}"}}}}}}"#
+            );
+            let framed = framed_payloads(&[event.as_bytes(), end.as_bytes()]);
+            let parsed = parse_start_stream(&framed).unwrap();
+            assert_eq!(parsed.stderr, bytes);
+            assert_eq!(parsed.exit_code, Some(code));
+        }
+    }
+
+    #[test]
+    fn exit_metadata_does_not_invent_stderr() {
+        let end = br#"{"event":{"end":{"exitCode":7,"error":"exit status 7"}}}"#;
+        let parsed = parse_start_stream(&framed_payloads(&[end])).unwrap();
+        assert!(parsed.stderr.is_empty());
+        assert_eq!(parsed.exit_code, Some(7));
+    }
+
+    #[test]
+    fn nonmatching_end_errors_are_preserved() {
+        for error in ["permission denied", "exit status 8", "diagnostic 7"] {
+            let end = format!(r#"{{"event":{{"end":{{"exitCode":7,"error":"{error}"}}}}}}"#);
+            let parsed = parse_start_stream(&framed_payloads(&[end.as_bytes()])).unwrap();
+            assert_eq!(parsed.stderr, error.as_bytes());
+            assert_eq!(parsed.exit_code, Some(7));
+        }
+    }
+
+    #[test]
+    fn unknown_exit_retains_end_error() {
+        let end = br#"{"event":{"end":{"error":"exit status 7"}}}"#;
+        let parsed = parse_start_stream(&framed_payloads(&[end])).unwrap();
+        assert_eq!(parsed.stderr, b"exit status 7");
+        assert_eq!(parsed.exit_code, None);
     }
 }
