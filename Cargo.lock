@@ -3416,6 +3416,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tool",
+ "tracing",
  "uuid",
  "xgovernor-core",
  "xgovernor-manager",

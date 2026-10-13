@@ -425,3 +425,75 @@ Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式�
   认证、连接、超时和服务失败，不回传上游响应正文或凭证。
 - 每轮切换不额外进行网络预检，但必须通过配置校验和 `set_model` 确认后才提交
   提示。首版不增加温度/推理预算等生成参数、自动别名映射或凭证刷新管理。
+
+### xiaoO 工具策略与模型配置
+
+xiaoO 支持相同结构的 `tool_policy`，放在 `ext.xiaoo` 下，使用原生工具名：
+`bash/file_read/file_write/file_edit/glob/grep/ask_user_question`。
+allow 缺省为全部、空数组为无工具；deny 优先，未知名称报错，重复项去重。
+`tools_enabled: false` 禁用全部；`allow_interaction: false` 额外禁止问答工具。
+open 默认值可逐轮覆盖，未提供字段继承，数组整体替换，合并结果进入 checkpoint。
+工具注册表不为被禁止的工具提供执行器。只读工具列表不构成文件系统隔离，
+后端权限及宿主 exec/files 仍独立执行。
+
+```json
+{
+  "runtime_kind": "xiaoo",
+  "llm": {
+    "provider": "my-gateway",
+    "model": "deployment-model-id",
+    "api_base": "https://gateway.example/v1",
+    "api": "openai-responses",
+    "api_key_env": "GATEWAY_API_KEY",
+    "capabilities": {
+      "reasoning": true,
+      "input": ["text"],
+      "context_window": 128000,
+      "max_tokens": 16000
+    }
+  },
+  "ext": {
+    "xiaoo": {
+      "backend_id": "local",
+      "tool_policy": {"allow": ["file_read", "glob", "grep"]},
+      "discovery": {
+        "extensions": false,
+        "skills": false,
+        "prompt_templates": false,
+        "themes": false,
+        "context_files": false
+      }
+    }
+  }
+}
+```
+
+- 嵌入式 xiaoO 原本不加载上述外部资源。discovery 缺省和 false 均保持关闭，
+  true 明确报错；仅 open 可声明，逐轮提供 discovery（即使 false）也报错。
+  保存、恢复及 fork 保留声明，旧状态缺字段时使用原有默认值。
+- 公共 `llm` 支持三种 api 和基础 capabilities，可覆盖旧 `ext.xiaoo` 的
+  provider/model/api_key_env/api_base。无需重复提供旧模型字段，凭证仍只接受
+  环境变量引用，拒绝 inline api_key。模型 ID 原样发送，不做别名替换。
+- 未显式指定 api 时保留 xiaoO 已有 provider 协议，包括旧 Anthropic 自定义
+  endpoint；未知自定义 provider 默认 Chat Completions。无 api_base 时显式
+  协议必须与内置 provider 一致；Responses 或跨协议接入需提供 api_base。
+  xiaoO 的 api_base 包含服务版本路径：三种协议通常均为 `https://host/v1`，
+  分别追加 `/chat/completions`、`/responses`、`/messages`。显式 Chat Completions
+  也接受完整 `/chat/completions` 地址；旧未指定 api 的配置保留 SDK 地址尝试规则。
+- capabilities 逐字段合并；context_window 使用声明值或 SDK 静态模型表，
+  未知模型回退到 128000；max_tokens 缺省为上下文的十分之一（至少 1）。这些
+  是兼容预算假设，不是在线能力发现。reasoning/input 未声明时保持未知及 SDK
+  原有行为；声明 reasoning:false 后拒绝非 off 的推理请求。token 上限必须为正，
+  最大输出不得超过上下文。Anthropic 的 SDK 推理模式要求输出预算至少 2048。
+  input 仅接受非空 text/image 列表，是模型能力元数据；当前公共 turn 为文本，
+  声明 image 不会增加图片上传接口。
+- 逐轮 llm 保留 model-only 覆盖兼容性：未提供字段继承；改变 model 清除上个
+  模型的能力覆盖，改变 provider 还清除旧 endpoint/api。配置校验及 provider
+  构建成功后才运行本轮，不会切换失败后继续向旧模型发提示。配置与历史一起由
+  worker 回传，描述信息、checkpoint、恢复、fork 和 load_state 使用同一配置。
+  网络调用失败不会自动回退到旧模型，也不增加每轮网络预检。
+- open 在创建 sandbox 前调用实际 provider 做最小预检，10 秒超时，完成或超时
+  即释放请求；三种协议与正式调用共用解析和 provider。预检不写业务历史、不
+  注册工具，返回分类后的安全错误，抑制 SDK 可能包含响应正文的预检 trace。
+  Responses 支持流式文本/推理摘要、function tools 和用量解析，并随 checkpoint
+  保存继续工具链所需的 encrypted reasoning 数据；不保存 API key。

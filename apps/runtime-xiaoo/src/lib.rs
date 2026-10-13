@@ -17,14 +17,17 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use xgovernor_core::{
     enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
-    NormalizedSessionEnvironment, OpaqueRuntimeState, ResolvedLlm, SandboxCapability,
-    SecurityContext, SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess,
+    NormalizedSessionEnvironment, OpaqueRuntimeState, SandboxCapability, SecurityContext,
+    SessionDomainError, SessionEnvironmentNormalizer, WorkspaceAccess,
 };
 use xiaoo_api::events::{LoopEndSummary, LoopEventSink, ToolResultEvent};
-use xiaoo_api::llm::{resolve_config, resolve_model_context_length, ResolveInput};
 use xiaoo_api::runtime::Runtime;
 use xiaoo_core::{EmptySkillRegistry, LoopStateSnapshot};
 
+mod model;
+mod policy;
+mod responses;
+use policy::{DiscoveryPolicy, ToolPolicy};
 pub mod worker;
 pub mod xiaoo_backend;
 pub mod xiaoo_runtime;
@@ -43,8 +46,11 @@ const E2B_WORKSPACE_ROOT: &str = "/home/user/workspace";
 #[serde(deny_unknown_fields)]
 struct XiaooRuntimeExt {
     backend_id: String,
+    #[serde(default)]
     provider: String,
+    #[serde(default)]
     model: String,
+    #[serde(default)]
     api_key_env: String,
     #[serde(default)]
     api_base: Option<String>,
@@ -56,6 +62,10 @@ struct XiaooRuntimeExt {
     tools_enabled: Option<bool>,
     #[serde(default)]
     allow_interaction: Option<bool>,
+    #[serde(default)]
+    tool_policy: ToolPolicy,
+    #[serde(default)]
+    discovery: DiscoveryPolicy,
 }
 
 /// Effective role policy; persisted alongside history so branch loads retain it.
@@ -66,6 +76,8 @@ pub(crate) struct RoleSettings {
     max_turns: Option<u32>,
     tools_enabled: bool,
     allow_interaction: bool,
+    tool_policy: ToolPolicy,
+    discovery: DiscoveryPolicy,
 }
 
 impl Default for RoleSettings {
@@ -75,6 +87,8 @@ impl Default for RoleSettings {
             max_turns: None,
             tools_enabled: true,
             allow_interaction: true,
+            tool_policy: ToolPolicy::default(),
+            discovery: DiscoveryPolicy::default(),
         }
     }
 }
@@ -87,11 +101,15 @@ struct RoleOverrides {
     tools_enabled: Option<bool>,
     #[serde(default)]
     allow_interaction: Option<bool>,
+    #[serde(default)]
+    tool_policy: ToolPolicy,
 }
 
 impl RoleSettings {
     fn apply(&self, overrides: RoleOverrides) -> Result<Self, SessionDomainError> {
+        overrides.tool_policy.validate()?;
         let mut settings = self.clone();
+        settings.tool_policy.merge(overrides.tool_policy);
         if let Some(prompt) = overrides.system_prompt {
             settings.system_prompt = prompt;
         }
@@ -130,12 +148,16 @@ impl RoleSettings {
 
 impl XiaooRuntimeExt {
     fn role_settings(&self) -> Result<RoleSettings, SessionDomainError> {
-        RoleSettings::default().apply(RoleOverrides {
+        self.discovery.validate()?;
+        let mut settings = RoleSettings::default().apply(RoleOverrides {
             system_prompt: self.system_prompt.clone(),
             max_turns: self.max_turns,
             tools_enabled: self.tools_enabled,
             allow_interaction: self.allow_interaction,
-        })
+            tool_policy: self.tool_policy.clone(),
+        })?;
+        settings.discovery = self.discovery.clone();
+        Ok(settings)
     }
 }
 
@@ -149,6 +171,8 @@ pub(crate) struct XiaooPersistedState {
     loop_state: LoopStateSnapshot,
     #[serde(default)]
     role_settings: RoleSettings,
+    #[serde(default)]
+    responses_state: responses::ResponsesState,
 }
 
 pub struct XiaooSessionEnvironment {
@@ -187,39 +211,10 @@ fn read_ext(
             message: format!("invalid 'ext.xiaoo' configuration: {error}"),
         }
     })?;
-    for (name, value) in [
-        ("backend_id", parsed.backend_id.as_str()),
-        ("provider", parsed.provider.as_str()),
-        ("model", parsed.model.as_str()),
-        ("api_key_env", parsed.api_key_env.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(SessionDomainError::InvalidRequest {
-                message: format!("'ext.xiaoo.{name}' must not be empty"),
-            });
-        }
+    if parsed.backend_id.trim().is_empty() {
+        return Err(policy::invalid("ext.xiaoo.backend_id must not be empty"));
     }
     parsed.role_settings()?;
-    // Resolve now so open fails before a sandbox is provisioned. Only the
-    // environment variable name is retained after this point.
-    std::env::var(&parsed.api_key_env)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| SessionDomainError::InvalidRequest {
-            message: format!(
-                "environment variable '{}' required by xiaoO is missing or empty",
-                parsed.api_key_env
-            ),
-        })?;
-    resolve_config(ResolveInput {
-        provider: Some(parsed.provider.clone()),
-        api_key_env: Some(parsed.api_key_env.clone()),
-        base_url: parsed.api_base.clone(),
-        ..Default::default()
-    })
-    .map_err(|error| SessionDomainError::InvalidRequest {
-        message: format!("invalid xiaoO LLM configuration: {error}"),
-    })?;
     Ok(parsed)
 }
 
@@ -241,6 +236,7 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
             });
         }
         let ext = read_ext(&request.ext)?;
+        let llm = model::initial_llm(&ext, request.llm.as_ref())?;
         if !self.configured_backends.contains(&ext.backend_id) {
             return Err(SessionDomainError::InvalidRequest {
                 message: format!("xiaoo backend_id '{}' is not configured", ext.backend_id),
@@ -369,14 +365,7 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                 metadata: json!({"backend_id": ext.backend_id, "controller_boundary":"host"}),
             },
             sandbox_capabilities: sandbox,
-            llm: Some(ResolvedLlm {
-                api: None,
-                capabilities: None,
-                provider: ext.provider,
-                model: ext.model,
-                api_base: ext.api_base,
-                credential_source: format!("env:{}", ext.api_key_env),
-            }),
+            llm: Some(llm.descriptor().into()),
             lease: None,
         })
     }
@@ -387,28 +376,24 @@ struct CoreToolSource {
 }
 
 impl CoreToolSource {
+    #[cfg(test)]
     fn new(tools_enabled: bool, allow_interaction: bool) -> Self {
+        Self::with_policy(tools_enabled, allow_interaction, &ToolPolicy::default())
+    }
+
+    fn with_policy(tools_enabled: bool, allow_interaction: bool, policy: &ToolPolicy) -> Self {
         if !tools_enabled {
             return Self {
                 discovered: Vec::new(),
             };
         }
-        const ALLOWED: &[&str] = &[
-            "bash",
-            "file_read",
-            "file_write",
-            "file_edit",
-            "glob",
-            "grep",
-            "ask_user_question",
-        ];
         let discovered = tool::load_tool_sources_with_services(tool::ToolRuntimeServices {
             disable_plugin_tools: true,
             ..Default::default()
         })
         .into_iter()
         .flat_map(|source| source.discover())
-        .filter(|tool| ALLOWED.contains(&tool.spec.name().0.as_str()))
+        .filter(|tool| policy.allows(tool.spec.name().0.as_str()))
         .filter(|tool| allow_interaction || tool.spec.name().0 != "ask_user_question")
         .collect();
         Self { discovered }
@@ -507,31 +492,17 @@ fn state_from_opaque(
 }
 
 fn validate_persisted_llm(llm: &PersistedLlm) -> Result<(), SessionDomainError> {
-    std::env::var(&llm.api_key_env)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| SessionDomainError::InvalidRequest {
-            message: format!(
-                "environment variable '{}' required by xiaoO is missing or empty",
-                llm.api_key_env
-            ),
-        })?;
-    resolve_config(ResolveInput {
-        provider: Some(llm.provider.clone()),
-        api_key_env: Some(llm.api_key_env.clone()),
-        base_url: llm.api_base.clone(),
-        ..Default::default()
-    })
-    .map(|_| ())
-    .map_err(|error| SessionDomainError::InvalidRequest {
-        message: format!("invalid persisted xiaoO LLM configuration: {error}"),
-    })
+    llm.resolve().map(|_| ())
 }
 
 fn build_tool_registry(
     role_settings: &RoleSettings,
 ) -> Result<Box<dyn agent_contracts::tool::ToolRegistry>, SessionDomainError> {
-    let source = CoreToolSource::new(role_settings.tools_enabled, role_settings.allow_interaction);
+    let source = CoreToolSource::with_policy(
+        role_settings.tools_enabled,
+        role_settings.allow_interaction,
+        &role_settings.tool_policy,
+    );
     let allowed = source
         .discovered
         .iter()
@@ -555,47 +526,23 @@ fn build_tool_registry(
 
 pub(crate) async fn build_runtime(
     llm: &PersistedLlm,
-    model_override: Option<&str>,
+    responses_state: Arc<std::sync::Mutex<responses::ResponsesState>>,
     backend: Arc<dyn xiaoo_api::backend::OperationBackend>,
     role_settings: &RoleSettings,
 ) -> Result<(Runtime, Arc<UsageMeter>), SessionDomainError> {
-    let model = model_override.unwrap_or(&llm.model);
-    let resolved = resolve_config(ResolveInput {
-        provider: Some(llm.provider.clone()),
-        api_key_env: Some(llm.api_key_env.clone()),
-        base_url: llm.api_base.clone(),
-        ..Default::default()
-    })
-    .map_err(|error| SessionDomainError::InvalidRequest {
-        message: error.to_string(),
-    })?;
-    let context = resolve_model_context_length(&resolved, model)
-        .await
-        .map_err(|error| SessionDomainError::Unavailable {
-            message: error.to_string(),
-        })?
-        .unwrap_or(128_000) as usize;
+    let provider = model::provider(llm, responses_state)?;
+    let capabilities = llm.effective_capabilities();
+    let context = capabilities.context_window.unwrap() as usize;
     let budget = TokenBudgetConfig {
         total_budget: context,
-        reserved_for_output: context / 10,
+        reserved_for_output: capabilities.max_tokens.unwrap() as usize,
         reserved_for_system: context / 20,
         hard_limit_ratio: 0.9,
     };
-    let provider = Arc::new(
-        llm_client::create_llm_provider_from_resolved(
-            &resolved,
-            model.to_string(),
-            Some("xgovernor".into()),
-            None,
-        )
-        .map_err(|error| SessionDomainError::InvalidRequest {
-            message: error.to_string(),
-        })?,
-    );
     let meter = Arc::new(UsageMeter::default());
     let provider = Arc::new(llm_client::LlmProviderWrapper::new(
         Arc::new(MeteredProvider {
-            inner: provider.inner(),
+            inner: provider,
             meter: Arc::clone(&meter),
         }),
         Some("xgovernor".into()),
@@ -781,6 +728,7 @@ mod role_tests {
                 max_turns: Some(160),
                 tools_enabled: Some(true),
                 allow_interaction: Some(false),
+                tool_policy: ToolPolicy::default(),
             })
             .unwrap();
         let state = XiaooPersistedState {
@@ -793,9 +741,12 @@ mod role_tests {
                 model: "test".into(),
                 api_key_env: "TEST_KEY".into(),
                 api_base: None,
+                api: None,
+                capabilities: None,
             },
             loop_state: xiaoo_api::runtime::RuntimeState::new("parent".into()).to_snapshot(),
             role_settings: settings.clone(),
+            responses_state: Default::default(),
         };
         let frozen = state_to_opaque(&state).unwrap();
         let restored = state_from_opaque(&frozen).unwrap();
@@ -970,5 +921,83 @@ mod docker_admission_tests {
             request.deployment.options = json!({"provider_options":options});
             assert!(normalizer.normalize(&admin, &request).await.is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    fn turn(settings: &RoleSettings, value: Value) -> Result<RoleSettings, SessionDomainError> {
+        settings.for_turn(&[(EXT_NAMESPACE.into(), value)].into_iter().collect())
+    }
+    fn names(settings: &RoleSettings) -> Vec<String> {
+        build_tool_registry(settings)
+            .unwrap()
+            .list_specs()
+            .iter()
+            .map(|s| s.name().0.clone())
+            .collect()
+    }
+    #[test]
+    fn allow_deny_master_switch_and_executor_enforcement() {
+        assert_eq!(names(&RoleSettings::default()).len(), 7);
+        let settings = turn(
+            &RoleSettings::default(),
+            json!({"tool_policy":{"allow":["file_read","grep","file_read"],"deny":["grep"]}}),
+        )
+        .unwrap();
+        assert_eq!(names(&settings), vec!["file_read"]);
+        let registry = build_tool_registry(&settings).unwrap();
+        let registry = registry.filter_for(&AgentId("anonymous".into()));
+        for denied in ["bash", "grep", "file_write", "unknown"] {
+            assert!(registry.get_executor_for_name(denied).is_none());
+        }
+        assert!(registry.get_executor_for_name("file_read").is_some());
+        assert!(names(&turn(&settings, json!({"tools_enabled":false})).unwrap()).is_empty());
+        assert!(names(&turn(&settings, json!({"tool_policy":{"allow":[]}})).unwrap()).is_empty());
+        assert!(turn(&settings, json!({"tool_policy":{"deny":["no-such-tool"]}})).is_err());
+        let changed = turn(&settings, json!({"tool_policy":{"allow":["grep"]}})).unwrap();
+        assert!(
+            names(&changed).is_empty(),
+            "deny survives a partial override"
+        );
+        assert_eq!(
+            names(&turn(&changed, json!({"tool_policy":{"deny":[]}})).unwrap()),
+            vec!["grep"]
+        );
+        let restored: RoleSettings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+    }
+    #[test]
+    fn discovery_is_explicit_open_only_and_old_state_is_compatible() {
+        for field in [
+            "extensions",
+            "skills",
+            "prompt_templates",
+            "themes",
+            "context_files",
+        ] {
+            let mut value = json!({"backend_id":"local","discovery":{}});
+            value["discovery"][field] = json!(false);
+            let ext: XiaooRuntimeExt = serde_json::from_value(value.clone()).unwrap();
+            let roles = ext.role_settings().unwrap();
+            assert_eq!(
+                serde_json::to_value(&roles).unwrap()["discovery"][field],
+                false
+            );
+            value["discovery"][field] = json!(true);
+            assert!(serde_json::from_value::<XiaooRuntimeExt>(value)
+                .unwrap()
+                .role_settings()
+                .is_err());
+            assert!(turn(&roles, json!({"discovery":{field:false}})).is_err());
+        }
+        let old: RoleSettings =
+            serde_json::from_value(json!({"system_prompt":"old","tools_enabled":true})).unwrap();
+        assert_eq!(names(&old).len(), 7);
     }
 }
