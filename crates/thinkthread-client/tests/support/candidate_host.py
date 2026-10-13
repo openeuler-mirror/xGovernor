@@ -3,6 +3,7 @@
 import json, os, struct, sys
 scenario = os.environ.get("XG_TEST_SCENARIO", "ok")
 trace = os.environ["XG_TEST_TRACE"]
+operations = {}
 while True:
     prefix = sys.stdin.buffer.read(4)
     if not prefix: break
@@ -21,6 +22,12 @@ while True:
         if scenario in ("source-not-ready","cross-runtime"):
             error = {"code":"SourceNotReady" if scenario == "source-not-ready" else "CrossRuntimeParent",
                      "message":"fixture rejection","retryable":False,"delivery":"accepted"}
+        previous = operations.get(p["operationId"])
+        if scenario == "operation-conflict" and previous is not None and previous != p["operationDigest"]:
+            error = {"code":"OperationConflict", "message":"fixture operation digest mismatch",
+                     "retryable":False, "delivery":"not_sent"}
+        elif error is None:
+            operations[p["operationId"]] = p["operationDigest"]
         target = "fixture-child-" + p["operationId"]
         result = {"operation":{"scope":"thinkthread","operationId":p["operationId"],
                                "operationDigest":p["operationDigest"]},"thinkthreadId":target,

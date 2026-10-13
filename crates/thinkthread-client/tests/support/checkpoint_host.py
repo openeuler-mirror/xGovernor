@@ -41,6 +41,9 @@ while True:
                                "operationDigest":p["operationDigest"]},"request":result_request(kind)}
         if scenario == "revision-conflict" and method == "thinkthread.restore":
             error = {"code":"ContentRevisionConflict","message":"fixture conflict","retryable":False,"delivery":"accepted"}
+        if scenario == "checkpoint-in-use" and method == "checkpoint.remove":
+            error = {"code":"CheckpointInUse","message":"Checkpoint is retained by: fixture-branch",
+                     "retryable":False,"delivery":"accepted"}
     elif method == "checkpoint.request.get":
         result = {"request":result_request("create",True),"continuationMessage":None,
                   "continuationRecovery":None,"recoveryBlocker":None}

@@ -177,3 +177,122 @@ async fn unknown_fork_never_falls_back_to_a_shared_or_new_root_operation() {
         "handshake" | "context.bind" | "thinkthread.fork"
     )));
 }
+
+#[tokio::test]
+async fn distinct_fork_operations_publish_distinct_private_identities() {
+    let f = Fixture::new("ok");
+    let c = f.config.connect().await.unwrap();
+    let first = c.thinkthreads().fork(request()).await.unwrap();
+    let second = c.thinkthreads().fork(request()).await.unwrap();
+    assert_ne!(first.operation.operation_id, second.operation.operation_id);
+    assert_ne!(first.thinkthread_id, second.thinkthread_id);
+    assert_ne!(first.fs_branch_id, second.fs_branch_id);
+    assert_eq!(first.source_thinkthread_id, second.source_thinkthread_id);
+    assert_eq!(first.fs, sdk::ThinkThreadForkFs::Private);
+    assert_eq!(second.fs, sdk::ThinkThreadForkFs::Private);
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_fork_replay_after_reconnect_keeps_exact_identity_and_digest() {
+    let f = Fixture::new("ok");
+    let id = uuid::Uuid::new_v4().to_string();
+    let c = f.config.connect().await.unwrap();
+    let first = c
+        .thinkthreads()
+        .fork_with_operation(id.clone(), request())
+        .await
+        .unwrap();
+    c.close().await.unwrap();
+    let c = f.config.connect().await.unwrap();
+    let replay = c
+        .thinkthreads()
+        .fork_with_operation(id, request())
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    c.close().await.unwrap();
+    let rows: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|r| r["method"] == "thinkthread.fork")
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["params"], rows[1]["params"]);
+}
+
+#[tokio::test]
+async fn reused_operation_with_changed_source_is_rejected_without_new_fork() {
+    let f = Fixture::new("operation-conflict");
+    let c = f.config.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    c.thinkthreads()
+        .fork_with_operation(id.clone(), request())
+        .await
+        .unwrap();
+    let mut changed = request();
+    changed.source_thinkthread_id = "fixture-other-source".into();
+    let e = c
+        .thinkthreads()
+        .fork_with_operation(id, changed)
+        .await
+        .unwrap_err();
+    assert_eq!(e.delivery(), Some(sdk::Delivery::NotSent));
+    assert!(matches!(e, sdk::ManagementError::Rejected(body) if body.code == "OperationConflict"));
+    c.close().await.unwrap();
+    let rows: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|r| r["method"] == "thinkthread.fork")
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]["params"]["operationId"],
+        rows[1]["params"]["operationId"]
+    );
+    assert_ne!(
+        rows[0]["params"]["operationDigest"],
+        rows[1]["params"]["operationDigest"]
+    );
+    assert_eq!(
+        rows[1]["params"]["sourceThinkthreadId"],
+        "fixture-other-source"
+    );
+    assert_eq!(rows[1]["params"]["fs"], "private");
+}
+
+#[tokio::test]
+async fn reused_operation_with_changed_fs_is_rejected_without_replacing_identity() {
+    let f = Fixture::new("operation-conflict");
+    let c = f.config.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    c.thinkthreads()
+        .fork_with_operation(id.clone(), request())
+        .await
+        .unwrap();
+    let mut changed = request();
+    changed.fs = sdk::ThinkThreadForkFs::Shared;
+    let e = c
+        .thinkthreads()
+        .fork_with_operation(id, changed)
+        .await
+        .unwrap_err();
+    assert_eq!(e.delivery(), Some(sdk::Delivery::NotSent));
+    assert!(matches!(e, sdk::ManagementError::Rejected(body) if body.code == "OperationConflict"));
+    c.close().await.unwrap();
+    let rows: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|r| r["method"] == "thinkthread.fork")
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]["params"]["operationId"],
+        rows[1]["params"]["operationId"]
+    );
+    assert_ne!(
+        rows[0]["params"]["operationDigest"],
+        rows[1]["params"]["operationDigest"]
+    );
+    assert_eq!(rows[1]["params"]["fs"], "shared");
+}

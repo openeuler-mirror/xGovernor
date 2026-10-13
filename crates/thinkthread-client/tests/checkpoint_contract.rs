@@ -260,3 +260,34 @@ async fn checkpoint_delete_uses_the_explicit_owner_and_retained_id() {
         .iter()
         .any(|v| v["method"] == "checkpoint.list" || v["method"] == "thinkthread.remove"));
 }
+
+#[tokio::test]
+async fn referenced_checkpoint_rejection_does_not_delete_its_source_or_branch() {
+    let f = Fixture::new("checkpoint-in-use");
+    let c = f.config.connect().await.unwrap();
+    let e = c
+        .checkpoints()
+        .remove(sdk::CheckpointTargetRequest {
+            runtime_thinkthread_id: "fixture-owning-root".into(),
+            checkpoint_id: "fixture-checkpoint".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(e, sdk::ManagementError::Rejected(body) if body.code == "CheckpointInUse"));
+    c.close().await.unwrap();
+    let trace = f.trace();
+    let rows: Vec<_> = trace
+        .iter()
+        .filter(|r| r["method"] == "checkpoint.remove")
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["params"]["runtimeThinkthreadId"],
+        "fixture-owning-root"
+    );
+    assert_eq!(rows[0]["params"]["checkpointId"], "fixture-checkpoint");
+    assert!(trace.iter().all(|r| matches!(
+        r["method"].as_str().unwrap(),
+        "handshake" | "context.bind" | "checkpoint.remove"
+    )));
+}
