@@ -43,7 +43,16 @@ fn record_command(command: &serde_json::Value) {
     else {
         return;
     };
-    let path = std::path::Path::new(session_dir).join("fake_pi_commands.jsonl");
+    // Keep this out of `session_dir` itself. The product picks the most recently
+    // modified `*.jsonl` directly inside that directory (`session_file.rs::
+    // latest_complete_turn_file`) and expects each one to be a pi session file —
+    // writing our own log in there makes this log the newest `.jsonl` and the
+    // restore reads it as a session, which it is not. One level up keeps it on
+    // the same temp tree while staying out of the scanned directory.
+    let root = std::path::Path::new(session_dir)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(session_dir));
+    let path = root.join("fake_pi_commands.jsonl");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
