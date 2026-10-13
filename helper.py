@@ -40,7 +40,7 @@ def execute(q):
         argv = [q['command'], *q.get('args', [])]
     env = os.environ.copy()
     env.update(q.get('env') or {})
-    p = subprocess.Popen(argv, cwd=q.get('cwd') or '/workspace', env=env,
+    p = subprocess.Popen(argv, cwd=q.get('cwd') or os.getcwd(), env=env,
                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, start_new_session=True)
     chunks = {'stdout': bytearray(), 'stderr': bytearray()}
