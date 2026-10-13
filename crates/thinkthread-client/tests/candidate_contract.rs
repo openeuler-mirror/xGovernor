@@ -140,7 +140,8 @@ async fn cross_runtime_parent_rejection_preserves_the_requested_source_and_paren
     let mut input = request();
     input.parent_thinkthread_id = Some("other-runtime-root".into());
     let e = c.thinkthreads().fork(input).await.unwrap_err();
-    assert!(matches!(e,sdk::ManagementError::Rejected(body) if body.code=="CrossRuntimeParent"));
+    assert_eq!(e.delivery(), Some(sdk::Delivery::Accepted));
+    assert!(matches!(e,sdk::ManagementError::Rejected(body) if body.code=="ThinkThreadNotFound"));
     c.close().await.unwrap();
     let trace = f.trace();
     let rows: Vec<_> = trace
@@ -296,4 +297,53 @@ async fn reused_operation_with_changed_fs_is_rejected_without_replacing_identity
         rows[1]["params"]["operationDigest"]
     );
     assert_eq!(rows[1]["params"]["fs"], "shared");
+}
+
+#[tokio::test]
+async fn changed_lifecycle_parent_conflicts_without_losing_original_fork() {
+    let f = Fixture::new("operation-conflict");
+    let c = f.config.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let original = c
+        .thinkthreads()
+        .fork_with_operation(id.clone(), request())
+        .await
+        .unwrap();
+    let mut changed = request();
+    changed.parent_thinkthread_id = Some("other-runtime-root".into());
+    let error = c
+        .thinkthreads()
+        .fork_with_operation(id.clone(), changed)
+        .await
+        .unwrap_err();
+    assert_eq!(error.delivery(), Some(sdk::Delivery::NotSent));
+    assert!(
+        matches!(error, sdk::ManagementError::Rejected(body) if body.code == "OperationConflict")
+    );
+    let replay = c
+        .thinkthreads()
+        .fork_with_operation(id, request())
+        .await
+        .unwrap();
+    assert_eq!(replay, original);
+    c.close().await.unwrap();
+    let rows: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|row| row["method"] == "thinkthread.fork")
+        .collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["params"], rows[2]["params"]);
+    assert_eq!(
+        rows[1]["params"]["parentThinkthreadId"],
+        "other-runtime-root"
+    );
+    assert_eq!(
+        rows[0]["params"]["operationId"],
+        rows[1]["params"]["operationId"]
+    );
+    assert_ne!(
+        rows[0]["params"]["operationDigest"],
+        rows[1]["params"]["operationDigest"]
+    );
 }
