@@ -246,25 +246,21 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                 message: format!("xiaoo backend_id '{}' is not configured", ext.backend_id),
             });
         }
+        let mut docker_options = None;
         if ext.backend_id == DOCKER_BACKEND_ID {
             if !ctx.is_admin() {
                 return Err(SessionDomainError::InvalidRequest {
                     message: "Docker is administrator-only".into(),
                 });
             }
-            if let Some(options) = request.deployment.options.get("provider_options") {
-                if !options.is_object()
-                    || options
-                        .as_object()
-                        .unwrap()
-                        .iter()
-                        .any(|(k, v)| k != "workspace_root" || v != "/workspace")
-                {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker configuration is controlled by the server".into(),
-                    });
-                }
-            }
+            docker_options = Some(
+                backend::docker::DockerProviderOptions::parse(
+                    &request.deployment.options["provider_options"],
+                )
+                .map_err(|error| SessionDomainError::InvalidRequest {
+                    message: error.to_string(),
+                })?,
+            );
             if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
                 if !url.starts_with("https://") {
                     return Err(SessionDomainError::InvalidRequest {
@@ -273,6 +269,18 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                 }
             }
         }
+        let docker_root = docker_options
+            .as_ref()
+            .map(|options| options.workspace_root())
+            .unwrap_or("/workspace");
+        let docker_network = if docker_options
+            .as_ref()
+            .is_some_and(|options| options.network_mode == backend::docker::DockerNetworkMode::None)
+        {
+            NetworkIsolation::Isolated
+        } else {
+            NetworkIsolation::None
+        };
         let sandboxed = matches!(ext.backend_id.as_str(), E2B_BACKEND_ID | DOCKER_BACKEND_ID);
         enforce_workspace_axiom(ctx, &request.workspace, sandboxed)?;
         let (root, boundary, network, metadata) =
@@ -309,9 +317,9 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                     json!({"url": url, "reference": reference, "subdirectory": subdirectory}),
                 ),
                 (session_protocol::WorkspaceSpec::DaemonDefault, DOCKER_BACKEND_ID) => (
-                    "/workspace".into(),
+                    docker_root.into(),
                     IsolationBoundary::Container,
-                    NetworkIsolation::None,
+                    docker_network.clone(),
                     Value::Null,
                 ),
                 (
@@ -322,9 +330,9 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
                     },
                     DOCKER_BACKEND_ID,
                 ) => (
-                    "/workspace".into(),
+                    docker_root.into(),
                     IsolationBoundary::Container,
-                    NetworkIsolation::None,
+                    docker_network.clone(),
                     json!({"url":url,"reference":reference,"subdirectory":subdirectory}),
                 ),
                 (workspace, backend_id) => {
@@ -945,10 +953,17 @@ mod docker_admission_tests {
             subdirectory: None,
         };
         assert!(normalizer.normalize(&admin, &request).await.is_ok());
+        for root in ["/testbed", "/opt/my project"] {
+            request.deployment.options =
+                json!({"provider_options":{"workspace_root":root,"network_mode":"none"}});
+            let facts = normalizer.normalize(&admin, &request).await.unwrap();
+            assert_eq!(facts.workspace.root, root);
+            assert_eq!(facts.isolation.network, NetworkIsolation::Isolated);
+        }
         for options in [
             json!({"privileged":true}),
             json!({"image":"arbitrary"}),
-            json!({"workspace_root":"/tmp"}),
+            json!({"workspace_root":"relative/path"}),
         ] {
             request.deployment.options = json!({"provider_options":options});
             assert!(normalizer.normalize(&admin, &request).await.is_err());

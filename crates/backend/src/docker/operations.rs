@@ -1,7 +1,7 @@
 use super::{
     args,
     control::{Control, InFlight},
-    DockerConfig, WORKSPACE,
+    DockerConfig,
 };
 use crate::execution::OPERATION_CONTEXT;
 use async_trait::async_trait;
@@ -27,12 +27,17 @@ fn failure(message: impl ToString) -> OperationError {
     }
 }
 impl DockerBackend {
-    pub(super) fn new(config: Arc<DockerConfig>, container: String, control: Arc<Control>) -> Self {
+    pub(super) fn new(
+        config: Arc<DockerConfig>,
+        container: String,
+        workspace: String,
+        control: Arc<Control>,
+    ) -> Self {
         Self {
             config,
             container,
             control,
-            workspace: BackendPath(WORKSPACE.into()),
+            workspace: BackendPath(workspace),
             home: BackendPath("/home/agent".into()),
         }
     }
@@ -240,7 +245,7 @@ impl OperationExec for DockerBackend {
         let env: std::collections::BTreeMap<_, _> =
             request.env.unwrap_or_default().into_iter().collect();
         let value = self.call(json!({"op":"exec", "command":request.command,"args":request.args,"shell":request.shell,
-            "cwd":request.cwd.map(|p|p.0),"env":env,"timeout_ms":timeout})).await?;
+            "cwd":request.cwd.unwrap_or_else(|| self.workspace.clone()).0,"env":env,"timeout_ms":timeout})).await?;
         Ok(ExecResult {
             stdout: STANDARD
                 .decode(

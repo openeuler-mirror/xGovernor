@@ -586,45 +586,31 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             });
         }
 
-        let docker_network_mode = if ext.backend_id == DOCKER_BACKEND_ID {
+        let docker_options = if ext.backend_id == DOCKER_BACKEND_ID {
             if !ctx.is_admin() {
                 return Err(SessionDomainError::InvalidRequest {
                     message: "Docker prototype is administrator-only".into(),
                 });
             }
-            let options = request.deployment.options.get("provider_options");
-            if let Some(options) = options {
-                let Some(object) = options.as_object() else {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker provider_options must be an object".into(),
-                    });
-                };
-                if object
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "workspace_root" | "network_mode"))
-                    || object
-                        .get("workspace_root")
-                        .is_some_and(|root| root != "/workspace")
-                {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker accepts only the fixed /workspace root and network_mode"
-                            .into(),
-                    });
-                }
-            }
-            let mode = options
-                .and_then(|value| value.get("network_mode"))
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            if !matches!(mode, "none" | "default" | "bridge") {
-                return Err(SessionDomainError::InvalidRequest {
-                    message: "Docker network_mode must be 'none', 'default', or 'bridge'".into(),
-                });
-            }
-            Some(mode)
+            Some(
+                backend::docker::DockerProviderOptions::parse(
+                    &request.deployment.options["provider_options"],
+                )
+                .map_err(|error| SessionDomainError::InvalidRequest {
+                    message: error.to_string(),
+                })?,
+            )
         } else {
             None
         };
+        let docker_network_mode =
+            docker_options
+                .as_ref()
+                .map(|options| match options.network_mode {
+                    backend::docker::DockerNetworkMode::None => "none",
+                    backend::docker::DockerNetworkMode::Default => "default",
+                    backend::docker::DockerNetworkMode::Bridge => "bridge",
+                });
         if ext.backend_id == DOCKER_BACKEND_ID {
             if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
                 if !url.starts_with("https://") {
@@ -634,8 +620,8 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 }
             }
         }
-        let sandbox_root = if ext.backend_id == DOCKER_BACKEND_ID {
-            "/workspace"
+        let sandbox_root = if let Some(options) = &docker_options {
+            options.workspace_root()
         } else {
             E2B_WORKSPACE_ROOT
         };
@@ -2045,5 +2031,30 @@ mod tests {
             matches!(result, Err(SessionDomainError::Internal { .. })),
             "state tagged for a different runtime_kind must not be interpreted as pi's"
         );
+    }
+    #[tokio::test]
+    async fn docker_workspace_is_configurable_and_validated() {
+        let normalizer = PiSessionEnvironment::new("/unused", ["docker".into()]);
+        let mut request = open_request(session_protocol::WorkspaceSpec::DaemonDefault);
+        request
+            .ext
+            .insert(EXT_NAMESPACE.into(), json!({"backend_id":"docker"}));
+        for root in ["/testbed", "/opt/project with spaces"] {
+            request.deployment.options =
+                json!({"provider_options":{"workspace_root":root,"network_mode":"none"}});
+            let facts = normalizer
+                .normalize(&SecurityContext::admin("test"), &request)
+                .await
+                .unwrap();
+            assert_eq!(facts.workspace.root, root);
+            assert_eq!(facts.isolation.network, NetworkIsolation::Isolated);
+        }
+        for root in ["relative", "/tmp/../testbed", ""] {
+            request.deployment.options = json!({"provider_options":{"workspace_root":root}});
+            assert!(normalizer
+                .normalize(&SecurityContext::admin("test"), &request)
+                .await
+                .is_err());
+        }
     }
 }

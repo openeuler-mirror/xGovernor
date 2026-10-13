@@ -19,7 +19,7 @@ const WORKSPACE: &str = "/workspace";
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum DockerNetworkMode {
+pub enum DockerNetworkMode {
     None,
     Default,
     Bridge,
@@ -33,11 +33,54 @@ impl Default for DockerNetworkMode {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DockerProviderOptions {
+pub struct DockerProviderOptions {
     #[serde(default)]
-    workspace_root: Option<String>,
+    pub workspace_root: Option<String>,
     #[serde(default)]
-    network_mode: DockerNetworkMode,
+    pub network_mode: DockerNetworkMode,
+}
+
+impl DockerProviderOptions {
+    /// Parse the shared admission/provider contract. Paths refer to the container,
+    /// never to a host mount, and remain unchanged through attach and restore.
+    pub fn parse(value: &Value) -> Result<Self, ProviderControlError> {
+        let options: Self = serde_json::from_value(if value.is_null() {
+            json!({})
+        } else {
+            value.clone()
+        })
+        .map_err(|error| invalid(format!("invalid Docker provider_options: {error}")))?;
+        validate_workspace_root(options.workspace_root())?;
+        Ok(options)
+    }
+
+    pub fn workspace_root(&self) -> &str {
+        self.workspace_root.as_deref().unwrap_or(WORKSPACE)
+    }
+}
+
+fn validate_workspace_root(root: &str) -> Result<(), ProviderControlError> {
+    if !root.starts_with('/')
+        || root.chars().any(char::is_control)
+        || (root != "/"
+            && root[1..]
+                .split('/')
+                .any(|part| matches!(part, "" | "." | "..")))
+    {
+        return Err(invalid(
+            "Docker workspace_root must be a normalized absolute container directory",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_requested_workspace(value: &Value, root: &str) -> Result<(), ProviderControlError> {
+    if value["Config"]["WorkingDir"].as_str() != Some(root) {
+        return Err(invalid(
+            "existing container workspace differs from the requested Docker workspace_root",
+        ));
+    }
+    Ok(())
 }
 
 mod config;
@@ -134,13 +177,13 @@ impl DockerProvider {
         value: &Value,
         expected_image: Option<&Value>,
     ) -> Result<(), ProviderControlError> {
+        validate_workspace_root(value["Config"]["WorkingDir"].as_str().unwrap_or(""))?;
         let h = &value["HostConfig"];
         let c = &value["Config"];
         let l = &self.config.limits;
         let has = |v: &Value, s: &str| v.as_array().is_some_and(|a| a.iter().any(|x| x == s));
         if expected_image.is_some_and(|image| image != &value["Image"])
             || c["User"] != "10001:10001"
-            || c["WorkingDir"] != WORKSPACE
             || h["Privileged"] != false
             || h["Init"] != true
             || !has(&h["CapDrop"], "ALL")
@@ -332,7 +375,7 @@ impl DockerProvider {
                 memory_mb: Some(self.config.limits.memory_mb),
                 disk_mb: None,
             },
-            metadata: json!({"workspace_root": WORKSPACE, "image_id": value["Image"], "deployment": self.config.deployment,
+            metadata: json!({"workspace_root": value["Config"]["WorkingDir"], "image_id": value["Image"], "deployment": self.config.deployment,
                 "owner_ref": value["Config"]["Labels"][OWNER], "request_id": value["Config"]["Labels"][REQUEST],
                 "pids_limit": self.config.limits.pids, "container_name": value["Name"], "effective_limits": self.config.limits, "helper_protocol": 2}),
             created_at_ms: now_ms(),
@@ -345,29 +388,12 @@ impl DockerProvider {
     fn validate_request_options(
         provider_options: &Value,
         resource_limits: &ProviderResourceLimits,
-    ) -> Result<DockerNetworkMode, ProviderControlError> {
-        let options = if provider_options.is_null() {
-            DockerProviderOptions {
-                workspace_root: None,
-                network_mode: DockerNetworkMode::default(),
-            }
-        } else {
-            serde_json::from_value::<DockerProviderOptions>(provider_options.clone())
-                .map_err(|error| invalid(format!("invalid Docker provider_options: {error}")))?
-        };
-        if options
-            .workspace_root
-            .as_deref()
-            .is_some_and(|root| root != WORKSPACE)
-        {
-            return Err(invalid(
-                "Docker prototype requires the fixed /workspace root",
-            ));
-        }
+    ) -> Result<DockerProviderOptions, ProviderControlError> {
+        let options = DockerProviderOptions::parse(provider_options)?;
         if *resource_limits != ProviderResourceLimits::default() {
             return Err(invalid("prototype resources are fixed by the server"));
         }
-        Ok(options.network_mode)
+        Ok(options)
     }
     async fn create_container(
         &self,
@@ -377,8 +403,10 @@ impl DockerProvider {
         if request.backend_id.0 != "docker" {
             return Err(invalid("Docker backend_id must be docker"));
         }
-        let network_mode =
+        let options =
             Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
+        let network_mode = options.network_mode;
+        let workspace = options.workspace_root();
         if self.config.free_bytes().await? < self.config.limits.reserve_bytes {
             return Err(transport("Docker filesystem reserve exhausted"));
         }
@@ -404,6 +432,7 @@ impl DockerProvider {
                 }
                 self.validate_container(&value, None)?;
                 validate_requested_network_mode(&value, network_mode)?;
+                validate_requested_workspace(&value, workspace)?;
                 let id = value["Id"]
                     .as_str()
                     .ok_or_else(|| transport("missing container ID"))?;
@@ -468,7 +497,7 @@ impl DockerProvider {
             "--user",
             "10001:10001",
             "--workdir",
-            WORKSPACE,
+            workspace,
             "--log-driver",
             "local",
             "--log-opt",
@@ -513,7 +542,9 @@ impl DockerProvider {
             let _ = self.config.checked(args(&["rm", "-f", &name])).await;
             return Err(error);
         }
-        if let Err(error) = validate_requested_network_mode(&value, network_mode) {
+        if let Err(error) = validate_requested_network_mode(&value, network_mode)
+            .and_then(|_| validate_requested_workspace(&value, workspace))
+        {
             let _ = self.config.checked(args(&["rm", "-f", &name])).await;
             return Err(error);
         }
@@ -707,6 +738,10 @@ impl OperationAttach for DockerProvider {
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
         let value = self.raw_inspect(&instance.instance_id.0).await?;
         self.validate_container(&value, instance.metadata.get("image_id"))?;
+        let workspace = instance.metadata["workspace_root"]
+            .as_str()
+            .unwrap_or(WORKSPACE);
+        validate_requested_workspace(&value, workspace)?;
         let control = self.control(&instance.instance_id.0)?;
         let _guard = control.gate.lock().await;
         let state = control.state()?;
@@ -728,6 +763,7 @@ impl OperationAttach for DockerProvider {
         let backend = operations::DockerBackend::new(
             self.config.clone(),
             instance.instance_id.0.clone(),
+            workspace.into(),
             control,
         );
         backend.health().await.map_err(transport)?;
@@ -738,6 +774,50 @@ impl OperationAttach for DockerProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn workspace_options_validate_container_paths_and_keep_default() {
+        assert_eq!(
+            DockerProviderOptions::parse(&Value::Null)
+                .unwrap()
+                .workspace_root(),
+            "/workspace"
+        );
+        for root in ["/", "/testbed", "/opt/project with spaces", "/代码"] {
+            let options = DockerProviderOptions::parse(
+                &json!({"workspace_root": root, "network_mode": "none"}),
+            )
+            .unwrap();
+            assert_eq!(options.workspace_root(), root);
+            assert_eq!(options.network_mode, DockerNetworkMode::None);
+        }
+        for root in [
+            "",
+            "relative",
+            "~/code",
+            "/tmp/../code",
+            "/tmp/./code",
+            "//code",
+            "/code/",
+            "/code\n",
+            "/code\0",
+        ] {
+            assert!(
+                DockerProviderOptions::parse(&json!({"workspace_root":root})).is_err(),
+                "{root:?}"
+            );
+        }
+        for options in [
+            json!({"workspace_root":1}),
+            json!({"privileged":true}),
+            json!({"network_mode":false}),
+        ] {
+            assert!(DockerProviderOptions::parse(&options).is_err());
+        }
+        let value = json!({"Config":{"WorkingDir":"/testbed"}});
+        assert!(validate_requested_workspace(&value, "/testbed").is_ok());
+        assert!(validate_requested_workspace(&value, "/workspace").is_err());
+    }
+
     #[test]
     fn rejects_remote_socket_and_unsafe_deployment() {
         let mut c = DockerConfig {
