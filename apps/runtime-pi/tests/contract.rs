@@ -41,6 +41,8 @@ use xgovernor_runtime_pi::EXT_NAMESPACE;
 
 fn llm(provider: &str, model: &str, api_key: &str) -> LlmOverrideRequest {
     LlmOverrideRequest {
+        api: None,
+        capabilities: None,
         provider: Some(provider.into()),
         model: Some(model.into()),
         api_base: None,
@@ -127,7 +129,11 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
         .map(|line| serde_json::from_str(line).expect("command JSON"))
         .collect();
     assert_eq!(commands[0]["type"], "get_state");
-    let commands = &commands[1..];
+    assert_eq!(
+        commands[2]["provider"], "openai",
+        "startup selects the resolved model"
+    );
+    let commands = &commands[3..];
     assert!(commands[0]
         .get("message")
         .and_then(Value::as_str)
@@ -171,6 +177,8 @@ async fn llm_override_requires_explicit_provider_and_model() {
                 workspace: workspace_facts(workspace.path().to_str().unwrap()),
                 state: None,
                 llm: Some(LlmOverrideRequest {
+                    api: None,
+                    capabilities: None,
                     model: Some("some-model".into()),
                     ..Default::default()
                 }),
@@ -196,6 +204,8 @@ async fn api_base_creates_a_session_isolated_openai_compatible_provider() {
                 workspace: workspace_facts(workspace.path().to_str().unwrap()),
                 state: None,
                 llm: Some(LlmOverrideRequest {
+                    api: None,
+                    capabilities: None,
                     provider: Some("my-gateway".into()),
                     model: Some("my-model".into()),
                     api_base: Some("https://llm.example.test/v1".into()),
@@ -789,4 +799,49 @@ async fn native_pi_exit_during_startup_does_not_publish_a_ready_runtime() {
         .check_alive("failed-native-start")
         .await
         .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn session_descriptor_tracks_confirmed_model_protocol_and_capabilities() {
+    use xgovernor_core::SessionRepository;
+    let workspace = TempDir::new().unwrap();
+    let (app, repository) = application(workspace.path().to_str().unwrap().into());
+    let ctx = SecurityContext::admin("test");
+    let config = json!({"provider":"gateway","model":"custom-model","api_base":"http://unused.test/v1",
+        "api":"openai-responses","capabilities":{"context_window":8192,"max_tokens":1024}});
+    let request: SessionOpenRequest = serde_json::from_value(
+        json!({"conversation_id":"test","sender_id":"test","llm":config,"ext":pi_runtime_ext()}),
+    )
+    .unwrap();
+    app.open(&ctx, request).await.unwrap();
+    let record = repository.get("runtime-1").await.unwrap().unwrap();
+    assert_eq!(
+        record.llm.as_ref().unwrap().api,
+        Some(session_protocol::LlmApi::OpenaiResponses)
+    );
+    let mut changed = config;
+    changed["api"] = json!("anthropic-messages");
+    changed["capabilities"]["max_tokens"] = json!(512);
+    let mut submission = app
+        .submit_turn(
+            &ctx,
+            serde_json::from_value(json!({"runtime_id":"runtime-1","text":"hello","llm":changed}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let events = submission.events.as_mut().unwrap();
+    while let Some(event) = events.recv().await {
+        if matches!(
+            event,
+            session_protocol::SessionEvent::TurnCompleted { .. }
+                | session_protocol::SessionEvent::TurnFailed { .. }
+        ) {
+            break;
+        }
+    }
+    let record = repository.get("runtime-1").await.unwrap().unwrap();
+    let llm = record.llm.unwrap();
+    assert_eq!(llm.api, Some(session_protocol::LlmApi::AnthropicMessages));
+    assert_eq!(llm.capabilities.unwrap().max_tokens, Some(512));
 }

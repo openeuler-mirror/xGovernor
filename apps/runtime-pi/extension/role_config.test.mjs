@@ -14,7 +14,7 @@ test("role changes replace system prompt, disable selector tools and bound model
     writeFileSync(join(dir,"xgovernor-turn.json"),JSON.stringify({turn_id:"test-turn"}));
     try {
         const handlers=new Map();let active=[];let aborts=0;
-        extension({on:(name,fn)=>handlers.set(name,fn),registerCommand:()=>{},registerTool:()=>{},setActiveTools:names=>{active=names;}});
+        await extension({on:(name,fn)=>handlers.set(name,fn),registerCommand:()=>{},registerTool:()=>{},setActiveTools:names=>{active=names;}});
         writeFileSync(config,JSON.stringify({system_prompt:"selector",tools_enabled:false,max_turns:2}));
         assert.deepEqual(await handlers.get("before_agent_start")(),{systemPrompt:"selector"});
         assert.deepEqual(active,[]);

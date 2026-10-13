@@ -148,12 +148,14 @@ impl AgentRuntime for XiaooRuntime {
         request: RuntimeStartRequest,
         context: RuntimeExecutionContext,
     ) -> Result<(), RuntimeError> {
+        self.validate_llm_config(request.llm.as_ref())?;
         self.start_inner(request, context)
             .await
             .map_err(to_runtime_error)
     }
 
     async fn probe_llm(&self, request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
+        self.validate_llm_config(request.llm.as_ref())?;
         let ext = read_ext(&request.ext).map_err(to_runtime_error)?;
         let resolved = resolve_config(ResolveInput {
             provider: Some(ext.provider.clone()),
@@ -210,6 +212,7 @@ impl AgentRuntime for XiaooRuntime {
         &self,
         input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, RuntimeError> {
+        self.validate_llm_config(input.llm.as_ref())?;
         self.submit_turn_inner(input)
             .await
             .map_err(to_runtime_error)
@@ -808,5 +811,22 @@ for line in sys.stdin:
             assert!(matches!(next.recv().await,Some(RuntimeEvent::Completed { .. })));
             runtime.stop_inner("test").await.unwrap();
         }).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_config_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unsupported_model_features_are_rejected() {
+        let runtime = XiaooRuntime::new();
+        for value in [
+            serde_json::json!({"api":"openai-responses"}),
+            serde_json::json!({"capabilities":{"reasoning":true}}),
+        ] {
+            let config = serde_json::from_value(value).unwrap();
+            assert!(runtime.validate_llm_config(Some(&config)).is_err());
+        }
+        assert!(runtime.validate_llm_config(None).is_ok());
     }
 }

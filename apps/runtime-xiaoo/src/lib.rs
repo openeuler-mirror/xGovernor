@@ -370,6 +370,8 @@ impl SessionEnvironmentNormalizer for XiaooSessionEnvironment {
             },
             sandbox_capabilities: sandbox,
             llm: Some(ResolvedLlm {
+                api: None,
+                capabilities: None,
                 provider: ext.provider,
                 model: ext.model,
                 api_base: ext.api_base,

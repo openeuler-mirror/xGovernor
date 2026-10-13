@@ -211,6 +211,50 @@ mod tests {
     }
 }
 
+/// Explicit wire protocol for custom model endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LlmApi {
+    #[serde(rename = "openai-completions")]
+    OpenaiCompletions,
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmInput {
+    Text,
+    Image,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmCapabilities {
+    pub reasoning: Option<bool>,
+    pub input: Option<Vec<LlmInput>>,
+    pub context_window: Option<u32>,
+    pub max_tokens: Option<u32>,
+}
+
+impl LlmCapabilities {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.input.as_ref().is_some_and(Vec::is_empty) {
+            return Err("llm.capabilities.input must not be empty".into());
+        }
+        if self.context_window == Some(0) || self.max_tokens == Some(0) {
+            return Err("model token limits must be positive".into());
+        }
+        if let (Some(context), Some(output)) = (self.context_window, self.max_tokens) {
+            if output > context {
+                return Err("max_tokens must not exceed context_window".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Request-only LLM configuration. `api_key` must be consumed during request
 /// handling and must never be projected into a descriptor or persistent state.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -222,6 +266,10 @@ pub struct LlmOverrideRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub api_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<LlmApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<LlmCapabilities>,
     #[serde(default)]
     pub api_key_env: Option<String>,
     #[serde(default)]
@@ -245,5 +293,45 @@ pub struct ResolvedLlmDescriptor {
     pub model: String,
     #[serde(default)]
     pub api_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<LlmApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<LlmCapabilities>,
     pub credential_source: String,
+}
+
+#[cfg(test)]
+mod llm_tests {
+    use super::*;
+    #[test]
+    fn protocol_and_capability_wire_validation() {
+        let legacy: LlmOverrideRequest =
+            serde_json::from_str(r#"{"provider":"openai","model":"gpt-4o"}"#).unwrap();
+        assert!(legacy.api.is_none() && legacy.capabilities.is_none());
+        for api in [
+            "openai-completions",
+            "openai-responses",
+            "anthropic-messages",
+        ] {
+            let config: LlmOverrideRequest = serde_json::from_value(serde_json::json!({"api":api,"capabilities":{"input":["text","image"],"context_window":100,"max_tokens":10}})).unwrap();
+            config.capabilities.as_ref().unwrap().validate().unwrap();
+            assert_eq!(serde_json::to_value(config).unwrap()["api"], api);
+        }
+        for bad in [
+            serde_json::json!({"api":"invalid"}),
+            serde_json::json!({"capabilities":{"input":["audio"]}}),
+        ] {
+            assert!(serde_json::from_value::<LlmOverrideRequest>(bad).is_err());
+        }
+        for caps in [
+            serde_json::json!({"input":[]}),
+            serde_json::json!({"max_tokens":0}),
+            serde_json::json!({"context_window":10,"max_tokens":11}),
+        ] {
+            assert!(serde_json::from_value::<LlmCapabilities>(caps)
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+    }
 }

@@ -142,7 +142,7 @@
 - `runtime_id` 省略/为 null 时由服务端签发；携带已存在的 id 为**幂等重附着**（attach + 返回现有会话投影）。
 - `workspace.kind`：`daemon_default`（默认）/ `local_path` / `git` / `shared`。当前部署只实现前两种，其余返回 400。
 - `requested_capabilities` 从严校验：请求未知能力名是 400；请求了归一化结果/runtime 宣告之外的能力是 422。
-- `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 当前按 OpenAI Chat Completions-compatible endpoint 处理。
+- `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 配合可选 `api` 选择协议，省略 `api` 时兼容原有 OpenAI Chat Completions 默认；详见下方模型协议配置。
 - Pi 会把生效配置保存在该 session 的隔离目录中，以便 daemon 重启、checkpoint/load 后恢复；响应只投影 provider/model/base 与凭证来源，不回显 key。
 
 响应 `SessionOpenResponse`：
@@ -384,3 +384,44 @@ Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式�
 ```
 
 只读工具列表不是文件系统隔离；宿主 exec/files 和后端 sandbox 权限仍独立执行。
+
+### 模型协议与基础能力（Pi）
+
+公共 `llm` 增加可选 `api` 和 `capabilities`：
+
+```json
+{
+  "llm": {
+    "provider": "my-gateway",
+    "model": "deployment-model-id",
+    "api_base": "https://gateway.example/v1",
+    "api": "openai-responses",
+    "api_key_env": "GATEWAY_API_KEY",
+    "capabilities": {
+      "reasoning": true,
+      "input": ["text", "image"],
+      "context_window": 128000,
+      "max_tokens": 16000
+    }
+  }
+}
+```
+
+- `api` 接受 `openai-completions`、`openai-responses`、`anthropic-messages`。
+  自定义 `api_base` 省略 api 时保持 Chat Completions 默认；没有 api_base 时
+  保留 pi 内置模型的协议，显式冲突会报错。模型名是精确 ID，不做别名猜测。
+- 地址遵循 pi SDK 的协议约定：OpenAI 兼容服务通常为 `https://host/v1`；
+  Anthropic Messages 通常为 `https://host`，SDK 自行追加 `/v1/messages`。
+- 能力声明逐项覆盖内置定义。无内置定义的自定义模型兼容默认是
+  `reasoning: false`、`input: ["text"]`、128000 上下文、32000 最大输出、
+  零价格；这些是默认假设，不是自动发现的真实能力。输入仅支持 text/image，
+  数组必须非空，token 上限必须为正，合并后最大输出不能超过上下文窗口。
+- 新字段进入不含凭证的描述信息，并随模型配置保存、恢复和 fork；描述信息在
+  启动、恢复和每轮终态时同步已确认的配置，失败的切换保留原值。逐轮 llm
+  仍是完整模型选择，不改变现有覆盖规则。不支持这些字段的 runtime 明确拒绝。
+- open 的预检先于 sandbox 创建，通过同一 pi executable 和模型解析代码执行
+  最小模型请求；资源发现和工具全部关闭，不写业务历史。请求超时为 10 秒，
+  整个子进程预检上限为 20 秒，完成后回收进程和临时目录。错误区分配置、模型、
+  认证、连接、超时和服务失败，不回传上游响应正文或凭证。
+- 每轮切换不额外进行网络预检，但必须通过配置校验和 `set_model` 确认后才提交
+  提示。首版不增加温度/推理预算等生成参数、自动别名映射或凭证刷新管理。

@@ -54,6 +54,10 @@ fn record_command(command: &serde_json::Value) {
 }
 
 fn main() {
+    if std::env::var_os("XGOVERNOR_PI_PROBE").is_some() {
+        emit(serde_json::json!({"type":"xgovernor_probe","success":true}));
+        return;
+    }
     record_launch_args_if_session_dir_present();
 
     let (tx, rx) = mpsc::channel::<serde_json::Value>();

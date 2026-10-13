@@ -175,3 +175,40 @@ Example: `{"tool_policy":{"allow":["read","ls","find","grep"]},"discovery":{"ext
 Read-only tool selection is not filesystem isolation. Host operations and sandbox
 permissions remain governed by backend capability/lease enforcement. Discovered
 extensions execute host code; tool filtering is not an extension sandbox.
+
+## Model protocols and capabilities
+
+`llm.api` accepts `openai-completions`, `openai-responses`, or
+`anthropic-messages`. Custom `api_base` without `api` keeps the legacy Chat
+Completions default. Without `api_base`, the built-in catalogue protocol is
+preserved and conflicting declarations fail. Use the exact model ID. OpenAI
+base URLs usually include `/v1`; Anthropic bases usually omit it because its SDK
+appends `/v1/messages`.
+
+`llm.capabilities` optionally overrides `reasoning`, `input` (`text`/`image`),
+`context_window`, and `max_tokens`, field by field. Built-in capabilities are
+inherited; uncatalogued custom models default to text-only, no reasoning,
+128000 context, 32000 output and zero cost. These are compatibility assumptions.
+Merged limits must be positive and output cannot exceed context.
+
+`model-config.ts` resolves against a clean built-in catalogue and is shared by
+extension startup, `/xgovernor-model`, and `probe.ts`. Rust writes a minimal
+private bootstrap models.json; extension startup replaces it with the resolved
+model, using an environment reference for credentials. The worker checks the
+configuration command and correlated `set_model` response before Ready and
+before submitting a switched turn. Saved configuration carries the declared
+protocol and capabilities through checkpoint/fork/restore. The runtime reports
+credential-free model metadata after startup/restoration and at each terminal
+turn event, so rejected switches do not change the public descriptor.
+
+The open-time probe starts the same Pi executable with an isolated agent directory,
+all discovery disabled, no tools and no session history. It loads only `probe.ts`,
+uses Pi's provider completion API and reports a structured result through an RPC
+UI notification. Provider bodies, URLs and secrets are never returned as probe
+errors. A 10-second request deadline and 20-second process deadline bound the
+probe; cleanup kills/reaps the process and removes its temporary directory.
+
+Validation: `npm run typecheck`, `npm test`, `npm run test:integration` (requires
+Pi 0.84.2 and local loopback access). Full runtime integration:
+`cargo test -p xgovernor-runtime-pi --test real_pi -- --ignored`.
+All integration requests use local mock providers, not paid APIs.
