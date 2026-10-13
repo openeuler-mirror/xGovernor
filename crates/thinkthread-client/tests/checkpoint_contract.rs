@@ -291,3 +291,53 @@ async fn referenced_checkpoint_rejection_does_not_delete_its_source_or_branch() 
         "handshake" | "context.bind" | "checkpoint.remove"
     )));
 }
+
+#[tokio::test]
+async fn accepted_capture_can_fail_without_publishing_a_checkpoint() {
+    let f = Fixture::new("failed-create");
+    let c = f.config.connect().await.unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let accepted = c
+        .checkpoints()
+        .create_with_operation(
+            id.clone(),
+            sdk::CheckpointCreateRequest {
+                runtime_thinkthread_id: "fixture-owning-root".into(),
+                thinkthread_id: "fixture-source".into(),
+                label: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.operation.operation_id, id);
+    assert_eq!(
+        accepted.request.state,
+        sdk::CheckpointRequestState::Accepted
+    );
+    let terminal = c
+        .checkpoints()
+        .get_request(sdk::CheckpointRequestGetRequest {
+            runtime_thinkthread_id: "fixture-owning-root".into(),
+            request_id: accepted.request.request_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(terminal.request.state, sdk::CheckpointRequestState::Failed);
+    assert!(terminal.request.result.is_none());
+    assert_eq!(
+        terminal.request.error.unwrap().code,
+        "NotAtCheckpointBoundary"
+    );
+    c.close().await.unwrap();
+    let rows = f.trace();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["method"] == "checkpoint.create")
+            .count(),
+        1
+    );
+    assert!(rows.iter().all(|row| matches!(
+        row["method"].as_str().unwrap(),
+        "handshake" | "context.bind" | "checkpoint.create" | "checkpoint.request.get"
+    )));
+}

@@ -11,6 +11,14 @@ def result_request(kind, terminal=False):
                                   "thinkthreadId": "fixture-source", "contentRevision": "42"}
     if kind == "remove": main = {"kind": "removed", "checkpointId": "fixture-checkpoint"}
     failed = scenario == "partial-restore" and kind == "restore"
+    if scenario == "failed-create" and kind == "create" and terminal:
+        return {"requestId": request_id, "kind": "create", "state": "failed", "phase": "done",
+                "result": None, "resolvedIfContentRevision": None, "continuation": "none",
+                "continuationMessageId": None, "executionResume": "not_attempted",
+                "executionStart": None, "targetStateAtFinish": "running",
+                "error": {"code": "NotAtCheckpointBoundary", "message": "current turn has no confirmed native checkpoint"},
+                "acceptedAt": "1", "finishedAt": "2", "expiresAt": "3"}
+
     return {"requestId": request_id, "kind": kind,
             "state": "failed" if failed else ("succeeded" if terminal else "accepted"),
             "phase": "done" if terminal or failed else "accepted", "result": main if terminal or failed else None,
