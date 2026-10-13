@@ -229,6 +229,11 @@ async fn spawn_native_pi(
     responses: mpsc::UnboundedSender<WorkerResponse>,
 ) -> Result<Arc<NativePi>, String> {
     let mut command = Command::new(&config.executable);
+    read_role(&config.session_dir)
+        .await
+        .map_err(|e| e.to_string())?
+        .discovery
+        .configure(&mut command);
     command
         .arg("--mode")
         .arg("rpc")
@@ -298,6 +303,9 @@ async fn handle_worker_request(
 
     match request {
         WorkerRequest::SubmitTurn(request) => {
+            if let Some(value) = request.ext.get(EXT_NAMESPACE) {
+                super::validate_turn_policy(value).map_err(super::to_runtime_error)?;
+            }
             let context_path = native.session_dir.join("xgovernor-turn.json");
             let pending = context_path.with_extension("pending");
             tokio::fs::write(

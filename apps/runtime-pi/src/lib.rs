@@ -90,10 +90,73 @@ struct PiRoleConfig {
     max_turns: Option<u32>,
     #[serde(default)]
     tools_enabled: Option<bool>,
+    #[serde(default)]
+    tool_policy: ToolPolicy,
+    #[serde(default)]
+    discovery: DiscoveryPolicy,
+}
+
+const SANDBOX_TOOLS: &[&str] = &["read", "write", "edit", "bash", "ls", "find", "grep"];
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolPolicy {
+    #[serde(default)]
+    allow: Option<BTreeSet<String>>,
+    #[serde(default)]
+    deny: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryPolicy {
+    extensions: Option<bool>,
+    skills: Option<bool>,
+    prompt_templates: Option<bool>,
+    themes: Option<bool>,
+    context_files: Option<bool>,
+}
+
+impl DiscoveryPolicy {
+    fn configure(&self, command: &mut Command) {
+        for (enabled, flag) in [
+            (self.extensions, "--no-extensions"),
+            (self.skills, "--no-skills"),
+            (self.prompt_templates, "--no-prompt-templates"),
+            (self.themes, "--no-themes"),
+            (self.context_files, "--no-context-files"),
+        ] {
+            if enabled == Some(false) {
+                command.arg(flag);
+            }
+        }
+    }
+}
+
+fn validate_turn_policy(value: &Value) -> Result<(), SessionDomainError> {
+    if value.get("discovery").is_some() {
+        return Err(SessionDomainError::InvalidRequest {
+            message: "runtime_pi.discovery can only be configured when opening a session".into(),
+        });
+    }
+    Ok(())
 }
 const PI_ROLE_FILE: &str = "xgovernor-role.json";
 impl PiRoleConfig {
     fn validate(&self) -> Result<(), SessionDomainError> {
+        for name in self
+            .tool_policy
+            .allow
+            .iter()
+            .chain(self.tool_policy.deny.iter())
+            .flatten()
+        {
+            if !SANDBOX_TOOLS.contains(&name.as_str()) {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: format!("unknown Pi bridge tool: {name}"),
+                });
+            }
+        }
         if self.max_turns == Some(0) {
             return Err(SessionDomainError::InvalidRequest {
                 message: "max_turns must be positive".into(),
@@ -107,6 +170,12 @@ impl PiRoleConfig {
         }
         if next.max_turns.is_some() {
             self.max_turns = next.max_turns;
+        }
+        if next.tool_policy.allow.is_some() {
+            self.tool_policy.allow = next.tool_policy.allow;
+        }
+        if next.tool_policy.deny.is_some() {
+            self.tool_policy.deny = next.tool_policy.deny;
         }
         if next.tools_enabled.is_some() {
             self.tools_enabled = next.tools_enabled;
@@ -1635,6 +1704,7 @@ impl PiRuntime {
         // worker performs the actual Pi model reconfiguration.
         resolve_llm(input.llm.as_ref())?;
         if let Some(value) = input.ext.get(EXT_NAMESPACE) {
+            validate_turn_policy(value)?;
             let role: PiRoleConfig = serde_json::from_value(value.clone()).map_err(|e| {
                 SessionDomainError::InvalidRequest {
                     message: e.to_string(),
@@ -2056,5 +2126,70 @@ mod tests {
                 .await
                 .is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn tool_overrides_merge_fields_replace_arrays_and_preserve_discovery() {
+        let mut role: PiRoleConfig = serde_json::from_value(json!({
+            "tool_policy":{"allow":["read","grep","read"],"deny":["grep"]},
+            "discovery":{"skills":false,"context_files":false}
+        }))
+        .unwrap();
+        role.validate().unwrap();
+        assert_eq!(role.tool_policy.allow.as_ref().unwrap().len(), 2);
+        role.merge(serde_json::from_value(json!({"tool_policy":{"allow":[]}})).unwrap());
+        assert!(role.tool_policy.allow.as_ref().unwrap().is_empty());
+        assert!(role.tool_policy.deny.as_ref().unwrap().contains("grep"));
+        assert_eq!(role.discovery.skills, Some(false));
+        assert!(
+            serde_json::from_value::<PiRoleConfig>(json!({"tool_policy":{"allow":["oops"]}}))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(validate_turn_policy(&json!({"discovery":null})).is_err());
+        assert!(validate_turn_policy(&json!({"tool_policy":{"deny":[]}})).is_ok());
+    }
+
+    #[test]
+    fn discovery_launch_flags_and_legacy_checkpoint_defaults() {
+        let role: PiRoleConfig = serde_json::from_value(json!({"discovery":{
+            "extensions":false,"skills":false,"prompt_templates":false,"themes":false,"context_files":false
+        }})).unwrap();
+        let mut command = Command::new("pi");
+        role.discovery.configure(&mut command);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files"
+            ]
+        );
+        let checkpoint = PiCheckpoint {
+            session_jsonl: None,
+            llm_config_ref: None,
+            llm_config: None,
+            role,
+        };
+        let restored: PiCheckpoint =
+            serde_json::from_value(serde_json::to_value(&checkpoint).unwrap()).unwrap();
+        assert_eq!(restored, checkpoint);
+        let legacy: PiRoleConfig = serde_json::from_value(json!({"tools_enabled":true})).unwrap();
+        let mut command = Command::new("pi");
+        legacy.discovery.configure(&mut command);
+        assert_eq!(command.as_std().get_args().count(), 0);
     }
 }

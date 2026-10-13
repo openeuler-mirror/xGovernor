@@ -366,3 +366,21 @@ Pi 用受信扩展替换真实 system prompt，限定沙箱工具集合，关闭
 
 Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式仅含实时会话目录的 state 不可直接作为新分支使用，需要在升级后的服务上重新 checkpoint。当前本地 provider 不提供环境快照；完整 MCTS 分支需使用具备 snapshot 能力的 provider（如 E2B）。
 
+
+### Pi 工具和资源发现策略
+
+`ext.runtime_pi.tool_policy` 支持 `allow`/`deny` 数组，仅接受
+`read/write/edit/bash/ls/find/grep`。allow 缺省为全部，空数组为无工具；deny
+优先，重复名称去重，未知名称报错。`tools_enabled: false` 禁用全部。
+逐轮覆盖按字段继承、数组整体替换，结果随 checkpoint 保存。
+
+`ext.runtime_pi.discovery` 支持 `extensions`、`skills`、`prompt_templates`、
+`themes`、`context_files` 布尔值。false 关闭对应发现，缺省或 true 保持 pi
+原生行为；桥接扩展始终显式加载。仅 open 可配置，turn 中传入会报错。
+恢复及 fork 继承原值，旧 session 默认行为不变。例如：
+
+```json
+{"ext":{"runtime_pi":{"backend_id":"local","tool_policy":{"allow":["read","ls","find","grep"]},"discovery":{"extensions":false,"skills":false,"prompt_templates":false,"themes":false,"context_files":false}}}}
+```
+
+只读工具列表不是文件系统隔离；宿主 exec/files 和后端 sandbox 权限仍独立执行。

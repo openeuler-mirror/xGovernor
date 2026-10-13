@@ -154,3 +154,24 @@ These were resolved by reading `apps/runtime-pi/src/bridge.rs` and the
    fallback, since pi resolves before calling Operations) are anchored to
    the workspace root. This is a substitution on the extension side only —
    the wire contract is unaffected.
+
+## Session tool and discovery policies
+
+`ext.runtime_pi.tool_policy` has optional `allow` and `deny` arrays containing
+only `read`, `write`, `edit`, `bash`, `ls`, `find`, `grep`. An omitted allow list
+means all seven; an empty list means none. Deny wins and duplicates are removed.
+`tools_enabled: false` overrides both lists. Unknown names are rejected. At each
+turn boundary, provided arrays replace their previous values; omitted fields
+inherit. The extension checks both tool exposure and actual tool calls.
+
+`ext.runtime_pi.discovery` accepts optional booleans `extensions`, `skills`,
+`prompt_templates`, `themes`, `context_files`. False maps to the corresponding
+Pi `--no-*` flag; omitted/true keeps native discovery. The bridge extension is
+always loaded explicitly with `-e`. Discovery is open-only: turn overrides are
+rejected, including null. Both policies survive checkpoints, restores and forks
+through the saved role configuration; old configurations retain their defaults.
+
+Example: `{"tool_policy":{"allow":["read","ls","find","grep"]},"discovery":{"extensions":false,"skills":false,"prompt_templates":false,"themes":false,"context_files":false}}`.
+Read-only tool selection is not filesystem isolation. Host operations and sandbox
+permissions remain governed by backend capability/lease enforcement. Discovered
+extensions execute host code; tool filtering is not an extension sandbox.

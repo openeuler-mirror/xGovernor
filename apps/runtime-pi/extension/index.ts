@@ -575,10 +575,14 @@ export default function (pi: ExtensionAPI): void {
 	const workspaceRoot = env.workspaceRoot;
     // Only the trusted worker writes this host-side config. It is reloaded at
     // each prompt boundary, allowing init -> step role changes after a fork.
-    type RoleConfig = { system_prompt?: string; max_turns?: number; tools_enabled?: boolean };
+    type RoleConfig = {
+        system_prompt?: string; max_turns?: number; tools_enabled?: boolean;
+        tool_policy?: { allow?: string[] | null; deny?: string[] | null };
+    };
     let role: RoleConfig = {};
     let turns = 0;
     const sandboxTools = ["read", "write", "edit", "bash", "ls", "find", "grep"];
+    let activeTools = new Set<string>();
     pi.on("before_agent_start", async () => {
         const configPath = process.env.XGOVERNOR_PI_ROLE_FILE;
         if (configPath) {
@@ -586,15 +590,21 @@ export default function (pi: ExtensionAPI): void {
         }
         role = configPath ? JSON.parse(readFileSync(configPath, "utf8")) as RoleConfig : {};
         turns = 0;
-        pi.setActiveTools(role.tools_enabled === false ? [] : sandboxTools);
+        const allow = role.tool_policy?.allow ?? sandboxTools;
+        const deny = role.tool_policy?.deny ?? [];
+        for (const name of [...allow, ...deny]) {
+            if (!sandboxTools.includes(name)) throw new Error(`Unknown Pi bridge tool: ${name}`);
+        }
+        activeTools = new Set(role.tools_enabled === false ? [] : allow.filter(name => !deny.includes(name)));
+        pi.setActiveTools([...activeTools]);
         if (role.system_prompt != null) return { systemPrompt: role.system_prompt };
     });
     pi.on("turn_start", async (_event, ctx) => {
         turns += 1;
         if (role.max_turns != null && turns > role.max_turns) await ctx.abort();
     });
-    pi.on("tool_call", async () => {
-        if (role.tools_enabled === false) return { block: true, reason: "Tools disabled for this role" };
+    pi.on("tool_call", async (event) => {
+        if (!activeTools.has(event.toolName)) return { block: true, reason: "Tool disallowed by role policy" };
     });
 
 	// Runtime-neutral model switching endpoint used by xGovernor between

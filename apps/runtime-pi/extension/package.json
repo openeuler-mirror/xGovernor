@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --test role_config.test.mjs"
+    "test": "node --experimental-transform-types --test role_config.test.mjs",
+    "test:integration": "node --experimental-transform-types --test discovery.test.mjs"
   },
   "pi": {
     "extensions": [
