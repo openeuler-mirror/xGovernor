@@ -63,11 +63,16 @@ while True:
         if scenario == "changed-terminal" and method == "message.get": result["replyText"] = "changed"
     elif method == "thinkthread.stop":
         stops += 1
-        accepted = scenario != "partial-stop"
-        if accepted: state = "Stopped"
+        accepted = scenario != "partial-stop" and stops == 1
+        changed = accepted
+        status = "stopped" if accepted else "already_stopped"
+        if scenario == "partial-stop": status = "messages_active"
+        if scenario == "misreported-stop":
+            accepted = True; status = "messages_active"
+        if scenario == "changed-noop-stop" and stops == 2: changed = True
+        if scenario != "partial-stop": state = "Stopped"
         result = {"operation": handle(params), "targets": [{"thinkthreadId": root,
-            "changed": stops == 1, "accepted": accepted,
-            "status": "stopped" if accepted else "messages_active"}]}
+            "changed": changed, "accepted": accepted, "status": status}]}
     elif method == "thinkthread.remove":
         state = "Absent"
         result = {"operation": handle(params), "targets": [{"thinkthreadId": root,

@@ -109,11 +109,13 @@ async fn runs_two_typed_turns_and_only_removes_the_created_root() {
         .filter(|v| v["params"]["operationId"].is_string())
     {
         let id = row["params"]["operationId"].as_str().unwrap();
-        assert!(journal.iter().any(|snap| snap["operations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|op| op["operation_id"] == id && op["delivery"] == "pending")));
+        assert!(journal.iter().any(|snap| {
+            snap["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|op| op["operation_id"] == id && op["delivery"] == "pending")
+        }));
         if row["method"] == "thinkthread.stop" || row["method"] == "thinkthread.remove" {
             assert_eq!(
                 row["params"]["thinkthreadIds"],
@@ -258,4 +260,28 @@ async fn accepted_operation_must_have_the_digest_of_the_journaled_request() {
     let (r, _) = Fixture::new("wrong-digest").run().await;
     assert_eq!(r["check_failure"], "operation_digest_mismatch");
     assert_eq!(r["operations"][0]["delivery"], "pending");
+}
+
+#[tokio::test]
+async fn accepted_envelope_with_failed_stop_status_does_not_authorize_remove() {
+    let f = Fixture::new("misreported-stop");
+    let (r, _) = f.run().await;
+    assert_eq!(r["cleanup_failure"], "stop_batch_target_not_proven");
+    assert_eq!(r["status"], "failed");
+    assert!(!f
+        .trace()
+        .iter()
+        .any(|v| v["method"] == "thinkthread.remove"));
+}
+
+#[tokio::test]
+async fn already_stopped_with_content_change_does_not_authorize_remove() {
+    let f = Fixture::new("changed-noop-stop");
+    let (r, _) = f.run().await;
+    assert_eq!(r["cleanup_failure"], "stop_batch_target_not_proven");
+    assert_eq!(r["status"], "failed");
+    assert!(!f
+        .trace()
+        .iter()
+        .any(|v| v["method"] == "thinkthread.remove"));
 }

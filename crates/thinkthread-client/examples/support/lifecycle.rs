@@ -269,10 +269,13 @@ impl Probe {
                 .await
                 .map_err(|error| self.sdk_error(error))?;
             self.accepted(&stopped.operation, &op)?;
-            if stopped.targets.len() != 1
-                || stopped.targets[0].thinkthread_id != root
-                || !stopped.targets[0].accepted
-                || (repeat == 1 && stopped.targets[0].changed)
+            if stopped.targets.len() != 1 {
+                return Err("stop_batch_target_not_proven");
+            }
+            let target = &stopped.targets[0];
+            let stopped_or_noop = (target.status == "stopped" && target.accepted)
+                || (target.status == "already_stopped" && !target.accepted && !target.changed);
+            if target.thinkthread_id != root || !stopped_or_noop || (repeat == 1 && target.changed)
             {
                 return Err("stop_batch_target_not_proven");
             }
