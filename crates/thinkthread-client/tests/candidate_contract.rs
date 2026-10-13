@@ -116,7 +116,8 @@ async fn inactive_source_rejection_does_not_start_restore_or_share_a_workspace()
     let f = Fixture::new("source-not-ready");
     let c = f.config.connect().await.unwrap();
     let e = c.thinkthreads().fork(request()).await.unwrap_err();
-    assert!(matches!(e,sdk::ManagementError::Rejected(body) if body.code=="SourceNotReady"));
+    assert_eq!(e.delivery(), Some(sdk::Delivery::Accepted));
+    assert!(matches!(e,sdk::ManagementError::Rejected(body) if body.code=="ThinkThreadNotReady"));
     c.close().await.unwrap();
     let trace = f.trace();
     assert_eq!(

@@ -20,7 +20,7 @@ while True:
     elif method == "thinkthread.fork":
         if scenario == "drop-fork": sys.exit(0)
         if scenario in ("source-not-ready","cross-runtime"):
-            error = {"code":"SourceNotReady" if scenario == "source-not-ready" else "CrossRuntimeParent",
+            error = {"code":"ThinkThreadNotReady" if scenario == "source-not-ready" else "CrossRuntimeParent",
                      "message":"fixture rejection","retryable":False,"delivery":"accepted"}
         previous = operations.get(p["operationId"])
         if scenario == "operation-conflict" and previous is not None and previous != p["operationDigest"]:
