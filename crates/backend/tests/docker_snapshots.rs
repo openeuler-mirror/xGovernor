@@ -22,7 +22,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
         owner_ref: "admin".into(),
         reason: ProviderLifecycleReason::Acquire,
         resource_limits: Default::default(),
-        provider_options: json!({"workspace_root":"/workspace"}),
+        provider_options: json!({"workspace_root":"/tmp", "network_mode":"none"}),
         correlation: json!({"request_id":"parent"}),
     };
     let parent = provider.create(create).await.unwrap();
@@ -57,7 +57,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
         source: ProviderLoadSource::Snapshot(id),
         reason: ProviderLifecycleReason::Restore,
         resource_limits: Default::default(),
-        provider_options: json!({"workspace_root":"/workspace"}),
+        provider_options: json!({"workspace_root":"/tmp", "network_mode":"none"}),
         correlation: json!({"request_id":request}),
     };
     let delete = |instance: Option<ProviderInstanceId>, snapshot: Option<ProviderSnapshotId>| {
@@ -69,7 +69,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
             correlation: json!(null),
         }
     };
-    cmd(backend.as_ref(),"printf before > /workspace/proof; printf config > /home/agent/config; printf '\\000\\377' > /workspace/binary; chmod 700 /workspace/proof; ln -s proof /workspace/link; setsid bash -c 'sleep 5; touch /workspace/leak' >/dev/null 2>&1 &").await;
+    cmd(backend.as_ref(),"printf before > /tmp/proof; printf config > /home/agent/config; printf '\\000\\377' > /tmp/binary; chmod 700 /tmp/proof; ln -s proof /tmp/link; setsid bash -c 'sleep 5; touch /tmp/leak' >/dev/null 2>&1 &").await;
     backend
         .execution_control()
         .unwrap()
@@ -97,7 +97,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
     assert_eq!(again.snapshot_id, snap.snapshot_id);
     cmd(
         backend.as_ref(),
-        "printf after > /workspace/proof; rm /home/agent/config",
+        "printf after > /tmp/proof; rm /home/agent/config",
     )
     .await;
     let child = provider
@@ -108,13 +108,13 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
     assert_eq!(
         cmd(
             child_backend.as_ref(),
-            "cat /workspace/proof; cat /home/agent/config"
+            "cat /tmp/proof; cat /home/agent/config"
         )
         .await,
         "beforeconfig"
     );
-    cmd(child_backend.as_ref(),"test $(stat -c %a /workspace/proof) = 700; test -L /workspace/link; test $(wc -c < /workspace/binary) = 2; printf child > /workspace/proof").await;
-    assert_eq!(cmd(backend.as_ref(), "cat /workspace/proof").await, "after");
+    cmd(child_backend.as_ref(),"test $(stat -c %a /tmp/proof) = 700; test -L /tmp/link; test $(wc -c < /tmp/binary) = 2; printf child > /tmp/proof").await;
+    assert_eq!(cmd(backend.as_ref(), "cat /tmp/proof").await, "after");
     provider
         .delete(delete(Some(parent.instance_id.clone()), None))
         .await
@@ -124,7 +124,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
         .await
         .unwrap();
     let sb = provider.attach(&sibling).await.unwrap();
-    assert_eq!(cmd(sb.as_ref(), "cat /workspace/proof").await, "before");
+    assert_eq!(cmd(sb.as_ref(), "cat /tmp/proof").await, "before");
     provider
         .delete(delete(None, Some(snap.snapshot_id.clone())))
         .await
@@ -135,7 +135,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
         .is_err());
     let restored = DockerProvider::new(config.clone()).unwrap();
     let cb = restored.attach(&child).await.unwrap();
-    assert_eq!(cmd(cb.as_ref(), "cat /workspace/proof").await, "child");
+    assert_eq!(cmd(cb.as_ref(), "cat /tmp/proof").await, "child");
     let paused = restored
         .pause(ProviderPauseRequest {
             backend_id: BackendId("docker".into()),
@@ -153,7 +153,7 @@ async fn idle_snapshots_forks_pause_and_reference_cleanup() {
     restored.load(resume).await.unwrap();
     let cb = restored.attach(&child).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    cmd(cb.as_ref(), "test ! -e /workspace/leak").await;
+    cmd(cb.as_ref(), "test ! -e /tmp/leak").await;
     restored
         .delete(delete(None, Some(paused.snapshot_id)))
         .await

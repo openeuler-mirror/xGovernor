@@ -133,10 +133,16 @@ def read_key(args):
     if args.api_key_file:
         key = args.api_key_file.read_text().strip()
     else:
-        key = os.environ.get(args.api_key_env, "").strip()
+        env_name = args.api_key_env or "MODEL_API_KEY"
+        key = os.environ.get(env_name, "").strip()
+        saved = REPO.parent / ".config/xgovernor/az-gptplus5.key"
+        if (not key and args.api_key_env is None
+                and args.api_base.rstrip("/") == "https://az.gptplus5.com/v1"
+                and saved.is_file()):
+            key = saved.read_text().strip()
         if not key:
             if not sys.stdin.isatty():
-                raise ValueError(f"Set {args.api_key_env} or pass --api-key-file in non-interactive mode")
+                raise ValueError(f"Set {env_name} or pass --api-key-file in non-interactive mode")
             key = getpass.getpass("API key (hidden): ").strip()
     if not key:
         raise ValueError("API key is empty")
@@ -437,9 +443,9 @@ def parser():
     p.add_argument("--run-id", help="New output subdirectory; existing directories are never overwritten")
     p.add_argument("--model", default="deepseek-flash")
     p.add_argument("--provider", default="openai", help="pi provider for OpenAI-compatible endpoints")
-    p.add_argument("--api-base", default="https://api.deepseek.com/v1")
+    p.add_argument("--api-base", default="https://az.gptplus5.com/v1")
     keys = p.add_mutually_exclusive_group()
-    keys.add_argument("--api-key-env", default="DEEPSEEK_API_KEY", help="Environment variable; otherwise prompt securely")
+    keys.add_argument("--api-key-env", help="Environment variable; otherwise use MODEL_API_KEY, saved relay key, or prompt")
     keys.add_argument("--api-key-file", type=Path, help="Read a key from an existing private file")
     p.add_argument("--skip-model-check", action="store_true", help="Skip GET /models for providers without that endpoint")
     p.add_argument("--server-bin", type=Path)

@@ -1,5 +1,7 @@
 //! Experimental, administrator-only Docker tool backend. No host mounts; opt-in idle filesystem snapshots.
+mod bootstrap;
 mod operations;
+use bootstrap::{bootstrapped, BOOTSTRAP};
 mod snapshots;
 
 use crate::OperationAttach;
@@ -38,6 +40,9 @@ pub struct DockerProviderOptions {
     pub workspace_root: Option<String>,
     #[serde(default)]
     pub network_mode: DockerNetworkMode,
+    /// Install the bundled helper and prepare workspace ownership in the container.
+    #[serde(default)]
+    pub bootstrap: bool,
 }
 
 impl DockerProviderOptions {
@@ -51,6 +56,9 @@ impl DockerProviderOptions {
         })
         .map_err(|error| invalid(format!("invalid Docker provider_options: {error}")))?;
         validate_workspace_root(options.workspace_root())?;
+        if options.bootstrap && options.workspace_root() == "/" {
+            return Err(invalid("Docker bootstrap cannot use / as workspace_root"));
+        }
         Ok(options)
     }
 
@@ -188,7 +196,11 @@ impl DockerProvider {
             || h["Init"] != true
             || !has(&h["CapDrop"], "ALL")
             || !has(&h["SecurityOpt"], "no-new-privileges:true")
-            || h["CapAdd"].as_array().is_some_and(|a| !a.is_empty())
+            || if bootstrapped(value) {
+                h["CapAdd"] != json!(["CHOWN"])
+            } else {
+                h["CapAdd"].as_array().is_some_and(|a| !a.is_empty())
+            }
             || value["Mounts"].as_array().is_none_or(|a| !a.is_empty())
             || h["PortBindings"].as_object().is_some_and(|a| !a.is_empty())
             || !matches!(
@@ -433,6 +445,9 @@ impl DockerProvider {
                 self.validate_container(&value, None)?;
                 validate_requested_network_mode(&value, network_mode)?;
                 validate_requested_workspace(&value, workspace)?;
+                if bootstrapped(&value) != options.bootstrap {
+                    return Err(invalid("existing container bootstrap differs from request"));
+                }
                 let id = value["Id"]
                     .as_str()
                     .ok_or_else(|| transport("missing container ID"))?;
@@ -444,6 +459,10 @@ impl DockerProvider {
                 }
                 if value["State"]["Running"] != true {
                     self.config.checked(args(&["start", &name])).await?;
+                }
+                if options.bootstrap && self.journal.state(&name)? != "created" {
+                    self.bootstrap_container(&name, workspace).await?;
+                    self.journal.set(&name, "created", 0, json!({"id":id}))?;
                 }
                 return self.instance(&self.raw_inspect(&name).await?);
             }
@@ -481,6 +500,11 @@ impl DockerProvider {
             &format!("{OWNER}={}", request.owner_ref),
             "--label",
             &format!("{REQUEST}={request_id}"),
+            "--label",
+            &format!(
+                "{BOOTSTRAP}={}",
+                if options.bootstrap { "v1" } else { "none" }
+            ),
             "--cpus",
             &self.config.limits.cpus.to_string(),
             "--memory",
@@ -511,6 +535,10 @@ impl DockerProvider {
             &image_id,
             "infinity",
         ]);
+        if options.bootstrap {
+            let insert_at = create.iter().position(|arg| arg == "--cpus").unwrap();
+            create.splice(insert_at..insert_at, ["--cap-add".into(), "CHOWN".into()]);
+        }
         if network_mode != DockerNetworkMode::Default {
             let network_arg = match network_mode {
                 DockerNetworkMode::None => "none",
@@ -547,6 +575,12 @@ impl DockerProvider {
         {
             let _ = self.config.checked(args(&["rm", "-f", &name])).await;
             return Err(error);
+        }
+        if options.bootstrap && source_image.is_none() {
+            if let Err(error) = self.bootstrap_container(&name, workspace).await {
+                let _ = self.config.checked(args(&["rm", "-f", &name])).await;
+                return Err(error);
+            }
         }
         self.journal
             .set(&name, "created", 0, json!({"id":value["Id"]}))?;
@@ -813,6 +847,16 @@ mod tests {
         ] {
             assert!(DockerProviderOptions::parse(&options).is_err());
         }
+        assert!(
+            DockerProviderOptions::parse(&json!({"workspace_root":"/", "bootstrap":true})).is_err()
+        );
+        assert!(DockerProviderOptions::parse(&json!({"bootstrap":"true"})).is_err());
+        assert!(!DockerProviderOptions::parse(&json!({})).unwrap().bootstrap);
+        assert!(
+            DockerProviderOptions::parse(&json!({"bootstrap":true}))
+                .unwrap()
+                .bootstrap
+        );
         let value = json!({"Config":{"WorkingDir":"/testbed"}});
         assert!(validate_requested_workspace(&value, "/testbed").is_ok());
         assert!(validate_requested_workspace(&value, "/workspace").is_err());

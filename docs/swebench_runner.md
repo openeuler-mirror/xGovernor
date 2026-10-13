@@ -13,18 +13,17 @@ cd /mnt/cz/xGovernor
   astropy__astropy-14995
 ```
 
-如果没有配置 API key，脚本会通过隐藏输入提示读取。默认使用 DeepSeek 官方 `https://api.deepseek.com/v1` 和 `deepseek-flash`。key 不写入脚本、命令行参数、结果文件或工具容器；只传给独立管控进程的环境变量。脚本不会删除用户自己提供的 key 文件。
 
 也可以先在 shell 中安全输入，再用于批量任务：
 
 ```bash
-read -r -s -p 'DeepSeek API key: ' DEEPSEEK_API_KEY; printf '\n'
-export DEEPSEEK_API_KEY
+read -r -s -p 'DeepSeek API key: ' MODEL_API_KEY; printf '\n'
+export MODEL_API_KEY
 ./scripts/run_swebench.sh --instance-ids astropy__astropy-12907 astropy__astropy-14995
-unset DEEPSEEK_API_KEY
+unset MODEL_API_KEY
 ```
 
-以上 `read` 示例适用于 bash。自动化环境可以设置 `DEEPSEEK_API_KEY`，或通过 `--api-key-env MY_KEY` 使用其他环境变量；也可以使用 `--api-key-file /path/to/private/key`。非交互环境缺少凭证会直接报错，不会等待输入。不要将 key 放进命令行。
+以上 `read` 示例适用于 bash。自动化环境可以设置 `MODEL_API_KEY`，或通过 `--api-key-env MY_KEY` 使用其他环境变量；也可以使用 `--api-key-file /path/to/private/key`。非交互环境缺少凭证会直接报错，不会等待输入。不要将 key 放进命令行。
 
 自定义兼容 OpenAI Chat Completions 的服务：
 
