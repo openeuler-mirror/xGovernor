@@ -15,6 +15,10 @@ pub struct PersistedLlm {
     pub(crate) api_key_env: String,
     #[serde(default)]
     pub(crate) api_base: Option<String>,
+    #[serde(default)]
+    pub(crate) api: Option<session_protocol::LlmApi>,
+    #[serde(default)]
+    pub(crate) capabilities: Option<session_protocol::LlmCapabilities>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +109,8 @@ pub struct WorkerConfig {
     pub(crate) loop_state: LoopStateSnapshot,
     #[serde(default)]
     pub(crate) role_settings: crate::RoleSettings,
+    #[serde(default)]
+    pub(crate) responses_state: crate::responses::ResponsesState,
     pub(crate) bridge_url: String,
     pub(crate) bridge_token: String,
     pub(crate) backend_id: String,
@@ -541,9 +547,12 @@ assert sys.stdin.readline() == "next-request\n"
                 model: "test".into(),
                 api_key_env: "TEST_KEY".into(),
                 api_base: None,
+                api: None,
+                capabilities: None,
             },
             loop_state: xiaoo_api::runtime::RuntimeState::new("test".into()).to_snapshot(),
             role_settings,
+            responses_state: Default::default(),
             bridge_url: "http://127.0.0.1:1".into(),
             bridge_token: "test".into(),
             backend_id: "e2b".into(),
@@ -641,9 +650,12 @@ mod bridge_tests {
                 model: "unused".into(),
                 api_key_env: "UNUSED".into(),
                 api_base: None,
+                api: None,
+                capabilities: None,
             },
             loop_state: xiaoo_api::runtime::RuntimeState::new("test".into()).to_snapshot(),
             role_settings: Default::default(),
+            responses_state: Default::default(),
             bridge_url: bridge.base_url(),
             bridge_token: "test-token".into(),
             backend_id: "docker".into(),

@@ -35,6 +35,8 @@ pub async fn run_worker_from_env() -> Result<(), String> {
     let config: WorkerConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let backend = Arc::new(HttpOperationBackend::new(&config));
     let mut role_settings = config.role_settings.clone();
+    let mut llm = config.llm.clone();
+    let responses_state = Arc::new(std::sync::Mutex::new(config.responses_state.clone()));
     let mut state = RuntimeState::from_snapshot(config.loop_state, CancellationToken::new());
     emit(&WorkerResponse::Ready)?;
 
@@ -65,32 +67,48 @@ pub async fn run_worker_from_env() -> Result<(), String> {
         };
         match request {
             WorkerRequest::SubmitTurn(request) => {
-                role_settings = match role_settings.for_turn(&request.ext) {
-                    Ok(settings) => settings,
+                // Construct the proposed configuration before accepting it. Failed
+                // switches leave history and the last accepted model untouched.
+                let proposed = async {
+                    let roles = role_settings.for_turn(&request.ext)?;
+                    let next_llm = llm.apply(request.llm.as_ref())?;
+                    let effort = request
+                        .reasoning_effort
+                        .as_deref()
+                        .unwrap_or("off")
+                        .parse()
+                        .map_err(|_| crate::policy::invalid("invalid reasoning effort"))?;
+                    if next_llm.effective_capabilities().reasoning == Some(false)
+                        && effort != agent_types::ReasoningEffort::Off
+                    {
+                        return Err(crate::policy::invalid("model does not support reasoning"));
+                    }
+                    let (runtime, meter) = build_runtime(
+                        &next_llm,
+                        Arc::clone(&responses_state),
+                        Arc::new(backend.for_turn(request.turn_id.clone())),
+                        &roles,
+                    )
+                    .await?;
+                    Ok::<_, xgovernor_core::SessionDomainError>((
+                        roles, next_llm, effort, runtime, meter,
+                    ))
+                }
+                .await;
+                let (roles, next_llm, effort, runtime, usage_meter) = match proposed {
+                    Ok(value) => value,
                     Err(error) => {
                         emit(&WorkerResponse::Error {
                             error: RuntimeError::InvalidRequest {
-                                code: "invalid_role_policy".into(),
+                                code: "invalid_turn_configuration".into(),
                                 message: error.to_string(),
                             },
                         })?;
                         continue;
                     }
                 };
-                let effort = request
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("off")
-                    .parse()
-                    .map_err(|e| format!("invalid reasoning effort: {e}"))?;
-                let (runtime, usage_meter) = build_runtime(
-                    &config.llm,
-                    request.llm.as_ref().and_then(|llm| llm.model.as_deref()),
-                    Arc::new(backend.for_turn(request.turn_id.clone())),
-                    &role_settings,
-                )
-                .await
-                .map_err(|e| format!("failed to build xiaoO runtime: {e:?}"))?;
+                role_settings = roles;
+                llm = next_llm;
                 state.cancel = CancellationToken::new();
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
                 let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -145,27 +163,46 @@ pub async fn run_worker_from_env() -> Result<(), String> {
                 while let Ok(event) = event_rx.try_recv() {
                     emit(&WorkerResponse::Event { event })?;
                 }
+                let snapshot = state.to_snapshot();
+                responses_state
+                    .lock()
+                    .expect("Responses state lock")
+                    .retain_history(&snapshot.messages);
                 emit(&WorkerResponse::State {
                     state: RuntimeStateSnapshot::try_new(
                         "xiaoo",
                         STATE_SCHEMA_VERSION,
-                        &state.to_snapshot(),
+                        &WorkerTurnState {
+                            loop_state: snapshot,
+                            llm: llm.clone(),
+                            role_settings: role_settings.clone(),
+                            responses_state: responses_state
+                                .lock()
+                                .expect("Responses state lock")
+                                .clone(),
+                        },
                     )
                     .map_err(|error| format!("failed to encode xiaoO state: {error:?}"))?,
                 })?;
                 emit(&WorkerResponse::Event { event: terminal })?;
             }
             WorkerRequest::LoadState(snapshot) => {
-                match snapshot.decode("xiaoo", STATE_SCHEMA_VERSION) {
-                    Ok(loop_state) => {
-                        state = RuntimeState::from_snapshot(loop_state, CancellationToken::new())
+                match snapshot.decode::<WorkerTurnState>("xiaoo", STATE_SCHEMA_VERSION) {
+                    Ok(loaded) => {
+                        state = RuntimeState::from_snapshot(
+                            loaded.loop_state,
+                            CancellationToken::new(),
+                        );
+                        llm = loaded.llm;
+                        role_settings = loaded.role_settings;
+                        *responses_state.lock().expect("Responses state lock") =
+                            loaded.responses_state;
                     }
                     Err(error) => emit(&WorkerResponse::Error { error })?,
                 }
             }
-            WorkerRequest::Shutdown
-            | WorkerRequest::AnswerInteraction(_)
-            | WorkerRequest::Cancel(_) => {}
+            WorkerRequest::Shutdown => break,
+            WorkerRequest::AnswerInteraction(_) | WorkerRequest::Cancel(_) => {}
         }
     }
     Ok(())
@@ -269,6 +306,26 @@ fn interaction_answer_to_agent(
         session_protocol::SessionInteractionAnswer::Cancelled
         | session_protocol::SessionInteractionAnswer::Data(_) => {
             InteractionResponse::Choice { value: None }
+        }
+    }
+}
+
+/// Internal worker snapshot atomically acknowledges the configuration used for
+/// a turn along with its history; the public persisted schema remains v1.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct WorkerTurnState {
+    pub loop_state: xiaoo_core::LoopStateSnapshot,
+    pub llm: crate::xiaoo_backend::PersistedLlm,
+    pub role_settings: crate::RoleSettings,
+    pub responses_state: crate::responses::ResponsesState,
+}
+impl From<&crate::XiaooPersistedState> for WorkerTurnState {
+    fn from(state: &crate::XiaooPersistedState) -> Self {
+        Self {
+            loop_state: state.loop_state.clone(),
+            llm: state.llm.clone(),
+            role_settings: state.role_settings.clone(),
+            responses_state: state.responses_state.clone(),
         }
     }
 }

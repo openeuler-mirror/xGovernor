@@ -16,7 +16,6 @@ use agent_runtime_protocol::{
 };
 use async_trait::async_trait;
 use bridge::Bridge;
-use llm_client::ResolveInput;
 use operation_protocol::capability::exec::ExecRequest;
 use operation_protocol::OperationBackend;
 use serde::{Deserialize, Serialize};
@@ -90,10 +89,73 @@ struct PiRoleConfig {
     max_turns: Option<u32>,
     #[serde(default)]
     tools_enabled: Option<bool>,
+    #[serde(default)]
+    tool_policy: ToolPolicy,
+    #[serde(default)]
+    discovery: DiscoveryPolicy,
+}
+
+const SANDBOX_TOOLS: &[&str] = &["read", "write", "edit", "bash", "ls", "find", "grep"];
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolPolicy {
+    #[serde(default)]
+    allow: Option<BTreeSet<String>>,
+    #[serde(default)]
+    deny: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryPolicy {
+    extensions: Option<bool>,
+    skills: Option<bool>,
+    prompt_templates: Option<bool>,
+    themes: Option<bool>,
+    context_files: Option<bool>,
+}
+
+impl DiscoveryPolicy {
+    fn configure(&self, command: &mut Command) {
+        for (enabled, flag) in [
+            (self.extensions, "--no-extensions"),
+            (self.skills, "--no-skills"),
+            (self.prompt_templates, "--no-prompt-templates"),
+            (self.themes, "--no-themes"),
+            (self.context_files, "--no-context-files"),
+        ] {
+            if enabled == Some(false) {
+                command.arg(flag);
+            }
+        }
+    }
+}
+
+fn validate_turn_policy(value: &Value) -> Result<(), SessionDomainError> {
+    if value.get("discovery").is_some() {
+        return Err(SessionDomainError::InvalidRequest {
+            message: "runtime_pi.discovery can only be configured when opening a session".into(),
+        });
+    }
+    Ok(())
 }
 const PI_ROLE_FILE: &str = "xgovernor-role.json";
 impl PiRoleConfig {
     fn validate(&self) -> Result<(), SessionDomainError> {
+        for name in self
+            .tool_policy
+            .allow
+            .iter()
+            .chain(self.tool_policy.deny.iter())
+            .flatten()
+        {
+            if !SANDBOX_TOOLS.contains(&name.as_str()) {
+                return Err(SessionDomainError::InvalidRequest {
+                    message: format!("unknown Pi bridge tool: {name}"),
+                });
+            }
+        }
         if self.max_turns == Some(0) {
             return Err(SessionDomainError::InvalidRequest {
                 message: "max_turns must be positive".into(),
@@ -107,6 +169,12 @@ impl PiRoleConfig {
         }
         if next.max_turns.is_some() {
             self.max_turns = next.max_turns;
+        }
+        if next.tool_policy.allow.is_some() {
+            self.tool_policy.allow = next.tool_policy.allow;
+        }
+        if next.tool_policy.deny.is_some() {
+            self.tool_policy.deny = next.tool_policy.deny;
         }
         if next.tools_enabled.is_some() {
             self.tools_enabled = next.tools_enabled;
@@ -157,10 +225,10 @@ const PI_LLM_STATE_FILE: &str = ".xgovernor-llm.json";
 const PI_MODEL_COMMAND: &str = "xgovernor-model";
 pub const PI_WORKER_ENV: &str = "XGOVERNOR_PI_WORKER";
 
-/// Fully resolved, per-session Pi model configuration. This is deliberately
+/// Per-session Pi model selection and capability overrides. This is deliberately
 /// provider-neutral: `provider` and `model` are passed through exactly as the
 /// caller selected them. When `api_base` is present, the bundled extension
-/// registers that endpoint as an OpenAI-compatible provider before selecting
+/// registers that endpoint with its explicit protocol (Chat Completions by default) before selecting
 /// the model; otherwise Pi's built-in provider catalogue is used.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +237,10 @@ struct PiLlmConfig {
     model: String,
     #[serde(default)]
     api_base: Option<String>,
+    #[serde(default)]
+    api: Option<session_protocol::LlmApi>,
+    #[serde(default)]
+    capabilities: Option<session_protocol::LlmCapabilities>,
     #[serde(default)]
     api_key: Option<String>,
     credential_source: String,
@@ -196,6 +268,11 @@ impl PiLlmConfig {
                     message: format!("pi llm.{name} is required when an llm override is supplied"),
                 })
         };
+        if let Some(capabilities) = &request.capabilities {
+            capabilities
+                .validate()
+                .map_err(|message| SessionDomainError::InvalidRequest { message })?;
+        }
         let provider = required("provider", &request.provider)?;
         let model = required("model", &request.model)?;
         let api_base = request
@@ -238,6 +315,12 @@ impl PiLlmConfig {
         Ok(Self {
             provider,
             model,
+            api: request.api.or_else(|| {
+                api_base
+                    .as_ref()
+                    .map(|_| session_protocol::LlmApi::OpenaiCompletions)
+            }),
+            capabilities: request.capabilities.clone(),
             api_base,
             api_key,
             credential_source,
@@ -249,6 +332,8 @@ impl PiLlmConfig {
             provider: self.provider.clone(),
             model: self.model.clone(),
             api_base: self.api_base.clone(),
+            api: self.api,
+            capabilities: self.capabilities.clone(),
             credential_source: self.credential_source.clone(),
         }
     }
@@ -258,49 +343,6 @@ fn resolve_llm(
     request: Option<&LlmOverrideRequest>,
 ) -> Result<Option<PiLlmConfig>, SessionDomainError> {
     request.map(PiLlmConfig::resolve).transpose()
-}
-
-/// Open-time LLM connectivity probe. Sends a minimal chat-completions
-/// request (max_tokens: 1) to verify the endpoint is reachable and the
-/// key/model are valid. Any failure aborts the session open before the
-/// sandbox is provisioned.
-async fn probe_llm_endpoint(
-    api_base: &str,
-    api_key: Option<&str>,
-    model: &str,
-) -> Result<(), SessionDomainError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| SessionDomainError::InvalidRequest {
-            message: format!("LLM probe: failed to build HTTP client: {e}"),
-        })?;
-    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-    let mut req = client.post(&url).json(&json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 1
-    }));
-    if let Some(key) = api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| SessionDomainError::InvalidRequest {
-            message: format!("LLM probe to '{url}': {e}"),
-        })?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SessionDomainError::InvalidRequest {
-            message: format!(
-                "LLM probe to '{url}' returned {status}: {}",
-                body.chars().take(500).collect::<String>()
-            ),
-        });
-    }
-    Ok(())
 }
 
 async fn private_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), SessionDomainError> {
@@ -366,40 +408,63 @@ async fn configure_pi_launch(
     command: &mut Command,
     session_dir: &std::path::Path,
     config: Option<&PiLlmConfig>,
+    select_model: bool,
 ) -> Result<(), SessionDomainError> {
     let Some(config) = config else { return Ok(()) };
 
-    command
-        .arg("--provider")
-        .arg(&config.provider)
-        .arg("--model")
-        .arg(&config.model);
+    if select_model {
+        command
+            .arg("--provider")
+            .arg(&config.provider)
+            .arg("--model")
+            .arg(&config.model);
+    }
     // Pi resolves apiKey strings through its environment. Never put credentials
     // in argv or models.json, including when the caller used an inline override.
-    command.env(
-        "XGOVERNOR_PI_MODEL_API_KEY",
-        config.api_key.as_deref().unwrap_or("xgovernor-keyless"),
-    );
+    if config.api_key.is_some() || config.api_base.is_some() {
+        command.env(
+            "XGOVERNOR_PI_MODEL_API_KEY",
+            config.api_key.as_deref().unwrap_or("xgovernor-keyless"),
+        );
+    } else {
+        command.env_remove("XGOVERNOR_PI_MODEL_API_KEY");
+    }
     let agent_dir = session_dir.join(".pi-agent");
     tokio::fs::create_dir_all(&agent_dir)
         .await
         .map_err(|error| SessionDomainError::Unavailable {
             message: error.to_string(),
         })?;
-    let mut provider = json!({"apiKey":"${XGOVERNOR_PI_MODEL_API_KEY}"});
+    let mut provider = json!({});
+    if config.api_key.is_some() || config.api_base.is_some() {
+        provider["apiKey"] = json!("${XGOVERNOR_PI_MODEL_API_KEY}");
+    }
     if let Some(base) = &config.api_base {
         provider["baseUrl"] = json!(base);
-        provider["api"] = json!("openai-completions");
+        provider["api"] = json!(config
+            .api
+            .unwrap_or(session_protocol::LlmApi::OpenaiCompletions));
         provider["models"] = json!([{"id":config.model}]);
     }
-    let models = json!({"providers":{config.provider.clone():provider}});
+    let models = if provider.as_object().is_some_and(|p| p.is_empty()) {
+        json!({"providers":{}})
+    } else {
+        json!({"providers":{config.provider.clone():provider}})
+    };
     private_write(
         &agent_dir.join("models.json"),
         &serde_json::to_vec_pretty(&models).unwrap(),
     )
     .await?;
     command.env("PI_CODING_AGENT_DIR", agent_dir);
-    persist_llm_config(session_dir, config).await
+    persist_llm_config(session_dir, config).await?;
+    // Private bootstrap input for the shared extension model resolver. Environment
+    // credentials stay out of this file and are supplied through the child env.
+    command.env(
+        "XGOVERNOR_PI_LLM_CONFIG",
+        session_dir.join(PI_LLM_STATE_FILE),
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -586,45 +651,31 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
             });
         }
 
-        let docker_network_mode = if ext.backend_id == DOCKER_BACKEND_ID {
+        let docker_options = if ext.backend_id == DOCKER_BACKEND_ID {
             if !ctx.is_admin() {
                 return Err(SessionDomainError::InvalidRequest {
                     message: "Docker prototype is administrator-only".into(),
                 });
             }
-            let options = request.deployment.options.get("provider_options");
-            if let Some(options) = options {
-                let Some(object) = options.as_object() else {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker provider_options must be an object".into(),
-                    });
-                };
-                if object
-                    .keys()
-                    .any(|key| !matches!(key.as_str(), "workspace_root" | "network_mode"))
-                    || object
-                        .get("workspace_root")
-                        .is_some_and(|root| root != "/workspace")
-                {
-                    return Err(SessionDomainError::InvalidRequest {
-                        message: "Docker accepts only the fixed /workspace root and network_mode"
-                            .into(),
-                    });
-                }
-            }
-            let mode = options
-                .and_then(|value| value.get("network_mode"))
-                .and_then(Value::as_str)
-                .unwrap_or("default");
-            if !matches!(mode, "none" | "default" | "bridge") {
-                return Err(SessionDomainError::InvalidRequest {
-                    message: "Docker network_mode must be 'none', 'default', or 'bridge'".into(),
-                });
-            }
-            Some(mode)
+            Some(
+                backend::docker::DockerProviderOptions::parse(
+                    &request.deployment.options["provider_options"],
+                )
+                .map_err(|error| SessionDomainError::InvalidRequest {
+                    message: error.to_string(),
+                })?,
+            )
         } else {
             None
         };
+        let docker_network_mode =
+            docker_options
+                .as_ref()
+                .map(|options| match options.network_mode {
+                    backend::docker::DockerNetworkMode::None => "none",
+                    backend::docker::DockerNetworkMode::Default => "default",
+                    backend::docker::DockerNetworkMode::Bridge => "bridge",
+                });
         if ext.backend_id == DOCKER_BACKEND_ID {
             if let session_protocol::WorkspaceSpec::Git { url, .. } = &request.workspace {
                 if !url.starts_with("https://") {
@@ -634,8 +685,8 @@ impl SessionEnvironmentNormalizer for PiSessionEnvironment {
                 }
             }
         }
-        let sandbox_root = if ext.backend_id == DOCKER_BACKEND_ID {
-            "/workspace"
+        let sandbox_root = if let Some(options) = &docker_options {
+            options.workspace_root()
         } else {
             E2B_WORKSPACE_ROOT
         };
@@ -1304,28 +1355,21 @@ impl AgentRuntime for PiRuntime {
             .map_err(to_runtime_error)
     }
 
+    fn validate_llm_config(&self, config: Option<&LlmOverrideRequest>) -> Result<(), RuntimeError> {
+        resolve_llm(config).map(|_| ()).map_err(to_runtime_error)
+    }
+
     async fn probe_llm(&self, request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
         let Some(override_req) = request.llm.as_ref() else {
             return Ok(());
         };
         let config = PiLlmConfig::resolve(override_req).map_err(to_runtime_error)?;
-        let resolved = llm_client::resolve_config(ResolveInput {
-            provider: Some(config.provider.clone()),
-            api_key: config.api_key.clone(),
-            base_url: config.api_base.clone(),
-            ..Default::default()
-        })
-        .map_err(|e| RuntimeError::InvalidRequest {
-            code: "llm_config".into(),
-            message: e.to_string(),
-        })?;
-        probe_llm_endpoint(
-            &resolved.base_url,
-            resolved.api_key.as_deref(),
-            &config.model,
-        )
-        .await
-        .map_err(to_runtime_error)
+        let ext = read_pi_runtime_ext(&request.ext).map_err(to_runtime_error)?;
+        let executable = ext
+            .executable
+            .or_else(|| std::env::var(PI_EXECUTABLE_ENV).ok())
+            .unwrap_or_else(|| DEFAULT_PI_EXECUTABLE.into());
+        worker::probe_llm(&executable, &config).await
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
@@ -1380,6 +1424,31 @@ impl AgentRuntime for PiRuntime {
         self.cancel_inner(&request.runtime_id, request.turn_id.as_deref())
             .await
             .map_err(to_runtime_error)
+    }
+
+    async fn describe_llm(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<session_protocol::ResolvedLlmDescriptor>, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        let config = load_llm_config(std::path::Path::new(
+            &instance.persisted_state.pi_session_dir,
+        ))
+        .await
+        .map_err(to_runtime_error)?;
+        Ok(
+            config.map(|config| session_protocol::ResolvedLlmDescriptor {
+                provider: config.provider,
+                model: config.model,
+                api_base: config.api_base,
+                api: config.api,
+                capabilities: config.capabilities,
+                credential_source: config.credential_source,
+            }),
+        )
     }
 
     async fn export_state(&self, runtime_id: &str) -> Result<OpaqueRuntimeState, RuntimeError> {
@@ -1629,13 +1698,17 @@ impl PiRuntime {
         let _ = send_worker_request(&instance, WorkerRequest::Shutdown).await;
         {
             let mut child = instance.child.lock().await;
-            if let Err(error) = child.start_kill() {
-                // Already exited is fine; anything else is worth logging but
-                // not worth failing `stop` over — the registry entry is
-                // already gone.
-                tracing::debug!(runtime_id = %runtime_id, %error, "start_kill on Pi worker failed");
+            // Let the worker reap native Pi before closing its RPC pipes. Killing
+            // the worker immediately can leave Pi writing to a broken pipe.
+            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                .await
+                .is_err()
+            {
+                if let Err(error) = child.start_kill() {
+                    tracing::debug!(runtime_id = %runtime_id, %error, "start_kill on Pi worker failed");
+                }
+                let _ = child.wait().await;
             }
-            let _ = child.wait().await;
         }
         self.bridge.unregister(&instance.bridge_token);
         Ok(())
@@ -1649,6 +1722,7 @@ impl PiRuntime {
         // worker performs the actual Pi model reconfiguration.
         resolve_llm(input.llm.as_ref())?;
         if let Some(value) = input.ext.get(EXT_NAMESPACE) {
+            validate_turn_policy(value)?;
             let role: PiRoleConfig = serde_json::from_value(value.clone()).map_err(|e| {
                 SessionDomainError::InvalidRequest {
                     message: e.to_string(),
@@ -2045,5 +2119,95 @@ mod tests {
             matches!(result, Err(SessionDomainError::Internal { .. })),
             "state tagged for a different runtime_kind must not be interpreted as pi's"
         );
+    }
+    #[tokio::test]
+    async fn docker_workspace_is_configurable_and_validated() {
+        let normalizer = PiSessionEnvironment::new("/unused", ["docker".into()]);
+        let mut request = open_request(session_protocol::WorkspaceSpec::DaemonDefault);
+        request
+            .ext
+            .insert(EXT_NAMESPACE.into(), json!({"backend_id":"docker"}));
+        for root in ["/testbed", "/opt/project with spaces"] {
+            request.deployment.options =
+                json!({"provider_options":{"workspace_root":root,"network_mode":"none"}});
+            let facts = normalizer
+                .normalize(&SecurityContext::admin("test"), &request)
+                .await
+                .unwrap();
+            assert_eq!(facts.workspace.root, root);
+            assert_eq!(facts.isolation.network, NetworkIsolation::Isolated);
+        }
+        for root in ["relative", "/tmp/../testbed", ""] {
+            request.deployment.options = json!({"provider_options":{"workspace_root":root}});
+            assert!(normalizer
+                .normalize(&SecurityContext::admin("test"), &request)
+                .await
+                .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn tool_overrides_merge_fields_replace_arrays_and_preserve_discovery() {
+        let mut role: PiRoleConfig = serde_json::from_value(json!({
+            "tool_policy":{"allow":["read","grep","read"],"deny":["grep"]},
+            "discovery":{"skills":false,"context_files":false}
+        }))
+        .unwrap();
+        role.validate().unwrap();
+        assert_eq!(role.tool_policy.allow.as_ref().unwrap().len(), 2);
+        role.merge(serde_json::from_value(json!({"tool_policy":{"allow":[]}})).unwrap());
+        assert!(role.tool_policy.allow.as_ref().unwrap().is_empty());
+        assert!(role.tool_policy.deny.as_ref().unwrap().contains("grep"));
+        assert_eq!(role.discovery.skills, Some(false));
+        assert!(
+            serde_json::from_value::<PiRoleConfig>(json!({"tool_policy":{"allow":["oops"]}}))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(validate_turn_policy(&json!({"discovery":null})).is_err());
+        assert!(validate_turn_policy(&json!({"tool_policy":{"deny":[]}})).is_ok());
+    }
+
+    #[test]
+    fn discovery_launch_flags_and_legacy_checkpoint_defaults() {
+        let role: PiRoleConfig = serde_json::from_value(json!({"discovery":{
+            "extensions":false,"skills":false,"prompt_templates":false,"themes":false,"context_files":false
+        }})).unwrap();
+        let mut command = Command::new("pi");
+        role.discovery.configure(&mut command);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-context-files"
+            ]
+        );
+        let checkpoint = PiCheckpoint {
+            session_jsonl: None,
+            llm_config_ref: None,
+            llm_config: None,
+            role,
+        };
+        let restored: PiCheckpoint =
+            serde_json::from_value(serde_json::to_value(&checkpoint).unwrap()).unwrap();
+        assert_eq!(restored, checkpoint);
+        let legacy: PiRoleConfig = serde_json::from_value(json!({"tools_enabled":true})).unwrap();
+        let mut command = Command::new("pi");
+        legacy.discovery.configure(&mut command);
+        assert_eq!(command.as_std().get_args().count(), 0);
     }
 }

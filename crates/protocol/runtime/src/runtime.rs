@@ -22,6 +22,22 @@ pub trait AgentRuntime: Send + Sync {
     fn runtime_kind(&self) -> &str;
     fn capabilities(&self) -> BTreeSet<RuntimeCapability>;
 
+    /// Validate optional model features before provider-side effects. Runtimes
+    /// must opt in rather than silently ignore protocol/capability declarations.
+    fn validate_llm_config(
+        &self,
+        config: Option<&session_protocol::LlmOverrideRequest>,
+    ) -> Result<(), RuntimeError> {
+        if config.is_some_and(|config| config.api.is_some() || config.capabilities.is_some()) {
+            return Err(RuntimeError::InvalidRequest {
+                code: "unsupported_llm_configuration".into(),
+                message: "This runtime does not support model protocol or capability overrides"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
     fn capabilities_for_context(
         &self,
         _context: &RuntimeCapabilityContext,
@@ -57,6 +73,15 @@ pub trait AgentRuntime: Send + Sync {
     /// do not configure an LLM endpoint.
     async fn probe_llm(&self, _request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    /// Credential-free model configuration confirmed by the running adapter.
+    /// None means this runtime does not supply model metadata.
+    async fn describe_llm(
+        &self,
+        _runtime_id: &str,
+    ) -> Result<Option<session_protocol::ResolvedLlmDescriptor>, RuntimeError> {
+        Ok(None)
     }
 
     async fn export_state(&self, _runtime_id: &str) -> Result<RuntimeStateSnapshot, RuntimeError> {

@@ -127,6 +127,8 @@ mod tests {
             provider: "openai".into(),
             model: "gpt".into(),
             api_base: None,
+            api: None,
+            capabilities: None,
             credential_source: "request".into(),
         };
         assert!(serde_json::to_value(descriptor)

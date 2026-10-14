@@ -98,7 +98,24 @@ pub struct ResolvedLlm {
     pub model: String,
     #[serde(default)]
     pub api_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<session_protocol::LlmApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<session_protocol::LlmCapabilities>,
     pub credential_source: String,
+}
+
+impl From<session_protocol::ResolvedLlmDescriptor> for ResolvedLlm {
+    fn from(value: session_protocol::ResolvedLlmDescriptor) -> Self {
+        Self {
+            provider: value.provider,
+            model: value.model,
+            api_base: value.api_base,
+            api: value.api,
+            capabilities: value.capabilities,
+            credential_source: value.credential_source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

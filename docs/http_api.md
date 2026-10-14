@@ -142,7 +142,7 @@
 - `runtime_id` 省略/为 null 时由服务端签发；携带已存在的 id 为**幂等重附着**（attach + 返回现有会话投影）。
 - `workspace.kind`：`daemon_default`（默认）/ `local_path` / `git` / `shared`。当前部署只实现前两种，其余返回 400。
 - `requested_capabilities` 从严校验：请求未知能力名是 400；请求了归一化结果/runtime 宣告之外的能力是 422。
-- `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 当前按 OpenAI Chat Completions-compatible endpoint 处理。
+- `llm` 由调用方逐 session 选择，不要求 daemon 启动时绑定某个 LLM。Pi 要求同时提供 `provider` 与 `model`；凭证可用 `api_key` 直接传入，或用 `api_key_env` 引用 daemon 环境变量。`api_base` 配合可选 `api` 选择协议，省略 `api` 时兼容原有 OpenAI Chat Completions 默认；详见下方模型协议配置。
 - Pi 会把生效配置保存在该 session 的隔离目录中，以便 daemon 重启、checkpoint/load 后恢复；响应只投影 provider/model/base 与凭证来源，不回显 key。
 
 响应 `SessionOpenResponse`：
@@ -366,3 +366,134 @@ Pi 用受信扩展替换真实 system prompt，限定沙箱工具集合，关闭
 
 Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式仅含实时会话目录的 state 不可直接作为新分支使用，需要在升级后的服务上重新 checkpoint。当前本地 provider 不提供环境快照；完整 MCTS 分支需使用具备 snapshot 能力的 provider（如 E2B）。
 
+
+### Pi 工具和资源发现策略
+
+`ext.runtime_pi.tool_policy` 支持 `allow`/`deny` 数组，仅接受
+`read/write/edit/bash/ls/find/grep`。allow 缺省为全部，空数组为无工具；deny
+优先，重复名称去重，未知名称报错。`tools_enabled: false` 禁用全部。
+逐轮覆盖按字段继承、数组整体替换，结果随 checkpoint 保存。
+
+`ext.runtime_pi.discovery` 支持 `extensions`、`skills`、`prompt_templates`、
+`themes`、`context_files` 布尔值。false 关闭对应发现，缺省或 true 保持 pi
+原生行为；桥接扩展始终显式加载。仅 open 可配置，turn 中传入会报错。
+恢复及 fork 继承原值，旧 session 默认行为不变。例如：
+
+```json
+{"ext":{"runtime_pi":{"backend_id":"local","tool_policy":{"allow":["read","ls","find","grep"]},"discovery":{"extensions":false,"skills":false,"prompt_templates":false,"themes":false,"context_files":false}}}}
+```
+
+只读工具列表不是文件系统隔离；宿主 exec/files 和后端 sandbox 权限仍独立执行。
+
+### 模型协议与基础能力（Pi）
+
+公共 `llm` 增加可选 `api` 和 `capabilities`：
+
+```json
+{
+  "llm": {
+    "provider": "my-gateway",
+    "model": "deployment-model-id",
+    "api_base": "https://gateway.example/v1",
+    "api": "openai-responses",
+    "api_key_env": "GATEWAY_API_KEY",
+    "capabilities": {
+      "reasoning": true,
+      "input": ["text", "image"],
+      "context_window": 128000,
+      "max_tokens": 16000
+    }
+  }
+}
+```
+
+- `api` 接受 `openai-completions`、`openai-responses`、`anthropic-messages`。
+  自定义 `api_base` 省略 api 时保持 Chat Completions 默认；没有 api_base 时
+  保留 pi 内置模型的协议，显式冲突会报错。模型名是精确 ID，不做别名猜测。
+- 地址遵循 pi SDK 的协议约定：OpenAI 兼容服务通常为 `https://host/v1`；
+  Anthropic Messages 通常为 `https://host`，SDK 自行追加 `/v1/messages`。
+- 能力声明逐项覆盖内置定义。无内置定义的自定义模型兼容默认是
+  `reasoning: false`、`input: ["text"]`、128000 上下文、32000 最大输出、
+  零价格；这些是默认假设，不是自动发现的真实能力。输入仅支持 text/image，
+  数组必须非空，token 上限必须为正，合并后最大输出不能超过上下文窗口。
+- 新字段进入不含凭证的描述信息，并随模型配置保存、恢复和 fork；描述信息在
+  启动、恢复和每轮终态时同步已确认的配置，失败的切换保留原值。逐轮 llm
+  仍是完整模型选择，不改变现有覆盖规则。不支持这些字段的 runtime 明确拒绝。
+- open 的预检先于 sandbox 创建，通过同一 pi executable 和模型解析代码执行
+  最小模型请求；资源发现和工具全部关闭，不写业务历史。请求超时为 10 秒，
+  整个子进程预检上限为 20 秒，完成后回收进程和临时目录。错误区分配置、模型、
+  认证、连接、超时和服务失败，不回传上游响应正文或凭证。
+- 每轮切换不额外进行网络预检，但必须通过配置校验和 `set_model` 确认后才提交
+  提示。首版不增加温度/推理预算等生成参数、自动别名映射或凭证刷新管理。
+
+### xiaoO 工具策略与模型配置
+
+xiaoO 支持相同结构的 `tool_policy`，放在 `ext.xiaoo` 下，使用原生工具名：
+`bash/file_read/file_write/file_edit/glob/grep/ask_user_question`。
+allow 缺省为全部、空数组为无工具；deny 优先，未知名称报错，重复项去重。
+`tools_enabled: false` 禁用全部；`allow_interaction: false` 额外禁止问答工具。
+open 默认值可逐轮覆盖，未提供字段继承，数组整体替换，合并结果进入 checkpoint。
+工具注册表不为被禁止的工具提供执行器。只读工具列表不构成文件系统隔离，
+后端权限及宿主 exec/files 仍独立执行。
+
+```json
+{
+  "runtime_kind": "xiaoo",
+  "llm": {
+    "provider": "my-gateway",
+    "model": "deployment-model-id",
+    "api_base": "https://gateway.example/v1",
+    "api": "openai-responses",
+    "api_key_env": "GATEWAY_API_KEY",
+    "capabilities": {
+      "reasoning": true,
+      "input": ["text"],
+      "context_window": 128000,
+      "max_tokens": 16000
+    }
+  },
+  "ext": {
+    "xiaoo": {
+      "backend_id": "local",
+      "tool_policy": {"allow": ["file_read", "glob", "grep"]},
+      "discovery": {
+        "extensions": false,
+        "skills": false,
+        "prompt_templates": false,
+        "themes": false,
+        "context_files": false
+      }
+    }
+  }
+}
+```
+
+- 嵌入式 xiaoO 原本不加载上述外部资源。discovery 缺省和 false 均保持关闭，
+  true 明确报错；仅 open 可声明，逐轮提供 discovery（即使 false）也报错。
+  保存、恢复及 fork 保留声明，旧状态缺字段时使用原有默认值。
+- 公共 `llm` 支持三种 api 和基础 capabilities，可覆盖旧 `ext.xiaoo` 的
+  provider/model/api_key_env/api_base。无需重复提供旧模型字段，凭证仍只接受
+  环境变量引用，拒绝 inline api_key。模型 ID 原样发送，不做别名替换。
+- 未显式指定 api 时保留 xiaoO 已有 provider 协议，包括旧 Anthropic 自定义
+  endpoint；未知自定义 provider 默认 Chat Completions。无 api_base 时显式
+  协议必须与内置 provider 一致；Responses 或跨协议接入需提供 api_base。
+  xiaoO 的 api_base 包含服务版本路径：三种协议通常均为 `https://host/v1`，
+  分别追加 `/chat/completions`、`/responses`、`/messages`。显式 Chat Completions
+  也接受完整 `/chat/completions` 地址；旧未指定 api 的配置保留 SDK 地址尝试规则。
+- capabilities 逐字段合并；context_window 使用声明值或 SDK 静态模型表，
+  未知模型回退到 128000；max_tokens 缺省为上下文的十分之一（至少 1）。这些
+  是兼容预算假设，不是在线能力发现。reasoning/input 未声明时保持未知及 SDK
+  原有行为；声明 reasoning:false 后拒绝非 off 的推理请求。token 上限必须为正，
+  最大输出不得超过上下文。Anthropic 的 SDK 推理模式要求输出预算至少 2048。
+  input 仅接受非空 text/image 列表，是模型能力元数据；当前公共 turn 为文本，
+  声明 image 不会增加图片上传接口。
+- 逐轮 llm 保留 model-only 覆盖兼容性：未提供字段继承；改变 model 清除上个
+  模型的能力覆盖，改变 provider 还清除旧 endpoint/api。配置校验及 provider
+  构建成功后才运行本轮，不会切换失败后继续向旧模型发提示。配置与历史一起由
+  worker 回传，描述信息、checkpoint、恢复、fork 和 load_state 使用同一配置。
+  网络调用失败不会自动回退到旧模型，也不增加每轮网络预检。
+- open 在创建 sandbox 前调用实际 provider 做最小预检，10 秒超时，完成或超时
+  即释放请求；三种协议与正式调用共用解析和 provider。预检不写业务历史、不
+  注册工具，返回分类后的安全错误，抑制 SDK 可能包含响应正文的预检 trace。
+  Responses 支持流式文本/推理摘要、function tools 和用量解析，并随 checkpoint
+  保存继续工具链所需的 encrypted reasoning 数据；不保存 API key。

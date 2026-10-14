@@ -17,10 +17,9 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{CapabilityFamily, OpaqueRuntimeState, SessionDomainError};
 use xgovernor_runtime_pi::bridge::Bridge;
-use xiaoo_api::llm::{resolve_config, ResolveInput};
 use xiaoo_api::runtime::RuntimeState;
 
-use crate::xiaoo_backend::{spawn_worker_process, PersistedLlm, WorkerConfig};
+use crate::xiaoo_backend::{spawn_worker_process, WorkerConfig};
 use crate::{
     clone_git_workspace, read_ext, state_from_opaque, state_to_opaque, validate_persisted_llm,
     XiaooPersistedState, E2B_BACKEND_ID, STATE_SCHEMA_VERSION,
@@ -148,29 +147,44 @@ impl AgentRuntime for XiaooRuntime {
         request: RuntimeStartRequest,
         context: RuntimeExecutionContext,
     ) -> Result<(), RuntimeError> {
+        self.validate_llm_config(request.llm.as_ref())?;
         self.start_inner(request, context)
             .await
             .map_err(to_runtime_error)
     }
 
     async fn probe_llm(&self, request: &RuntimeStartRequest) -> Result<(), RuntimeError> {
-        let ext = read_ext(&request.ext).map_err(to_runtime_error)?;
-        let resolved = resolve_config(ResolveInput {
-            provider: Some(ext.provider.clone()),
-            api_key_env: Some(ext.api_key_env.clone()),
-            base_url: ext.api_base.clone(),
-            ..Default::default()
-        })
-        .map_err(|e| RuntimeError::InvalidRequest {
-            code: "llm_config".into(),
-            message: e.to_string(),
-        })?;
-        let api_key = std::env::var(&ext.api_key_env)
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        probe_llm_endpoint(&resolved.base_url, api_key.as_deref(), &ext.model)
+        self.validate_llm_config(request.llm.as_ref())?;
+        let llm = if let Some(state) = &request.state {
+            state_from_opaque(state)
+                .map_err(to_runtime_error)?
+                .llm
+                .apply(request.llm.as_ref())
+                .map_err(to_runtime_error)?
+        } else {
+            let ext = read_ext(&request.ext).map_err(to_runtime_error)?;
+            crate::model::initial_llm(&ext, request.llm.as_ref()).map_err(to_runtime_error)?
+        };
+        crate::model::probe(&llm).await.map_err(to_runtime_error)
+    }
+
+    fn validate_llm_config(
+        &self,
+        llm: Option<&session_protocol::LlmOverrideRequest>,
+    ) -> Result<(), RuntimeError> {
+        crate::model::validate_override(llm).map_err(to_runtime_error)
+    }
+
+    async fn describe_llm(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<session_protocol::ResolvedLlmDescriptor>, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
             .await
-            .map_err(to_runtime_error)
+            .map_err(to_runtime_error)?;
+        let descriptor = instance.persisted.lock().await.llm.descriptor();
+        Ok(Some(descriptor))
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
@@ -210,6 +224,7 @@ impl AgentRuntime for XiaooRuntime {
         &self,
         input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, RuntimeError> {
+        self.validate_llm_config(input.llm.as_ref())?;
         self.submit_turn_inner(input)
             .await
             .map_err(to_runtime_error)
@@ -262,8 +277,10 @@ impl XiaooRuntime {
         }
         let backend = context.operation_backend;
         let persisted = if let Some(state) = request.state.as_ref() {
-            let persisted = state_from_opaque(state)?;
-            validate_persisted_llm(&persisted.llm)?;
+            let mut persisted = state_from_opaque(state)?;
+            persisted.llm = persisted.llm.apply(request.llm.as_ref())?;
+            persisted.role_settings.tool_policy.validate()?;
+            persisted.role_settings.discovery.validate()?;
             persisted
         } else {
             if request
@@ -278,6 +295,7 @@ impl XiaooRuntime {
             }
             let ext = read_ext(&request.ext)?;
             let role_settings = ext.role_settings()?;
+            let llm = crate::model::initial_llm(&ext, request.llm.as_ref())?;
             // `allow_internet_access` is an e2b-only provider option; the
             // local provider rejects unknown fields, so only include it
             // for e2b (mirrors apps/runtime-pi/src/lib.rs::prepare_cold_start).
@@ -303,12 +321,8 @@ impl XiaooRuntime {
                 owner_ref: String::new(),
                 workspace_root: request.workspace.root,
                 provider_options,
-                llm: PersistedLlm {
-                    provider: ext.provider,
-                    model: ext.model,
-                    api_key_env: ext.api_key_env,
-                    api_base: ext.api_base,
-                },
+                llm,
+                responses_state: Default::default(),
                 loop_state: RuntimeState::new(request.conversation_id).to_snapshot(),
                 role_settings,
             };
@@ -326,6 +340,7 @@ impl XiaooRuntime {
             llm: persisted.llm.clone(),
             loop_state: persisted.loop_state.clone(),
             role_settings: persisted.role_settings.clone(),
+            responses_state: persisted.responses_state.clone(),
             bridge_url: self.bridge.base_url(),
             bridge_token: bridge_token.clone(),
             backend_id: backend.backend_id().to_string(),
@@ -381,7 +396,7 @@ impl XiaooRuntime {
 
     async fn submit_turn_inner(
         &self,
-        mut input: RuntimeTurnInput,
+        input: RuntimeTurnInput,
     ) -> Result<RuntimeEventReceiver, SessionDomainError> {
         if input
             .llm
@@ -394,7 +409,6 @@ impl XiaooRuntime {
             });
         }
         let instance = self.instance_for(&input.runtime_id).await?;
-        let role_settings;
         {
             let mut active = instance.active_turn.lock().await;
             if active.is_some() {
@@ -402,21 +416,21 @@ impl XiaooRuntime {
                     message: "xiaoO worker already has an active turn".into(),
                 });
             }
-            role_settings = instance
-                .persisted
-                .lock()
-                .await
-                .role_settings
-                .for_turn(&input.ext)?;
-            input.ext.insert(
-                crate::EXT_NAMESPACE.into(),
-                serde_json::to_value(&role_settings).map_err(|error| {
-                    SessionDomainError::Internal {
-                        message: error.to_string(),
-                        source: None,
-                    }
-                })?,
-            );
+            let persisted = instance.persisted.lock().await;
+            persisted.role_settings.for_turn(&input.ext)?;
+            let next = persisted.llm.apply(input.llm.as_ref())?;
+            let effort: agent_types::ReasoningEffort = input
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("off")
+                .parse()
+                .map_err(|_| crate::policy::invalid("invalid reasoning effort"))?;
+            if next.effective_capabilities().reasoning == Some(false)
+                && effort != agent_types::ReasoningEffort::Off
+            {
+                return Err(crate::policy::invalid("model does not support reasoning"));
+            }
+            drop(persisted);
             instance
                 .backend
                 .begin_turn(&input.turn_id)
@@ -432,7 +446,6 @@ impl XiaooRuntime {
             instance.active_turn.lock().await.take();
             return Err(error);
         }
-        instance.persisted.lock().await.role_settings = role_settings;
         let (tx, mut internal_rx) = mpsc::channel(64);
         let (output, rx) = mpsc::channel(64);
         let terminal_instance = Arc::clone(&instance);
@@ -495,9 +508,15 @@ impl XiaooRuntime {
                         }
                     }
                     Ok(WorkerResponse::State { state }) => {
-                        match state.decode("xiaoo", STATE_SCHEMA_VERSION) {
-                            Ok(loop_state) => {
-                                instance.persisted.lock().await.loop_state = loop_state
+                        match state
+                            .decode::<crate::worker::WorkerTurnState>("xiaoo", STATE_SCHEMA_VERSION)
+                        {
+                            Ok(state) => {
+                                let mut persisted = instance.persisted.lock().await;
+                                persisted.loop_state = state.loop_state;
+                                persisted.llm = state.llm;
+                                persisted.role_settings = state.role_settings;
+                                persisted.responses_state = state.responses_state;
                             }
                             Err(error) => {
                                 let _ = tx.send(worker_error_event(error)).await;
@@ -606,60 +625,29 @@ impl XiaooRuntime {
         let instance = self.instance_for(runtime_id).await?;
         let persisted = state_from_opaque(&state)?;
         validate_persisted_llm(&persisted.llm)?;
+        persisted.role_settings.tool_policy.validate()?;
+        persisted.role_settings.discovery.validate()?;
+        let active = instance.active_turn.lock().await;
+        if active.is_some() {
+            return Err(SessionDomainError::Conflict {
+                message: "cannot load state during an active turn".into(),
+            });
+        }
         self.send_worker(
             &instance,
             WorkerRequest::LoadState(
-                RuntimeStateSnapshot::try_new("xiaoo", STATE_SCHEMA_VERSION, &persisted.loop_state)
-                    .map_err(map_runtime_error)?,
+                RuntimeStateSnapshot::try_new(
+                    "xiaoo",
+                    STATE_SCHEMA_VERSION,
+                    &crate::worker::WorkerTurnState::from(&persisted),
+                )
+                .map_err(map_runtime_error)?,
             ),
         )
         .await?;
         *instance.persisted.lock().await = persisted;
         Ok(())
     }
-}
-
-/// Open-time LLM connectivity probe. Sends a minimal chat-completions
-/// request (max_tokens: 1) to verify the endpoint is reachable and the
-/// key/model are valid. Any failure aborts the session open before the
-/// sandbox is provisioned.
-async fn probe_llm_endpoint(
-    api_base: &str,
-    api_key: Option<&str>,
-    model: &str,
-) -> Result<(), SessionDomainError> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| SessionDomainError::InvalidRequest {
-            message: format!("LLM probe: failed to build HTTP client: {e}"),
-        })?;
-    let url = format!("{}/chat/completions", api_base.trim_end_matches('/'));
-    let mut req = client.post(&url).json(&serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 1
-    }));
-    if let Some(key) = api_key {
-        req = req.header("Authorization", format!("Bearer {key}"));
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| SessionDomainError::InvalidRequest {
-            message: format!("LLM probe to '{url}': {e}"),
-        })?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(SessionDomainError::InvalidRequest {
-            message: format!(
-                "LLM probe to '{url}' returned {status}: {}",
-                body.chars().take(500).collect::<String>()
-            ),
-        });
-    }
-    Ok(())
 }
 
 fn to_runtime_error(error: SessionDomainError) -> RuntimeError {
@@ -808,5 +796,22 @@ for line in sys.stdin:
             assert!(matches!(next.recv().await,Some(RuntimeEvent::Completed { .. })));
             runtime.stop_inner("test").await.unwrap();
         }).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod model_config_tests {
+    use super::*;
+    #[tokio::test]
+    async fn supported_model_features_are_accepted() {
+        let runtime = XiaooRuntime::new();
+        for value in [
+            serde_json::json!({"api":"openai-responses"}),
+            serde_json::json!({"capabilities":{"reasoning":true}}),
+        ] {
+            let config = serde_json::from_value(value).unwrap();
+            assert!(runtime.validate_llm_config(Some(&config)).is_ok());
+        }
+        assert!(runtime.validate_llm_config(None).is_ok());
     }
 }

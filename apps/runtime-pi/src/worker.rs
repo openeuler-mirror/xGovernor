@@ -150,12 +150,19 @@ pub async fn run_worker_from_env() -> Result<(), String> {
     let reader = tokio::spawn(async move { read_native_events(reader_native, stdout).await });
     // Spawn success is not readiness: the native process may fail during
     // initialization. A local RPC response validates startup without a model call.
-    if let Err(message) = write_native_for_response(
-        &native,
-        json!({"type":"get_state","id":format!("startup-{}",Uuid::new_v4())}),
-    )
-    .await
-    {
+    let initialization = async {
+        write_native_for_response(
+            &native,
+            json!({"type":"get_state","id":format!("startup-{}",Uuid::new_v4())}),
+        )
+        .await?;
+        if let Some(config) = &config.llm {
+            configure_instance_llm(&native, config).await?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(message) = initialization {
         let _ = response_tx.send(WorkerResponse::Error {
             error: RuntimeError::WorkerUnavailable {
                 message,
@@ -229,6 +236,11 @@ async fn spawn_native_pi(
     responses: mpsc::UnboundedSender<WorkerResponse>,
 ) -> Result<Arc<NativePi>, String> {
     let mut command = Command::new(&config.executable);
+    read_role(&config.session_dir)
+        .await
+        .map_err(|e| e.to_string())?
+        .discovery
+        .configure(&mut command);
     command
         .arg("--mode")
         .arg("rpc")
@@ -254,7 +266,7 @@ async fn spawn_native_pi(
     if let Some(session_file) = &config.resume_session_file {
         command.arg("--session").arg(session_file);
     }
-    configure_pi_launch(&mut command, &config.session_dir, config.llm.as_ref())
+    configure_pi_launch(&mut command, &config.session_dir, config.llm.as_ref(), true)
         .await
         .map_err(|error| error.to_string())?;
     let mut child = command.spawn().map_err(|error| {
@@ -298,6 +310,9 @@ async fn handle_worker_request(
 
     match request {
         WorkerRequest::SubmitTurn(request) => {
+            if let Some(value) = request.ext.get(EXT_NAMESPACE) {
+                super::validate_turn_policy(value).map_err(super::to_runtime_error)?;
+            }
             let context_path = native.session_dir.join("xgovernor-turn.json");
             let pending = context_path.with_extension("pending");
             tokio::fs::write(
@@ -826,4 +841,85 @@ async fn handle_settled(native: &NativePi, message: &Value) {
             },
         );
     }
+}
+
+/// Use the same Pi provider implementation as real turns, without loading
+/// workspace resources, bridge tools or creating business conversation history.
+pub(crate) async fn probe_llm(executable: &str, config: &PiLlmConfig) -> Result<(), RuntimeError> {
+    let setup_error = |_| RuntimeError::InvalidRequest {
+        code: "llm_config".into(),
+        message: "Failed to start isolated Pi model probe".into(),
+    };
+    let dir = tempfile::tempdir().map_err(setup_error)?;
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-context-files",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-tools",
+        ])
+        .arg("-e")
+        .arg(std::path::Path::new(super::DEFAULT_EXTENSION_DIR).join("probe.ts"))
+        .current_dir(dir.path())
+        .env("PI_OFFLINE", "1")
+        .env("XGOVERNOR_PI_PROBE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    configure_pi_launch(&mut command, dir.path(), Some(config), false)
+        .await
+        .map_err(super::to_runtime_error)?;
+    let mut child = command.spawn().map_err(setup_error)?;
+    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    let result = timeout(Duration::from_secs(20), async {
+        while let Some(line) = lines.next_line().await.map_err(setup_error)? {
+            let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value["type"] == "extension_ui_request" && value["method"] == "notify" {
+                value = serde_json::from_str(value["message"].as_str().unwrap_or(""))
+                    .unwrap_or(Value::Null);
+            }
+            if value["type"] != "xgovernor_probe" {
+                continue;
+            }
+            if value["success"] == true {
+                return Ok(());
+            }
+            // Only our fixed error vocabulary crosses the process boundary.
+            let (code, message) = match value["code"].as_str() {
+                Some("llm_auth") => ("llm_auth", "Model authentication failed"),
+                Some("llm_model") => ("llm_model", "Model not found or unavailable"),
+                Some("llm_timeout") => ("llm_timeout", "Model request timed out"),
+                Some("llm_connection") => ("llm_connection", "Model endpoint connection failed"),
+                Some("llm_config") => ("llm_config", "Invalid model protocol or capabilities"),
+                _ => ("llm_provider", "Model provider request failed"),
+            };
+            return Err(RuntimeError::InvalidRequest {
+                code: code.into(),
+                message: message.into(),
+            });
+        }
+        Err(RuntimeError::InvalidRequest {
+            code: "llm_config".into(),
+            message: "Pi exited without a model probe result".into(),
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(RuntimeError::InvalidRequest {
+            code: "llm_timeout".into(),
+            message: "Pi model probe timed out".into(),
+        })
+    });
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    result
 }

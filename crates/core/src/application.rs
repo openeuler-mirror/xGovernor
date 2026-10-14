@@ -33,6 +33,22 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use xgovernor_manager::InstanceManager;
 
+async fn export_runtime_snapshot(
+    runtime: &dyn AgentRuntime,
+    runtime_id: &str,
+) -> Result<(OpaqueRuntimeState, Option<crate::ResolvedLlm>), SessionDomainError> {
+    let state = runtime
+        .export_state(runtime_id)
+        .await
+        .map_err(map_runtime_error)?;
+    let llm = runtime
+        .describe_llm(runtime_id)
+        .await
+        .map_err(map_runtime_error)?
+        .map(Into::into);
+    Ok((state, llm))
+}
+
 fn map_provider_error(error: provider_protocol::ProviderControlError) -> SessionDomainError {
     match error {
         provider_protocol::ProviderControlError::NotFound { resource_ref } => {
@@ -645,6 +661,9 @@ impl SessionApplication {
             .unwrap_or(&self.default_runtime_kind);
         let registration = self.registration(runtime_kind)?;
         let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .validate_llm_config(request.llm.as_ref())
+            .map_err(map_runtime_error)?;
         let mut normalized = registration.environment.normalize(ctx, &request).await?;
         if let Some(options) = request.deployment.options.get("provider_options") {
             if !options.is_object() {
@@ -791,26 +810,26 @@ impl SessionApplication {
         }
 
         // Reuse the pre-existing runtime-state quarantine slot
-        let runtime_state = match runtime
-            .export_state(&runtime_id)
-            .await
-            .map_err(map_runtime_error)
-        {
-            Ok(state) => state,
-            Err(SessionDomainError::UnsupportedCapability { .. }) => OpaqueRuntimeState {
-                runtime_kind: runtime.runtime_kind().into(),
-                schema_version: 1,
-                state: serde_json::Value::Null,
-            },
-            Err(error) => {
-                let _ = runtime.stop(&runtime_id).await;
-                let _ = manager.stop_instance(&runtime_id).await;
-                if let Some(tenant_id) = &tenant_id_for_quota {
-                    self.release_tenant_session(tenant_id);
+        let (runtime_state, runtime_llm) =
+            match export_runtime_snapshot(runtime.as_ref(), &runtime_id).await {
+                Ok(state) => state,
+                Err(SessionDomainError::UnsupportedCapability { .. }) => (
+                    OpaqueRuntimeState {
+                        runtime_kind: runtime.runtime_kind().into(),
+                        schema_version: 1,
+                        state: serde_json::Value::Null,
+                    },
+                    None,
+                ),
+                Err(error) => {
+                    let _ = runtime.stop(&runtime_id).await;
+                    let _ = manager.stop_instance(&runtime_id).await;
+                    if let Some(tenant_id) = &tenant_id_for_quota {
+                        self.release_tenant_session(tenant_id);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
 
         let record = SessionRecord {
             runtime_id,
@@ -829,7 +848,7 @@ impl SessionApplication {
                     .collect(),
             },
             runtime: runtime_state,
-            llm: normalized.llm,
+            llm: runtime_llm.or(normalized.llm),
             lease: normalized.lease,
             lineage: None,
             last_error: None,
@@ -866,9 +885,12 @@ impl SessionApplication {
         request: SessionTurnRequest,
     ) -> Result<SessionSubmission, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
-        self.ensure_runtime_attached(ctx, &record).await?;
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .validate_llm_config(request.llm.as_ref())
+            .map_err(map_runtime_error)?;
+        self.ensure_runtime_attached(ctx, &record).await?;
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
         if request.llm.is_some()
@@ -989,6 +1011,13 @@ impl SessionApplication {
                             })?;
                         if let Some(state) = state {
                             record.runtime = state;
+                        }
+                        if let Some(llm) = state_runtime
+                            .describe_llm(&event_runtime_id)
+                            .await
+                            .map_err(map_runtime_error)?
+                        {
+                            record.llm = Some(llm.into());
                         }
                         record.status = match &event {
                             RuntimeEvent::Completed { .. } => SessionStatus::Idle,
@@ -1824,6 +1853,8 @@ impl SessionApplication {
                 provider: provider.to_string(),
                 model: model.to_string(),
                 api_base: llm.api_base.clone(),
+                api: llm.api,
+                capabilities: llm.capabilities.clone(),
                 credential_source: llm
                     .api_key
                     .as_deref()
@@ -1855,6 +1886,9 @@ impl SessionApplication {
             })?;
         let registration = self.registration(&checkpoint.runtime_state.runtime_kind)?;
         let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .validate_llm_config(request.llm.as_ref())
+            .map_err(map_runtime_error)?;
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
         if let Some(tenant_id) = &tenant_id_for_quota {
             self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
@@ -1915,21 +1949,18 @@ impl SessionApplication {
             }
             return Err(error);
         }
-        let durable_state = match runtime
-            .export_state(&runtime_id)
-            .await
-            .map_err(map_runtime_error)
-        {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = runtime.stop(&runtime_id).await;
-                let _ = manager.stop_instance(&runtime_id).await;
-                if let Some(id) = &tenant_id_for_quota {
-                    self.release_tenant_session(id);
+        let (durable_state, runtime_llm) =
+            match export_runtime_snapshot(runtime.as_ref(), &runtime_id).await {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = runtime.stop(&runtime_id).await;
+                    let _ = manager.stop_instance(&runtime_id).await;
+                    if let Some(id) = &tenant_id_for_quota {
+                        self.release_tenant_session(id);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let now = self.clock.now_ms();
         let record = SessionRecord {
             runtime_id: runtime_id.clone(),
@@ -1944,7 +1975,7 @@ impl SessionApplication {
             isolation: checkpoint.isolation,
             capabilities: checkpoint.capabilities,
             runtime: durable_state,
-            llm: resolved_llm,
+            llm: runtime_llm.or(resolved_llm),
             lease: None,
             lineage: Some(CheckpointLineage {
                 parent_runtime_id: None,
@@ -2223,21 +2254,18 @@ impl SessionApplication {
         }
 
         let _ = runtime.delete_checkpoint_state(&exported).await;
-        let durable_state = match runtime
-            .export_state(&runtime_id)
-            .await
-            .map_err(map_runtime_error)
-        {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = runtime.stop(&runtime_id).await;
-                let _ = manager.stop_instance(&runtime_id).await;
-                if let Some(id) = &tenant_id_for_quota {
-                    self.release_tenant_session(id);
+        let (durable_state, runtime_llm) =
+            match export_runtime_snapshot(runtime.as_ref(), &runtime_id).await {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = runtime.stop(&runtime_id).await;
+                    let _ = manager.stop_instance(&runtime_id).await;
+                    if let Some(id) = &tenant_id_for_quota {
+                        self.release_tenant_session(id);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let _publication = self.snapshot_publication.lock().await;
         if self
             .records
@@ -2271,7 +2299,7 @@ impl SessionApplication {
             isolation: parent.isolation,
             capabilities: parent.capabilities,
             runtime: durable_state,
-            llm: parent.llm,
+            llm: runtime_llm.or(parent.llm),
             lease: None,
             lineage: Some(CheckpointLineage {
                 parent_runtime_id: Some(request.parent_runtime_id),

@@ -67,6 +67,8 @@ pub fn project_session(record: &SessionRecord) -> SessionOpenResponse {
             provider: llm.provider.clone(),
             model: llm.model.clone(),
             api_base: llm.api_base.clone(),
+            api: llm.api,
+            capabilities: llm.capabilities.clone(),
             credential_source: llm.credential_source.clone(),
         }),
     }

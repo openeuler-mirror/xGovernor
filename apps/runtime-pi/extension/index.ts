@@ -39,28 +39,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-interface XGovernorLlmConfig {
-	provider: string;
-	model: string;
-	apiBase?: string;
-	apiKey?: string;
-}
-
-function decodeLlmConfig(encoded: string): XGovernorLlmConfig {
-	const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
-	const padding = "=".repeat((4 - normalized.length % 4) % 4);
-	const parsed: unknown = JSON.parse(Buffer.from(normalized + padding, "base64").toString("utf8"));
-	if (!parsed || typeof parsed !== "object") throw new Error("LLM configuration must be an object");
-	const value = parsed as Record<string, unknown>;
-	if (typeof value.provider !== "string" || !value.provider.trim()) throw new Error("provider is required");
-	if (typeof value.model !== "string" || !value.model.trim()) throw new Error("model is required");
-	return {
-		provider: value.provider,
-		model: value.model,
-		apiBase: typeof value.apiBase === "string" && value.apiBase ? value.apiBase : undefined,
-		apiKey: typeof value.apiKey === "string" && value.apiKey ? value.apiKey : undefined,
-	};
-}
+import { decodeLlmConfig, launchConfig, registerModel, safeModelError } from "./model-config.ts";
 
 // ---------------------------------------------------------------------------
 // Environment
@@ -569,16 +548,26 @@ function registerGrepTool(pi: ExtensionAPI, client: BridgeClient, workspaceRoot:
 // Extension entry point
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI): void {
+export default async function (pi: ExtensionAPI): Promise<void> {
+    const initialModel = launchConfig();
+    if (initialModel) {
+        // The worker repeats this through the correlated command before Ready.
+        // Keep the command registered even if initial validation fails.
+        try { await registerModel(pi, initialModel, true); } catch { /* surfaced by command */ }
+    }
 	const env = readBridgeEnv();
 	const client = new BridgeClient(env.bridgeUrl, env.bridgeToken);
 	const workspaceRoot = env.workspaceRoot;
     // Only the trusted worker writes this host-side config. It is reloaded at
     // each prompt boundary, allowing init -> step role changes after a fork.
-    type RoleConfig = { system_prompt?: string; max_turns?: number; tools_enabled?: boolean };
+    type RoleConfig = {
+        system_prompt?: string; max_turns?: number; tools_enabled?: boolean;
+        tool_policy?: { allow?: string[] | null; deny?: string[] | null };
+    };
     let role: RoleConfig = {};
     let turns = 0;
     const sandboxTools = ["read", "write", "edit", "bash", "ls", "find", "grep"];
+    let activeTools = new Set<string>();
     pi.on("before_agent_start", async () => {
         const configPath = process.env.XGOVERNOR_PI_ROLE_FILE;
         if (configPath) {
@@ -586,44 +575,31 @@ export default function (pi: ExtensionAPI): void {
         }
         role = configPath ? JSON.parse(readFileSync(configPath, "utf8")) as RoleConfig : {};
         turns = 0;
-        pi.setActiveTools(role.tools_enabled === false ? [] : sandboxTools);
+        const allow = role.tool_policy?.allow ?? sandboxTools;
+        const deny = role.tool_policy?.deny ?? [];
+        for (const name of [...allow, ...deny]) {
+            if (!sandboxTools.includes(name)) throw new Error(`Unknown Pi bridge tool: ${name}`);
+        }
+        activeTools = new Set(role.tools_enabled === false ? [] : allow.filter(name => !deny.includes(name)));
+        pi.setActiveTools([...activeTools]);
         if (role.system_prompt != null) return { systemPrompt: role.system_prompt };
     });
     pi.on("turn_start", async (_event, ctx) => {
         turns += 1;
         if (role.max_turns != null && turns > role.max_turns) await ctx.abort();
     });
-    pi.on("tool_call", async () => {
-        if (role.tools_enabled === false) return { block: true, reason: "Tools disabled for this role" };
+    pi.on("tool_call", async (event) => {
+        if (!activeTools.has(event.toolName)) return { block: true, reason: "Tool disallowed by role policy" };
     });
 
-	// Runtime-neutral model switching endpoint used by xGovernor between
-	// turns. A custom base URL is registered as OpenAI Chat Completions
-	// compatible because the current session wire DTO has no API-kind field.
+	// Model switching shares protocol/capability resolution with startup and
+	// the isolated probe. The worker waits for this command and set_model.
 	pi.registerCommand("xgovernor-model", {
 		description: "Configure the provider/model selected by xGovernor",
 		async handler(args, ctx) {
 			const config = decodeLlmConfig(args.trim());
-			if (config.apiBase) {
-				pi.registerProvider(config.provider, {
-					baseUrl: config.apiBase,
-					apiKey: config.apiKey ?? "xgovernor-keyless",
-					api: "openai-completions",
-					models: [{
-						id: config.model,
-						name: config.model,
-						reasoning: false,
-						input: ["text"],
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-						contextWindow: 128_000,
-						maxTokens: 32_000,
-					}],
-				});
-			} else if (config.apiKey) {
-				// Preserve the built-in provider catalogue/API implementation and
-				// override only this child process's runtime credential.
-				pi.registerProvider(config.provider, { apiKey: config.apiKey });
-			}
+            try { await registerModel(pi, config); }
+            catch (error) { throw new Error(safeModelError(error).message); }
 			const model = ctx.modelRegistry.find(config.provider, config.model);
 			if (!model) throw new Error(`Model not found: ${config.provider}/${config.model}`);
 			// Rust follows this setup command with Pi's native `set_model` RPC.

@@ -12,6 +12,8 @@ struct Record {
     source: String,
     owner: String,
     parent_image: String,
+    #[serde(default = "default_workspace")]
+    workspace_root: String,
     image: Option<String>,
     bytes: u64,
     state: String,
@@ -27,6 +29,9 @@ struct Record {
     retry_count: u32,
     #[serde(default)]
     retry_at_ms: u64,
+}
+fn default_workspace() -> String {
+    WORKSPACE.into()
 }
 fn protocol_version() -> u32 {
     2
@@ -278,6 +283,7 @@ impl DockerProvider {
         r: &Record,
         image: &Value,
     ) -> Result<(), ProviderControlError> {
+        validate_workspace_root(&r.workspace_root)?;
         if r.helper_protocol != 2
             || r.policy_version != 1
             || image["Config"]["Labels"][LABEL] != self.config.deployment
@@ -285,7 +291,7 @@ impl DockerProvider {
             || image["Config"]["Labels"][SNAPSHOT] != r.id
             || r.image.as_ref().is_some_and(|id| image["Id"] != *id)
             || image["Config"]["User"] != "10001:10001"
-            || image["Config"]["WorkingDir"] != WORKSPACE
+            || image["Config"]["WorkingDir"] != r.workspace_root
             || image["Config"]["Volumes"]
                 .as_object()
                 .is_some_and(|v| !v.is_empty())
@@ -300,7 +306,7 @@ impl DockerProvider {
             provider: self.kind.clone(),
             source_instance_id: Some(ProviderInstanceId(r.source.clone())),
             serialized_handle: None,
-            metadata: json!({"image_id":r.image,"base_image_id":r.parent_image,"owner_ref":r.owner,"deployment":self.config.deployment,"helper_protocol":2,"policy_version":1,"filesystem_only":true,"bytes":r.bytes}),
+            metadata: json!({"workspace_root":r.workspace_root,"image_id":r.image,"base_image_id":r.parent_image,"owner_ref":r.owner,"deployment":self.config.deployment,"helper_protocol":2,"policy_version":1,"filesystem_only":true,"bytes":r.bytes}),
             created_at_ms: r.created,
         }
     }
@@ -402,6 +408,7 @@ impl DockerProvider {
                 .unwrap_or("")
                 .into(),
             parent_image: value["Image"].as_str().unwrap().into(),
+            workspace_root: value["Config"]["WorkingDir"].as_str().unwrap().into(),
             image: None,
             bytes: estimate,
             state: "prepared".into(),
@@ -537,8 +544,9 @@ impl DockerProvider {
         if request.backend_id.0 != "docker" {
             return Err(invalid("backend must be docker"));
         }
-        let network_mode =
+        let options =
             Self::validate_request_options(&request.provider_options, &request.resource_limits)?;
+        let network_mode = options.network_mode;
         let _snapshots = self.snapshot_lock.lock().await;
         match request.source {
             ProviderLoadSource::Instance(id) => {
@@ -548,6 +556,7 @@ impl DockerProvider {
                 }
                 self.validate_container(&value, None)?;
                 super::validate_requested_network_mode(&value, network_mode)?;
+                validate_requested_workspace(&value, options.workspace_root())?;
                 let control = self.control(&id.0)?;
                 let _gate = control.gate.lock().await;
                 if control.state()? != "paused" {
@@ -565,6 +574,11 @@ impl DockerProvider {
                 }
                 if r.owner != request.owner_ref {
                     return Err(invalid("snapshot owner mismatch"));
+                }
+                if options.workspace_root() != r.workspace_root {
+                    return Err(invalid(
+                        "snapshot workspace differs from requested Docker workspace_root",
+                    ));
                 }
                 let image = r
                     .image
@@ -805,6 +819,7 @@ mod tests {
             request: id.into(),
             source: "container".into(),
             owner: "admin".into(),
+            workspace_root: WORKSPACE.into(),
             parent_image: "base".into(),
             image: Some(image.into()),
             bytes: 100,
@@ -866,6 +881,20 @@ mod tests {
             bad["Config"][field] = value;
             assert!(p.validate_snapshot_image(&r, &bad).is_err());
         }
+        let mut custom = r.clone();
+        custom.workspace_root = "/testbed".into();
+        assert!(p.validate_snapshot_image(&custom, &image).is_err());
+        let mut custom_image = image.clone();
+        custom_image["Config"]["WorkingDir"] = json!("/testbed");
+        assert!(p.validate_snapshot_image(&custom, &custom_image).is_ok());
+        let mut legacy = serde_json::to_value(&r).unwrap();
+        legacy.as_object_mut().unwrap().remove("workspace_root");
+        assert_eq!(
+            serde_json::from_value::<Record>(legacy)
+                .unwrap()
+                .workspace_root,
+            "/workspace"
+        );
         let mut bad = r.clone();
         bad.policy_version = 99;
         assert!(p.validate_snapshot_image(&bad, &image).is_err());

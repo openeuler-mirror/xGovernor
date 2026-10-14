@@ -11,20 +11,34 @@ test("role changes replace system prompt, disable selector tools and bound model
     const keys=["XGOVERNOR_BRIDGE_URL","XGOVERNOR_BRIDGE_TOKEN","XGOVERNOR_WORKSPACE_ROOT","XGOVERNOR_PI_ROLE_FILE"];
     const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
     Object.assign(process.env,{XGOVERNOR_BRIDGE_URL:"http://127.0.0.1:1",XGOVERNOR_BRIDGE_TOKEN:"test",XGOVERNOR_WORKSPACE_ROOT:dir,XGOVERNOR_PI_ROLE_FILE:config});
+    writeFileSync(join(dir,"xgovernor-turn.json"),JSON.stringify({turn_id:"test-turn"}));
     try {
         const handlers=new Map();let active=[];let aborts=0;
-        extension({on:(name,fn)=>handlers.set(name,fn),registerCommand:()=>{},registerTool:()=>{},setActiveTools:names=>{active=names;}});
+        await extension({on:(name,fn)=>handlers.set(name,fn),registerCommand:()=>{},registerTool:()=>{},setActiveTools:names=>{active=names;}});
         writeFileSync(config,JSON.stringify({system_prompt:"selector",tools_enabled:false,max_turns:2}));
         assert.deepEqual(await handlers.get("before_agent_start")(),{systemPrompt:"selector"});
         assert.deepEqual(active,[]);
-        assert.equal((await handlers.get("tool_call")()).block,true);
+        assert.equal((await handlers.get("tool_call")({toolName:"read"})).block,true);
         const ctx={abort:()=>{aborts++;}};
         await handlers.get("turn_start")({},ctx);await handlers.get("turn_start")({},ctx);assert.equal(aborts,0);
         await handlers.get("turn_start")({},ctx);assert.equal(aborts,1);
         writeFileSync(config,JSON.stringify({system_prompt:"solver-step",tools_enabled:true,max_turns:3}));
         assert.deepEqual(await handlers.get("before_agent_start")(),{systemPrompt:"solver-step"});
-        assert.deepEqual(active,["read","write","edit","bash","find","grep"]);
-        assert.equal(await handlers.get("tool_call")(),undefined);
+        assert.deepEqual(active,["read","write","edit","bash","ls","find","grep"]);
+        assert.equal(await handlers.get("tool_call")({toolName:"read"}),undefined);
         await handlers.get("turn_start")({},ctx);assert.equal(aborts,1,"counter resets at prompt boundary");
+        for (const [tool_policy, expected] of [
+            [{allow:["read","read","grep"],deny:["grep"]},["read"]],
+            [{allow:[]},[]],
+            [{deny:["bash","write","edit"]},["read","ls","find","grep"]],
+        ]) {
+            writeFileSync(config,JSON.stringify({tool_policy}));
+            await handlers.get("before_agent_start")();
+            assert.deepEqual(active,expected);
+            assert.equal((await handlers.get("tool_call")({toolName:"bash"})).block,true);
+            assert.equal((await handlers.get("tool_call")({toolName:"external_tool"})).block,true);
+        }
+        writeFileSync(config,JSON.stringify({tool_policy:{allow:["unknown"]}}));
+        await assert.rejects(handlers.get("before_agent_start")(), /Unknown Pi bridge tool/);
     } finally { for (const key of keys) {if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}rmSync(dir,{recursive:true,force:true}); }
 });
