@@ -676,6 +676,15 @@ impl SessionApplication {
             }
             normalized.isolation.metadata["provider_options"] = options.clone();
         }
+        if request.deployment.resource_class.is_some() {
+            // The field is part of the request schema and travels through serde, but
+            // nothing selects a resource class from it yet. Saying so keeps a client
+            // that fills it in from believing the choice took effect.
+            tracing::warn!(
+                "deployment.resource_class is set but no code reads it yet; \
+                 the value currently has no effect"
+            );
+        }
 
         // Fail-closed second gate (`docs/tenancy_design.md` §0/§7 step 2):
         // deliberately independent of whatever `self.environment.normalize`
