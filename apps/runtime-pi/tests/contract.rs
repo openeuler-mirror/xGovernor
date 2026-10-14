@@ -123,7 +123,10 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
     assert_eq!(flag_value("--api-key"), None);
     assert!(!launch_args.iter().any(|arg| arg == "open-key"));
 
-    let commands: Vec<Value> = std::fs::read_to_string(session_dir.join("fake_pi_commands.jsonl"))
+    let commands: Vec<Value> = std::fs::read_to_string(session_dir
+        .parent()
+        .expect("the session dir has a parent")
+        .join("fake_pi_commands.jsonl"))
         .expect("command log")
         .lines()
         .map(|line| serde_json::from_str(line).expect("command JSON"))
