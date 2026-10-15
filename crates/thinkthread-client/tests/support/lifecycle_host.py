@@ -10,11 +10,14 @@ starts = 0
 stops = 0
 state_file = os.environ.get("XG_TEST_STATE")
 if scenario.startswith("owner") and state_file and os.path.exists(state_file):
-    with open(state_file) as source: state = json.load(source)["state"]
+    with open(state_file) as source:
+        stored = json.load(source)
+        state = stored["state"]
+        messages = stored.get("messages", {})
 
 def view():
     return {"thinkthreadId": root, "rootId": root, "state": state,
-            "sessionState": "Ready", "agent": "fixture", "fs": os.environ.get("XG_TEST_FS", "/fixture"),
+            "sessionState": "Processing" if scenario == "owner-message-not-ready" else "Ready", "agent": "fixture", "fs": os.environ.get("XG_TEST_FS", "/fixture"),
             "contentRevision": "1", "needsRecovery": scenario == "needs-recovery"}
 
 def handle(params):
@@ -52,6 +55,11 @@ while True:
     elif method == "operation.get" and scenario.startswith("owner"):
         with open(trace) as source:
             original = next(json.loads(line) for line in source if json.loads(line)["params"].get("operationId") == params["operationId"])
+        if original["method"] == "message.send":
+            admitted = next(v[0] for v in messages.values() if v[0]["text"] == original["params"]["text"])
+            result = {"operation": handle(original["params"]), "method": "message.send", "state": "failed" if scenario in ("owner-message-partial", "owner-message-unproven") else "succeeded",
+                      "acceptedAt": "2026-01-01T00:00:00Z", "result": {} if scenario == "owner-message-unproven" else {"message": admitted}}
+            reply(req,result);continue
         failed = scenario == "owner-start-reject" and original["method"] == "thinkthread.start"
         result = {"operation": handle(original["params"]), "method": original["method"], "state": "failed" if failed else "succeeded",
                   "acceptedAt": "2026-01-01T00:00:00Z", "result": {"thinkthreadId": root, "changed": True}}
@@ -70,7 +78,7 @@ while True:
         result = {"operation": handle(params), "thinkthreadId": root, "changed": starts == 1}
     elif method == "message.send":
         mid = "message-1" if scenario == "duplicate-message" else "message-" + str(len(messages) + 1)
-        marker = params["text"].split("exactly ", 1)[1].split(".", 1)[0]
+        marker = params["text"].split("exactly ", 1)[1].split(".", 1)[0] if "exactly " in params["text"] else "complete reply"
         msg = {"messageId": mid, "recipientThinkthreadId": root,
                "text": params["text"], "truncated": False, "state": "queued",
                "replyTruncated": False, "createdAtUnixMs": "1"}
@@ -79,6 +87,12 @@ while True:
     elif method in ("message.wait", "message.get"):
         msg, marker = messages[params["messageId"]]
         result = {**msg, "state": "completed", "replyText": marker, "completedAtUnixMs": "2"}
+        if scenario == "owner-message-eof":sys.exit(0)
+        if scenario == "owner-message-failed":result["state"] = "failed"
+        if scenario == "owner-message-truncated":result["replyTruncated"] = True
+        if scenario == "owner-message-silent":
+            with open(trace) as source: waits = sum(json.loads(line)["method"] == "message.wait" for line in source)
+            result["state"] = ("delivering", "awaiting_reply", "queued")[waits % 3]
         if scenario == "queued-timeout": result["state"] = "queued"
         if scenario == "truncated": result["replyTruncated"] = True
         if scenario == "foreign-terminal": result["recipientThinkthreadId"] = "foreign-root"
@@ -106,5 +120,6 @@ while True:
         if scenario == "not-absent" and params["target"] == "absent": result = {"reached": False, "thinkthreads": [view()]}
     else: sys.exit(2)
     if scenario.startswith("owner") and state_file:
-        with open(state_file,"w") as sink: json.dump({"state":state},sink)
+        with open(state_file,"w") as sink: json.dump({"state":state,"messages":messages},sink)
+    if scenario in ("owner-message-drop", "owner-message-partial", "owner-message-unproven") and method == "message.send":sys.exit(0)
     reply(req, result)

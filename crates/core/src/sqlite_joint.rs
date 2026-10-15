@@ -69,6 +69,10 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
           id TEXT PRIMARY KEY, request_json TEXT NOT NULL, admission_json TEXT NOT NULL,
           binding_id TEXT NOT NULL REFERENCES joint_bindings(id), tenant_key TEXT NOT NULL,
           stage TEXT NOT NULL, publication_json TEXT);
+        CREATE TABLE IF NOT EXISTS joint_turns (
+          runtime_id TEXT NOT NULL, turn_id TEXT NOT NULL, client_request_id TEXT,
+          input_digest TEXT NOT NULL, intent_id TEXT NOT NULL UNIQUE REFERENCES joint_operations(id),
+          terminal_json TEXT, PRIMARY KEY(runtime_id,turn_id), UNIQUE(runtime_id,client_request_id));
         CREATE TABLE IF NOT EXISTS joint_reservations (
           intent_id TEXT NOT NULL REFERENCES joint_operations(id), kind TEXT NOT NULL,
           units INTEGER NOT NULL CHECK(units>0), state TEXT NOT NULL,
@@ -148,8 +152,15 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
     .all(|v| nonempty(v))
         || c.owner_ref != tenant_key(c.tenant_id.as_deref())
         || c.configuration_revision != request.binding.configuration_revision
-        || !["open", "load", "checkpoint", "close", "delete_checkpoint"]
-            .contains(&c.operation.as_str())
+        || ![
+            "open",
+            "load",
+            "checkpoint",
+            "close",
+            "delete_checkpoint",
+            "turn",
+        ]
+        .contains(&c.operation.as_str())
         || (c.actor_role == crate::Role::Tenant && c.tenant_id.is_none())
         || request.native.is_empty()
     {
@@ -159,7 +170,7 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
         "open" => (c.target_runtime_id.as_deref(), Some("session"), false),
         "load" => (c.checkpoint_id.as_deref(), Some("session"), true),
         "checkpoint" => (c.source_runtime_id.as_deref(), Some("checkpoint"), true),
-        "close" => (c.source_runtime_id.as_deref(), None, false),
+        "close" | "turn" => (c.source_runtime_id.as_deref(), None, false),
         "delete_checkpoint" => (c.checkpoint_id.as_deref(), None, false),
         _ => unreachable!(),
     };
@@ -181,7 +192,7 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
         && !c.target_runtime_id.as_deref().is_some_and(nonempty)
         || ["checkpoint", "load", "delete_checkpoint"].contains(&c.operation.as_str())
             && !c.checkpoint_id.as_deref().is_some_and(nonempty)
-        || ["checkpoint", "close"].contains(&c.operation.as_str())
+        || ["checkpoint", "close", "turn"].contains(&c.operation.as_str())
             && !c.source_runtime_id.as_deref().is_some_and(nonempty)
     {
         return Err(conflict("incomplete joint public identity"));
@@ -203,6 +214,20 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
         {
             return Err(conflict("invalid durable publication input"));
         }
+    }
+    match (&request.turn, c.operation.as_str()) {
+        (Some(turn), "turn")
+            if nonempty(&turn.turn_id)
+                && turn.client_request_id.as_deref().is_none_or(nonempty)
+                && turn.input_digest.len() == 64
+                && turn.input_digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && !request.exclusive_root
+                && request.publication_input.is_none()
+                && request.native.len() == 1
+                && request.native[0].method == "message.send"
+                && request.native[0].effect == NativeEffect::Mutate => {}
+        (None, operation) if operation != "turn" => {}
+        _ => return Err(conflict("invalid durable turn admission")),
     }
     let mut kinds = BTreeSet::new();
     for reservation in &request.reservations {
@@ -381,17 +406,19 @@ impl SqliteSessionRepository {
                 [&binding.binding_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,u64>(5)?,r.get::<_,String>(6)?))).optional()? {
                 if owner!=binding.owner_kind || revision!=binding.configuration_revision || runtime!=request.context.runtime_kind
                     || stored_tenant!=tenant || root!=request.root_id || generation!=1 || state!="active"
-                    || !["close","delete_checkpoint"].contains(&request.context.operation.as_str()) {
+                    || !["close","delete_checkpoint","turn"].contains(&request.context.operation.as_str()) {
                     return Err(conflict("joint binding ownership or stage conflict"));
                 }
-                let (kind,public_id)=if request.context.operation=="close" {("session",request.context.source_runtime_id.as_deref())}
+                let (kind,public_id)=if ["close","turn"].contains(&request.context.operation.as_str()) {("session",request.context.source_runtime_id.as_deref())}
                     else {("checkpoint",request.context.checkpoint_id.as_deref())};
                 let owned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_refs WHERE kind=?1 AND public_id=?2 AND binding_id=?3)",
                     params![kind,public_id,binding.binding_id],|r|r.get(0))?;
                 if !owned {return Err(conflict("joint release does not own public reference"));}
                 let count:i64=tx.query_row("SELECT count(*) FROM joint_refs WHERE binding_id=?1",[&binding.binding_id],|r|r.get(0))?;
                 if count>1 {return Err(conflict("joint binding is referenced"));}
-                tx.execute("UPDATE joint_bindings SET state='releasing' WHERE id=?1",[&binding.binding_id])?;
+                if request.context.operation!="turn" {
+                    tx.execute("UPDATE joint_bindings SET state='releasing' WHERE id=?1",[&binding.binding_id])?;
+                }
             } else {
                 if !["open","load","checkpoint"].contains(&request.context.operation.as_str()) || request.reservations.is_empty() {return Err(conflict("new joint binding requires reservation"));}
                 if let Some(parent)=&request.parent_binding {
@@ -439,6 +466,16 @@ impl SqliteSessionRepository {
             };
             let admission=JointAdmission{intent_id:id.clone(),binding:binding.clone(),generation:1,root_epoch,source_epoch};
             tx.execute("INSERT INTO joint_operations VALUES(?1,?2,?3,?4,?5,'prepared',NULL)",params![id,encoded,encode(&admission)?,binding.binding_id,tenant])?;
+            if let Some(turn)=&request.turn {
+                tx.execute("INSERT INTO joint_turns VALUES(?1,?2,?3,?4,?5,NULL)",
+                    params![request.source_id,turn.turn_id,turn.client_request_id,turn.input_digest,id])?;
+                let body:String=tx.query_row("SELECT body FROM joint_sessions WHERE runtime_id=?1 AND binding_id=?2",
+                    params![request.source_id,binding.binding_id],|r|r.get(0))?;
+                let mut record:SessionRecord=decode(&body)?;
+                if !matches!(record.status,SessionStatus::Idle|SessionStatus::Failed) {return Err(conflict("Session is not available for a turn"));}
+                record.status=SessionStatus::Running;
+                tx.execute("UPDATE joint_sessions SET status='running',body=?1 WHERE runtime_id=?2",params![encode(&record)?,request.source_id])?;
+            }
             for reservation in &request.reservations {
                 let mut used:u64=tx.query_row("SELECT coalesce(sum(r.units),0) FROM joint_reservations r JOIN joint_operations o ON o.id=r.intent_id WHERE o.tenant_key=?1 AND r.kind=?2 AND r.state!='released'",
                     params![tenant,reservation.kind],|r|r.get(0))?;
@@ -463,6 +500,87 @@ impl SqliteSessionRepository {
                 tx.execute("INSERT INTO joint_native_steps VALUES(?1,?2,?3,?4,?5,NULL)",params![id,native.step,native.operation_id,native.digest,encode(native)?])?;
             }
             Ok(admission)
+        }).await
+    }
+
+    pub async fn get_joint_turn(
+        &self,
+        runtime_id: String,
+        client_request_id: String,
+    ) -> std::result::Result<Option<JointTurnRecord>, SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            let row:Option<(String,String,Option<String>)>=tx.query_row(
+                "SELECT o.request_json,o.admission_json,t.terminal_json FROM joint_turns t JOIN joint_operations o ON o.id=t.intent_id WHERE t.runtime_id=?1 AND t.client_request_id=?2",
+                params![runtime_id,client_request_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            row.map(|(request,admission,terminal)| {
+                let request:JointPrepareRequest=decode(&request)?;
+                Ok(JointTurnRecord {runtime_id,identity:request.turn.ok_or_else(||conflict("missing turn identity"))?,
+                    admission:decode(&admission)?,terminal:terminal.as_deref().map(decode).transpose()?})
+            }).transpose()
+        }).await
+    }
+
+    pub async fn joint_turn_result(
+        &self,
+        admission: JointAdmission,
+    ) -> std::result::Result<Option<JointTurnTerminal>, SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            let (request, stage, _) = operation(tx, &admission)?;
+            if request.context.operation != "turn" {
+                return Err(conflict("not a turn"));
+            }
+            if stage != "settled" {
+                return Ok(None);
+            }
+            let terminal: String = tx.query_row(
+                "SELECT terminal_json FROM joint_turns WHERE intent_id=?1",
+                [&admission.intent_id],
+                |r| r.get(0),
+            )?;
+            Ok(Some(decode(&terminal)?))
+        })
+        .await
+    }
+
+    /// Publishes a settled turn and releases its source fence in the same transaction.
+    pub async fn finish_joint_turn(
+        &self,
+        admission: JointAdmission,
+        terminal: JointTurnTerminal,
+    ) -> std::result::Result<(), SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation!="turn" || request.turn.is_none() {
+                return Err(conflict("operation is not a turn"));
+            }
+            let old:Option<String>=tx.query_row("SELECT terminal_json FROM joint_turns WHERE intent_id=?1",[&admission.intent_id],|r|r.get(0))?;
+            if stage=="settled" {
+                let old:JointTurnTerminal=decode(old.as_deref().ok_or_else(||conflict("settled turn missing terminal"))?)?;
+                let mut replay=terminal.clone();replay.completed_at_ms=old.completed_at_ms;
+                return if replay==old {Ok(())} else {Err(conflict("turn terminal changed"))};
+            }
+            check_fences(tx,&request,&admission)?;
+            settled_native(tx,&admission.intent_id)?;
+            let native=&request.native[0];
+            let raw:String=tx.query_row("SELECT outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2 AND operation_id=?3 AND digest=?4",
+                params![admission.intent_id,native.step,native.operation_id,native.digest],|r|r.get(0))?;
+            let outcome:JointNativeOutcome=decode(&raw)?;
+            if terminal.reply.is_some()==terminal.failure.is_some()
+                || (terminal.message_id.is_some() && !outcome.resources.iter().any(|o|o.kind=="message" && Some(&o.id)==terminal.message_id.as_ref()))
+                || (terminal.message_id.is_none() && (outcome.state!=NativeOperationState::NotSent || terminal.failure.is_none())) {
+                return Err(conflict("terminal does not match native Message admission"));
+            }
+            let body:String=tx.query_row("SELECT s.body FROM joint_sessions s JOIN joint_bindings b ON b.id=s.binding_id WHERE s.runtime_id=?1 AND s.binding_id=?2 AND b.generation=?3 AND b.state='active'",
+                params![request.source_id,admission.binding.binding_id,admission.generation],|r|r.get(0))?;
+            let mut record:SessionRecord=decode(&body)?;
+            record.status=if terminal.failure.is_some(){SessionStatus::Failed}else{SessionStatus::Idle};
+            record.last_error=terminal.failure.clone();record.updated_at_ms=terminal.completed_at_ms;
+            tx.execute("UPDATE joint_sessions SET status=?1,updated_at_ms=?2,body=?3 WHERE runtime_id=?4",
+                params![if terminal.failure.is_some(){"failed"}else{"idle"},record.updated_at_ms,encode(&record)?,request.source_id])?;
+            tx.execute("UPDATE joint_turns SET terminal_json=?1 WHERE intent_id=?2",params![encode(&terminal)?,admission.intent_id])?;
+            tx.execute("UPDATE joint_operations SET stage='settled' WHERE id=?1",[&admission.intent_id])?;
+            release_fences(tx,&admission.intent_id)?;
+            Ok(())
         }).await
     }
 
@@ -833,7 +951,7 @@ impl SqliteSessionRepository {
         &self,
     ) -> std::result::Result<Vec<JointPendingOperation>, SessionDomainError> {
         self.joint_transaction(|tx| {
-            let rows=tx.prepare("SELECT id,request_json,admission_json,stage FROM joint_operations WHERE stage NOT IN ('published','released','compensated') ORDER BY id")?
+            let rows=tx.prepare("SELECT id,request_json,admission_json,stage FROM joint_operations WHERE stage NOT IN ('published','released','compensated','settled') ORDER BY id")?
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter().map(|(id,request,admission,stage)| {
                 let native=tx.prepare("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 ORDER BY step")?

@@ -72,6 +72,8 @@ pub struct JointPrepareRequest {
     pub native: Vec<JointNativeIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_input: Option<SessionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<JointTurnIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,4 +115,33 @@ pub struct JointBindingState {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Public correlation retained before the first native Message admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointTurnIdentity {
+    pub turn_id: String,
+    pub client_request_id: Option<String>,
+    pub input_digest: String,
+}
+
+/// A complete native terminal, observed together with a quiescent owned Session.
+/// Metering is intentionally absent; a Message reply does not establish token usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointTurnTerminal {
+    pub message_id: Option<String>,
+    pub reply: Option<String>,
+    pub failure: Option<String>,
+    pub completed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointTurnRecord {
+    pub runtime_id: String,
+    pub identity: JointTurnIdentity,
+    pub admission: JointAdmission,
+    pub terminal: Option<JointTurnTerminal>,
 }

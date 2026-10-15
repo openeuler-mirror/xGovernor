@@ -89,6 +89,7 @@ fn request(
         });
     }
     JointPrepareRequest {
+        turn: None,
         context: JointOperationContext {
             intent_id: id.into(),
             operation: operation.into(),

@@ -271,7 +271,7 @@ fn every_terminal_event_has_an_explicit_sse_name() {
             retryable: false,
             details: serde_json::Value::Null,
         },
-        usage: session_protocol::SessionUsage::default(),
+        usage: session_protocol::SessionUsage::default().into(),
     };
     assert_eq!(session_event_name(&failed), "turn_failed");
 }
@@ -1135,7 +1135,7 @@ async fn failed_close_preserves_streams(
             runtime_id: "runtime-1".into(),
             turn_id: "turn-owner".into(),
             outcome: session_protocol::SessionTurnOutcome::Complete,
-            usage: session_protocol::SessionUsage::default(),
+            usage: session_protocol::SessionUsage::default().into(),
         })
         .await
         .unwrap();

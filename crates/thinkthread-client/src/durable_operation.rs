@@ -60,6 +60,7 @@ impl<'a> DurableManagementOperation<'a> {
             "thinkthread.start",
             "thinkthread.stop",
             "thinkthread.remove",
+            "message.send",
         ]
         .contains(&native.method.as_str())
         {
@@ -115,6 +116,30 @@ impl<'a> DurableManagementOperation<'a> {
                 {
                     return Err(DurableOperationError::Identity(
                         "start target is not owned by this binding",
+                    ));
+                }
+            }
+            "message.send" => {
+                let req: sdk::MessageSendRequest = decode(native.params.clone())?;
+                let binding = self
+                    .repository
+                    .get_joint_binding(admission.binding.clone())
+                    .await?
+                    .ok_or(DurableOperationError::Identity("Message binding missing"))?;
+                if pending.request.context.operation != "turn"
+                    || native.effect != NativeEffect::Mutate
+                    || native.compensation
+                    || binding.stage != "active"
+                    || serde_json::to_value(&req)
+                        .map_err(|_| DurableOperationError::Identity("Message encoding"))?
+                        != native.params
+                    || !binding
+                        .objects
+                        .iter()
+                        .any(|o| o.kind == "root" && o.id == req.recipient_thinkthread_id)
+                {
+                    return Err(DurableOperationError::Identity(
+                        "Message target is not owned",
                     ));
                 }
             }
@@ -226,6 +251,12 @@ impl<'a> DurableManagementOperation<'a> {
                 .stop_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
                 .await
                 .map(|r| (r.operation, json!({"targets":r.targets}))),
+            "message.send" => self
+                .client
+                .messages()
+                .send_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
+                .await
+                .map(|r| (r.operation, json!({"message":r.message}))),
             "thinkthread.remove" => self
                 .client
                 .thinkthreads()
@@ -345,6 +376,42 @@ impl<'a> DurableManagementOperation<'a> {
                     "completed batch has no result",
                 ));
             }
+        }
+        if native.method == "message.send" {
+            let mut resources = vec![];
+            if let Some(raw) = result.as_ref().and_then(|r| r.get("message")) {
+                let message: sdk::MessageView = decode(raw.clone())?;
+                if message.message_id.trim().is_empty()
+                    || native.params["recipientThinkthreadId"] != message.recipient_thinkthread_id
+                    || native.params["text"] != message.text
+                    || message.truncated
+                {
+                    return Err(DurableOperationError::Identity("Message admission changed"));
+                }
+                resources.push(JointNativeObject {
+                    kind: "message".into(),
+                    id: message.message_id,
+                });
+            } else if state == NativeOperationState::Completed {
+                return Err(DurableOperationError::Identity(
+                    "Message result lacks admission",
+                ));
+            }
+            let outcome = JointNativeOutcome {
+                state,
+                resources,
+                payload: json!({"result":result}),
+            };
+            self.repository
+                .record_joint_native_result(
+                    admission,
+                    native.step.clone(),
+                    native.operation_id.clone(),
+                    native.digest.clone(),
+                    outcome.clone(),
+                )
+                .await?;
+            return Ok(outcome);
         }
         let id = result
             .as_ref()

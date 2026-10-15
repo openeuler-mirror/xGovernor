@@ -8,6 +8,7 @@ rust-version = "1.89"
 [dependencies]
 async-trait.workspace = true
 uuid.workspace = true
+session-protocol = { path = "../protocol/session" }
 xgovernor-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true

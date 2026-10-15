@@ -285,6 +285,26 @@ impl SessionRepository for SqliteSessionRepository {
     ) -> Result<crate::JointAdmission, SessionDomainError> {
         SqliteSessionRepository::prepare_joint_operation(self, request).await
     }
+    async fn get_joint_turn(
+        &self,
+        runtime_id: String,
+        client_request_id: String,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        SqliteSessionRepository::get_joint_turn(self, runtime_id, client_request_id).await
+    }
+    async fn joint_turn_result(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointTurnTerminal>, SessionDomainError> {
+        SqliteSessionRepository::joint_turn_result(self, admission).await
+    }
+    async fn finish_joint_turn(
+        &self,
+        admission: crate::JointAdmission,
+        terminal: crate::JointTurnTerminal,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_turn(self, admission, terminal).await
+    }
     async fn begin_joint_compensation(
         &self,
         admission: crate::JointAdmission,

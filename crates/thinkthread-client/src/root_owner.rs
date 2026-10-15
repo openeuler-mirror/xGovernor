@@ -16,12 +16,12 @@ pub const ROOT_RUNTIME_KIND: &str = "thinkthread-root";
 
 #[derive(Clone)]
 pub struct RootSessionOwner {
-    config: ManagementConfig,
+    pub(crate) config: ManagementConfig,
     create: sdk::ThinkThreadCreateRequest,
-    revision: String,
+    pub(crate) revision: String,
     session_limit: u32,
     root_limit: u32,
-    timeout_ms: u64,
+    pub(crate) timeout_ms: u64,
 }
 impl RootSessionOwner {
     pub fn new(
@@ -100,7 +100,7 @@ impl RootSessionOwner {
         }
         Ok(record)
     }
-    async fn connect(&self) -> Result<sdk::ThinkThreadClient, SessionDomainError> {
+    pub(crate) async fn connect(&self) -> Result<sdk::ThinkThreadClient, SessionDomainError> {
         self.config
             .connect()
             .await
@@ -161,7 +161,7 @@ impl RootSessionOwner {
             )
             .await
     }
-    fn validate_view(
+    pub(crate) fn validate_view(
         &self,
         id: &str,
         v: &sdk::ThinkThreadView,
@@ -465,7 +465,7 @@ impl RootSessionOwner {
         Ok(())
     }
 
-    async fn bound_root(
+    pub(crate) async fn bound_root(
         &self,
         record: &SessionRecord,
         repository: Arc<dyn SessionRepository>,
@@ -481,7 +481,17 @@ impl RootSessionOwner {
         self.validate_context(&state.creation.context)?;
         if binding.owner_kind != ROOT_OWNER_KIND
             || state.stage != "active"
-            || state.creation.publication_input.as_ref() != Some(record)
+            || state
+                .creation
+                .publication_input
+                .as_ref()
+                .is_none_or(|original| {
+                    let mut expected = original.clone();
+                    expected.status = record.status;
+                    expected.updated_at_ms = record.updated_at_ms;
+                    expected.last_error = record.last_error.clone();
+                    expected != *record
+                })
             || repository.get(&record.runtime_id).await?.as_ref() != Some(record)
             || state.objects.len() != 1
             || state.objects[0].kind != "root"
@@ -604,6 +614,7 @@ impl JointSessionLifecycle for RootSessionOwner {
                 .await
                 .map_err(|_| unavailable("Management preflight close failed"))?;
             let request = JointPrepareRequest {
+                turn: None,
                 context,
                 binding: binding.clone(),
                 root_id: format!("root-owner-{}", binding.binding_id),
@@ -636,11 +647,57 @@ impl JointSessionLifecycle for RootSessionOwner {
         self.resume(pending, repository).await
     }
 
+    async fn submit_turn(
+        &self,
+        context: JointOperationContext,
+        session: SessionRecord,
+        request: session_protocol::SessionTurnRequest,
+        turn_id: String,
+        repository: Arc<dyn SessionRepository>,
+    ) -> Result<JointTurnSubmission, SessionDomainError> {
+        let admitted = self
+            .admit_message(
+                context,
+                session,
+                request,
+                turn_id.clone(),
+                repository.clone(),
+            )
+            .await?;
+        if admitted.identity.turn_id != turn_id {
+            return Ok(JointTurnSubmission {
+                turn_id: admitted.identity.turn_id,
+                terminal: None,
+            });
+        }
+        let owner = self.clone();
+        Ok(JointTurnSubmission {
+            turn_id,
+            terminal: Some(Box::pin(async move {
+                let pending = repository
+                    .pending_joint_operations()
+                    .await?
+                    .into_iter()
+                    .find(|p| p.admission == admitted.admission);
+                match pending {
+                    Some(pending) => owner.resume_message(pending, repository).await,
+                    None => repository
+                        .joint_turn_result(admitted.admission)
+                        .await?
+                        .ok_or_else(|| unavailable("Message intent missing")),
+                }
+            })),
+        })
+    }
     async fn reconcile(
         &self,
         pending: JointPendingOperation,
         repository: Arc<dyn SessionRepository>,
     ) -> Result<(), SessionDomainError> {
+        if pending.request.context.operation == "turn" {
+            self.resume_message(pending, repository).await?;
+            return Ok(());
+        }
         if pending.stage == "compensating"
             || pending.native.iter().any(|(n, o)| {
                 n.step.starts_with("compensate_")

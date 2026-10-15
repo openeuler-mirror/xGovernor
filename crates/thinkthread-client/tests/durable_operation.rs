@@ -68,6 +68,7 @@ async fn lost_create_response_recovers_original_uuid_without_a_second_mutation()
         compensation: false,
     };
     let request = JointPrepareRequest {
+        turn: None,
         context: JointOperationContext {
             intent_id: "opening".into(),
             operation: "open".into(),

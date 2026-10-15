@@ -174,7 +174,7 @@ fn project_runtime_event(runtime_id: &str, turn_id: &str, event: RuntimeEvent) -
             runtime_id: runtime_id.into(),
             turn_id: turn_id.into(),
             outcome,
-            usage,
+            usage: usage.into(),
         },
         RuntimeEvent::Failed { error, usage } => SessionEvent::TurnFailed {
             runtime_id: runtime_id.into(),
@@ -185,7 +185,7 @@ fn project_runtime_event(runtime_id: &str, turn_id: &str, event: RuntimeEvent) -
                 retryable: error.retryable,
                 details: error.details,
             },
-            usage,
+            usage: usage.into(),
         },
         RuntimeEvent::Extension { namespace, payload } => SessionEvent::Extension {
             runtime_id: runtime_id.into(),
@@ -717,7 +717,8 @@ impl SessionApplication {
             // `idle` restoration fallback (§1.3); mirror it onto this local
             // copy so the response the caller sees matches what was saved
             // rather than the pre-restoration snapshot fetched above.
-            if record.status == SessionStatus::Running {
+            if record.status == SessionStatus::Running && record.execution_backing.joint().is_none()
+            {
                 record.status = SessionStatus::Idle;
             }
             return Ok(project_session(&record));
@@ -1031,7 +1032,9 @@ impl SessionApplication {
         request: SessionTurnRequest,
     ) -> Result<SessionSubmission, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
-        Self::reject_joint_resource(&record, "submit_turn_impl")?;
+        if record.execution_backing.joint().is_some() {
+            return self.submit_joint_turn(ctx, record, request).await;
+        }
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
         runtime
@@ -1234,7 +1237,7 @@ impl SessionApplication {
                             retryable: true,
                             details: serde_json::Value::Null,
                         },
-                        usage: session_protocol::SessionUsage::default(),
+                        usage: session_protocol::SessionUsage::default().into(),
                     }),
                 )
                 .await;
@@ -1249,6 +1252,105 @@ impl SessionApplication {
                 turn_id,
                 accepted_kind: session_protocol::SessionAcceptedInputKind::Turn,
             },
+            events: Some(rx),
+        })
+    }
+
+    async fn submit_joint_turn(
+        &self,
+        ctx: &SecurityContext,
+        record: SessionRecord,
+        request: SessionTurnRequest,
+    ) -> Result<SessionSubmission, SessionDomainError> {
+        self.check_lease_holder(&record.runtime_id, &request.lease)
+            .await?;
+        let owner = self.joint_owner(
+            &record.runtime.runtime_kind,
+            record.execution_backing.joint().unwrap(),
+        )?;
+        let context = self.joint_context(ctx, &record, "turn", None, None);
+        let submitted = owner
+            .submit_turn(
+                context,
+                record.clone(),
+                request,
+                self.turn_ids.next_turn_id(),
+                self.records.clone(),
+            )
+            .await?;
+        let receipt = SessionSubmitReceipt {
+            runtime_id: record.runtime_id.clone(),
+            turn_id: submitted.turn_id.clone(),
+            accepted_kind: session_protocol::SessionAcceptedInputKind::Turn,
+        };
+        let Some(terminal) = submitted.terminal else {
+            return Ok(SessionSubmission {
+                receipt,
+                events: None,
+            });
+        };
+        // Durable admission precedes execution; the repository fence also protects restarts.
+        self.turn_gate
+            .active
+            .lock()
+            .expect("turn gate lock poisoned")
+            .insert(record.runtime_id.clone(), receipt.turn_id.clone());
+        let (tx, rx) = mpsc::channel(2);
+        let gate = self.turn_gate.clone();
+        let turn_id = receipt.turn_id.clone();
+        tokio::spawn(async move {
+            let result = terminal.await;
+            let runtime_id = record.runtime_id;
+            let event = match result {
+                Ok(terminal) if terminal.failure.is_none() => {
+                    if let Some(delta) = terminal.reply {
+                        let _ = tokio::time::timeout(
+                            FORWARD_SEND_TIMEOUT,
+                            tx.send(SessionEvent::OutputDelta {
+                                runtime_id: runtime_id.clone(),
+                                turn_id: turn_id.clone(),
+                                stream_id: "assistant".into(),
+                                sequence: 1,
+                                delta,
+                            }),
+                        )
+                        .await;
+                    }
+                    SessionEvent::TurnCompleted {
+                        runtime_id: runtime_id.clone(),
+                        turn_id: turn_id.clone(),
+                        outcome: session_protocol::SessionTurnOutcome::Complete,
+                        usage: session_protocol::SessionUsageReport::Unknown,
+                    }
+                }
+                result => SessionEvent::TurnFailed {
+                    runtime_id: runtime_id.clone(),
+                    turn_id: turn_id.clone(),
+                    error: session_protocol::SessionTurnFailure {
+                        code: match &result {
+                            Ok(_) => "message_failed",
+                            Err(_) => "message_unresolved",
+                        }
+                        .into(),
+                        message: match result {
+                            Ok(t) => t.failure.unwrap_or_else(|| "Message failed".into()),
+                            Err(_) => {
+                                "Message observation unresolved; execution protection retained"
+                                    .into()
+                            }
+                        },
+                        retryable: false,
+                        details: serde_json::Value::Null,
+                    },
+                    usage: session_protocol::SessionUsageReport::Unknown,
+                },
+            };
+            // No subscriber owns native execution. The owner settled it or retained its durable fence.
+            gate.release(&runtime_id, &turn_id);
+            let _ = tokio::time::timeout(FORWARD_SEND_TIMEOUT, tx.send(event)).await;
+        });
+        Ok(SessionSubmission {
+            receipt,
             events: Some(rx),
         })
     }
@@ -3159,6 +3261,26 @@ pub trait SessionRepository: Send + Sync {
         _request: crate::JointPrepareRequest,
     ) -> Result<crate::JointAdmission, SessionDomainError> {
         Err(crate::unsupported_joint("prepare_joint_operation"))
+    }
+    async fn get_joint_turn(
+        &self,
+        _runtime_id: String,
+        _client_request_id: String,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        Err(crate::unsupported_joint("turn_lookup"))
+    }
+    async fn joint_turn_result(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointTurnTerminal>, SessionDomainError> {
+        Err(crate::unsupported_joint("turn_result"))
+    }
+    async fn finish_joint_turn(
+        &self,
+        _admission: crate::JointAdmission,
+        _terminal: crate::JointTurnTerminal,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("finish_turn"))
     }
     async fn begin_joint_compensation(
         &self,

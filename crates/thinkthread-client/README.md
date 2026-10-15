@@ -3,8 +3,7 @@
 This crate provides a Host-side client for the pinned alpha8 Management SDK
 (`2.2.0`, protocol v2, Git revision
 `378fd41df1773e00dc01e4ddb5b28ac1df987719`). It requires Rust 1.89 or newer.
-It is not registered with the server, `AgentRuntime`, `Provider`, or the public
-Session protocol.
+The default server does not assemble it as an execution backend.
 
 Construct `ManagementConfig` with an explicit Management Host executable,
 state/runtime/config/cache roots, working directory, filesystem root, home,
@@ -76,8 +75,8 @@ startup/continuation fails; preserve that partial result and the failed outcome.
 ## Durable operation bridge
 
 `durable_operation::DurableManagementOperation` connects persisted joint intents
-in `SessionRepository` to typed `thinkthread.create`, `thinkthread.start` and
-`get_operation`. It reads the original admission and native step from storage,
+in `SessionRepository` to typed lifecycle and Message operations, with
+`get_operation` for recovery. It reads the original admission and native step from storage,
 checks canonical request parameters and their digest against the bound SDK
 context, then atomically claims the sole initial send before invoking a mutation.
 The claim remains unknown if the caller crashes or loses its response.
@@ -103,7 +102,7 @@ execution, requested LLM override, arbitrary extension parameters or advertised
 runtime/sandbox capabilities. The configured filesystem must match the normalized
 workspace. A durable workspace claim prevents another binding from taking the
 same configured path. This Root/direct profile provides no private Child,
-checkpoint, Host operations, turn handling or isolation guarantee.
+checkpoint, Host operations or isolation guarantee.
 
 Open persists sanitized publication input, budgets and native intent before
 create/start. A verified running Root with a committed Ready session is required
@@ -124,3 +123,23 @@ storage seam for assembly with a verified owner. Its default remains disabled;
 this crate adds no server registration or selectable production profile. After a
 successful commit, closing the Management connection cannot change the business
 result. Credentials and raw request extension/configuration are not persisted.
+
+## Durable Message turns
+
+An explicitly assembled `RootSessionOwner` can admit terminal-only Message
+turns for its administrator-owned Root. It accepts an empty policy/capability
+profile; model overrides, reasoning controls, entry metadata and extensions are
+rejected before Message dispatch. Production token-budget work is unsupported.
+
+The owner persists the public turn, idempotency key, input digest and native
+operation UUID before sending. A disconnected send is recovered by querying that
+UUID, without another mutation. Message identity, admitted text and owned Root
+must match. A successful reply also requires native Session Ready. Truncated,
+failed or missing replies fail; an observation timeout or EOF retains the durable
+source fence for reconciliation. Client disconnection does not cancel execution.
+
+Terminal state and source-fence release commit together. The application emits
+one full reply delta and one terminal, with explicit unknown metering. Replaying
+an idempotency key returns the original receipt; changed input conflicts. These
+operations do not provide active cancellation, streaming, policy enforcement,
+checkpoints or public close.

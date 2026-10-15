@@ -111,6 +111,18 @@ pub fn unsupported_joint(operation: &str) -> SessionDomainError {
     }
 }
 
+pub type JointTurnFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::JointTurnTerminal, SessionDomainError>>
+            + Send,
+    >,
+>;
+pub struct JointTurnSubmission {
+    pub turn_id: String,
+    /// None replays an existing durable receipt without dispatching another Message.
+    pub terminal: Option<JointTurnFuture>,
+}
+
 /// Implementations must publish through the supplied durable repository.
 /// Returned records are already committed; the application must not save them again.
 #[async_trait]
@@ -133,6 +145,16 @@ pub trait JointSessionLifecycle: Send + Sync {
         _repository: Arc<dyn SessionRepository>,
     ) -> Result<SessionRecord, SessionDomainError> {
         Err(unsupported_joint("open"))
+    }
+    async fn submit_turn(
+        &self,
+        _context: JointOperationContext,
+        _session: SessionRecord,
+        _request: session_protocol::SessionTurnRequest,
+        _turn_id: String,
+        _repository: Arc<dyn SessionRepository>,
+    ) -> Result<JointTurnSubmission, SessionDomainError> {
+        Err(unsupported_joint("submit_turn"))
     }
     async fn checkpoint(
         &self,
