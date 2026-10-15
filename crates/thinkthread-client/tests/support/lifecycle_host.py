@@ -37,10 +37,15 @@ while True:
                   "runtimeStateSchemaRange": {"minimum": 1, "maximum": 1}, "supportedFeatures": []}
     elif method == "context.bind": result = {"bound": True}
     elif method == "thinkthread.create":
-        if scenario == "drop-create": sys.exit(0)
+        if scenario in ("drop-create","durable-drop-create"): sys.exit(0)
         result = {"operation": handle(params), "thinkthreadId": root, "changed": True}
         if scenario == "wrong-operation": result["operation"]["operationId"] = "bad-operation"
         if scenario == "wrong-digest": result["operation"]["operationDigest"] = "0" * 64
+    elif method == "operation.get" and scenario == "durable-drop-create":
+        with open(trace) as source:
+            original = next(json.loads(line) for line in source if json.loads(line)["method"] == "thinkthread.create")
+        result = {"operation": handle(original["params"]), "method": "thinkthread.create", "state": "succeeded",
+                  "acceptedAt": "2026-01-01T00:00:00Z", "result": {"thinkthreadId": root, "changed": True}}
     elif method == "thinkthread.get": result = view()
     elif method == "thinkthread.start":
         starts += 1; state = "Running"

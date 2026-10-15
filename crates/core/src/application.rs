@@ -2972,10 +2972,23 @@ impl SessionApplication {
 
     /// Reconcile abandoned branch operations. A live transaction owns the same lock.
     pub async fn reconcile_snapshot_intents(&self) -> Result<(), SessionDomainError> {
+        let mut joint_error = None;
+        for pending in self.records.pending_joint_operations().await? {
+            let binding = &pending.admission.binding;
+            let result = match self.joint_owner(&pending.request.context.runtime_kind, binding) {
+                Ok(owner) => owner.reconcile(pending, self.records.clone()).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                if joint_error.is_none() {
+                    joint_error = Some(error);
+                }
+            }
+        }
         let Ok(_transaction) = self.snapshot_transactions.try_lock() else {
-            return Ok(());
+            return joint_error.map_or(Ok(()), Err);
         };
-        let mut first_error = None;
+        let mut first_error = joint_error;
         for (id, mut body) in self.records.operation_intents().await? {
             if body["retry_at_ms"].as_u64().unwrap_or(0) > self.clock.now_ms() {
                 continue;
@@ -3135,6 +3148,70 @@ pub trait SessionRepository: Send + Sync {
         Ok(None)
     }
 
+    async fn prepare_joint_operation(
+        &self,
+        _request: crate::JointPrepareRequest,
+    ) -> Result<crate::JointAdmission, SessionDomainError> {
+        Err(crate::unsupported_joint("prepare_joint_operation"))
+    }
+    async fn claim_joint_native_send(
+        &self,
+        _admission: crate::JointAdmission,
+        _step: String,
+    ) -> Result<Option<crate::JointNativeIntent>, SessionDomainError> {
+        Err(crate::unsupported_joint("claim_native_send"))
+    }
+    async fn append_joint_native_step(
+        &self,
+        _admission: crate::JointAdmission,
+        _native: crate::JointNativeIntent,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("append_joint_native_step"))
+    }
+    async fn record_joint_native_result(
+        &self,
+        _admission: crate::JointAdmission,
+        _step: String,
+        _operation_id: String,
+        _digest: String,
+        _outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("record_joint_native_result"))
+    }
+    async fn publish_joint_session(
+        &self,
+        _admission: crate::JointAdmission,
+        _record: SessionRecord,
+    ) -> Result<SessionRecord, SessionDomainError> {
+        Err(crate::unsupported_joint("publish_joint_session"))
+    }
+    async fn publish_joint_checkpoint(
+        &self,
+        _admission: crate::JointAdmission,
+        _record: crate::JointCheckpointRecord,
+    ) -> Result<crate::JointCheckpointRecord, SessionDomainError> {
+        Err(crate::unsupported_joint("publish_joint_checkpoint"))
+    }
+    async fn finish_joint_release(
+        &self,
+        _admission: crate::JointAdmission,
+        _reference_kind: String,
+        _public_id: String,
+        _updated_at_ms: u64,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("finish_joint_release"))
+    }
+    async fn finish_joint_compensation(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("finish_joint_compensation"))
+    }
+    async fn pending_joint_operations(
+        &self,
+    ) -> Result<Vec<crate::JointPendingOperation>, SessionDomainError> {
+        Ok(Vec::new())
+    }
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError>;
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError>;
     async fn list_active(

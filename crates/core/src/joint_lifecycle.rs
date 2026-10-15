@@ -118,6 +118,14 @@ pub trait JointSessionLifecycle: Send + Sync {
     fn owner_kind(&self) -> &str;
     fn configuration_revision(&self) -> &str;
 
+    /// Reconcile the original durable operation. Unknown mutations are queried, never recreated.
+    async fn reconcile(
+        &self,
+        _pending: crate::JointPendingOperation,
+        _repository: Arc<dyn SessionRepository>,
+    ) -> Result<(), SessionDomainError> {
+        Err(unsupported_joint("reconcile"))
+    }
     async fn open(
         &self,
         _context: JointOperationContext,

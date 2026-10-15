@@ -2,6 +2,8 @@
 //!
 //! This crate is not registered as a Session runtime or execution backend.
 
+pub mod durable_operation;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};

@@ -72,3 +72,25 @@ Default lifecycle/checkpoint tests use a Python transport fixture. They verify
 SDK framing, caller checks, exact revision and reconnect identity, not native
 Session/Fs state. A restore main result can be committed even when execution
 startup/continuation fails; preserve that partial result and the failed outcome.
+
+## Durable operation bridge
+
+`durable_operation::DurableManagementOperation` connects persisted joint intents
+in `SessionRepository` to typed `thinkthread.create`, `thinkthread.start` and
+`get_operation`. It reads the original admission and native step from storage,
+checks canonical request parameters and their digest against the bound SDK
+context, then atomically claims the sole initial send before invoking a mutation.
+The claim remains unknown if the caller crashes or loses its response.
+
+A later caller queries the original UUID and verifies its method, scope and
+digest. Unknown delivery, missing operation records and observation failures do
+not authorize another send or release ownership. Partial create results retain
+their Root identity. Start requires a Root already confirmed by a completed
+creation in the same binding. The bridge does not discover targets, replace
+configuration, repair Roots, publish Sessions or register a server backend.
+This is durable send admission, not a network-level exactly-once guarantee.
+
+The SQLite recovery test uses the existing transport fixture, drops the create
+response, reopens the repository and reconnects, then proves only one create was
+sent and recovery queried its original UUID. It is a storage/SDK contract test;
+it supplies no native Runtime, filesystem or isolation proof.

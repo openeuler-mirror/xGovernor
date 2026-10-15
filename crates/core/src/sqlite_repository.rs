@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex};
 
 /// Durable, single-process SQLite-backed [`SessionRepository`].
 pub struct SqliteSessionRepository {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteSessionRepository {
@@ -122,7 +122,7 @@ impl SqliteSessionRepository {
         if !has_execution {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{\"kind\":\"split_v1\"}';")?;
         }
-        Ok(())
+        crate::sqlite_joint::init(conn)
     }
 }
 
@@ -230,8 +230,116 @@ fn internal_error(message: impl Into<String>) -> SessionDomainError {
     }
 }
 
+fn read_session(conn: &Connection, id: &str) -> Result<Option<SessionRecord>, String> {
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM joint_sessions WHERE runtime_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(body) = body {
+        return json_decode(&body).map(Some);
+    }
+    let found = conn
+        .query_row(
+            "SELECT * FROM sessions WHERE runtime_id=?1",
+            [id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    found.transpose()
+}
+
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
+    async fn get_joint_checkpoint(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::JointCheckpointRecord>, SessionDomainError> {
+        self.read_joint_checkpoint(id).await
+    }
+    async fn prepare_joint_operation(
+        &self,
+        request: crate::JointPrepareRequest,
+    ) -> Result<crate::JointAdmission, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_operation(self, request).await
+    }
+    async fn claim_joint_native_send(
+        &self,
+        admission: crate::JointAdmission,
+        step: String,
+    ) -> Result<Option<crate::JointNativeIntent>, SessionDomainError> {
+        SqliteSessionRepository::claim_joint_native_send(self, admission, step).await
+    }
+    async fn append_joint_native_step(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::append_joint_native_step(self, admission, native).await
+    }
+    async fn record_joint_native_result(
+        &self,
+        admission: crate::JointAdmission,
+        step: String,
+        operation_id: String,
+        digest: String,
+        outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::record_joint_native_result(
+            self,
+            admission,
+            step,
+            operation_id,
+            digest,
+            outcome,
+        )
+        .await
+    }
+    async fn publish_joint_session(
+        &self,
+        admission: crate::JointAdmission,
+        record: SessionRecord,
+    ) -> Result<SessionRecord, SessionDomainError> {
+        SqliteSessionRepository::publish_joint_session(self, admission, record).await
+    }
+    async fn publish_joint_checkpoint(
+        &self,
+        admission: crate::JointAdmission,
+        record: crate::JointCheckpointRecord,
+    ) -> Result<crate::JointCheckpointRecord, SessionDomainError> {
+        SqliteSessionRepository::publish_joint_checkpoint(self, admission, record).await
+    }
+    async fn finish_joint_release(
+        &self,
+        admission: crate::JointAdmission,
+        reference_kind: String,
+        public_id: String,
+        updated_at_ms: u64,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_release(
+            self,
+            admission,
+            reference_kind,
+            public_id,
+            updated_at_ms,
+        )
+        .await
+    }
+    async fn finish_joint_compensation(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_compensation(self, admission).await
+    }
+    async fn pending_joint_operations(
+        &self,
+    ) -> Result<Vec<crate::JointPendingOperation>, SessionDomainError> {
+        SqliteSessionRepository::pending_joint_operations(self).await
+    }
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
         let conn = self.conn.clone();
         let runtime_id = runtime_id.to_string();
@@ -239,19 +347,7 @@ impl SessionRepository for SqliteSessionRepository {
             let conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            let found = conn
-                .query_row(
-                    "SELECT * FROM sessions WHERE runtime_id = ?1",
-                    params![runtime_id],
-                    row_to_record,
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            match found {
-                Some(Ok(record)) => Ok(Some(record)),
-                Some(Err(decode_error)) => Err(decode_error),
-                None => Ok(None),
-            }
+            read_session(&conn, &runtime_id)
         })
         .await
         .map_err(|error| internal_error(format!("sqlite get task panicked: {error}")))?;
@@ -447,7 +543,7 @@ impl SessionRepository for SqliteSessionRepository {
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
             let total: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM checkpoints WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)",
+                    "SELECT count(*) FROM (SELECT checkpoint_id,tenant_id FROM checkpoints WHERE NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id) UNION ALL SELECT checkpoint_id,tenant_id FROM joint_checkpoints) WHERE tenant_id=?1 OR ?1 IS NULL",
                     params![tenant_id],
                     |row| row.get(0),
                 )
@@ -455,8 +551,10 @@ impl SessionRepository for SqliteSessionRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT checkpoint_id, source_runtime_id, tenant_id, created_by, created_at_ms
-                     FROM checkpoints
-                     WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)
+                     FROM (SELECT checkpoint_id,source_runtime_id,tenant_id,created_by,created_at_ms FROM checkpoints
+                       WHERE NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)
+                       UNION ALL SELECT checkpoint_id,source_runtime_id,tenant_id,created_by,created_at_ms FROM joint_checkpoints)
+                     WHERE tenant_id = ?1 OR ?1 IS NULL
                      ORDER BY created_at_ms DESC, checkpoint_id DESC
                      LIMIT ?2 OFFSET ?3",
                 )
@@ -499,7 +597,7 @@ impl SessionRepository for SqliteSessionRepository {
                     .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
                 let mut stmt = conn
                     .prepare(
-                        "SELECT tenant_id, COUNT(*) FROM sessions \
+                        "SELECT tenant_id, COUNT(*) FROM (SELECT tenant_id,status FROM sessions UNION ALL SELECT tenant_id,status FROM joint_sessions) \
                  WHERE tenant_id IS NOT NULL AND status IN ('opening','idle','running','paused') \
                  GROUP BY tenant_id",
                     )
@@ -547,7 +645,7 @@ impl SessionRepository for SqliteSessionRepository {
             let total_active: i64 = conn
                 .query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM sessions \
+                        "SELECT COUNT(*) FROM (SELECT tenant_id,status FROM sessions UNION ALL SELECT tenant_id,status FROM joint_sessions) \
                          WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL)"
                     ),
                     params![tenant_id],
@@ -557,17 +655,18 @@ impl SessionRepository for SqliteSessionRepository {
 
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT * FROM sessions \
+                    "SELECT runtime_id FROM (SELECT runtime_id,tenant_id,status,updated_at_ms FROM sessions UNION ALL SELECT runtime_id,tenant_id,status,updated_at_ms FROM joint_sessions) \
                      WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL) \
                      ORDER BY updated_at_ms DESC LIMIT ?2"
                 ))
                 .map_err(|error| error.to_string())?;
             let rows = stmt
-                .query_map(params![tenant_id, limit], row_to_record)
+                .query_map(params![tenant_id, limit], |r|r.get::<_,String>(0))
                 .map_err(|error| error.to_string())?;
             let mut sessions = Vec::new();
             for row in rows {
-                sessions.push(row.map_err(|error| error.to_string())??);
+                let id=row.map_err(|error|error.to_string())?;
+                sessions.push(read_session(&conn,&id)?.ok_or("missing listed session")?);
             }
 
             Ok(SessionListPage {

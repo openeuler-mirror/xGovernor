@@ -13,3 +13,17 @@ Open, capture, load, close, attachment and health checks use the joint strategy 
 `SessionRepository::supports_joint_transactions` defaults to false. The standard SQLite repository does not yet enable this capability, so the joint strategy remains unavailable until transactional ownership, fencing and publication are provided. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
 
 Joint checkpoint records use a real binding reference; legacy checkpoints keep their real provider snapshot and runtime state. No placeholder provider snapshot ID is used to represent a joint resource. Durable migration/publication and recovery are requirements for enabling a joint owner, and do not follow merely from selecting the strategy.
+
+## Durable admission and publication
+
+SQLite stores joint sessions and checkpoints in independent tables in the same database. Legacy readers see only split records; triggers prevent a legacy writer from taking a published or reserved joint public identity. New readers merge the two routes for authorized listings and quota restoration. Ordinary `save` remains exclusively for split records.
+
+The durable repository API commits a binding, public identity claim, native UUID/digest/parameters, reservations, parent reference and Root/source fence before downstream effects. A repeated parent intent must match the original request exactly. Admission counts active legacy sessions plus joint reservations, including unpublished and unknown operations. A new Root requires its own reservation. Every later binding in that Root has an explicit active parent with matching tenant, owner, runtime and configuration revision. Independent native objects have one owner within a Root.
+
+Record native outcomes with their exact original UUID and digest. Accepted, unknown and failed results retain any known partial objects. An unknown result does not release a reservation, identity claim or fence. A later create result invalidates earlier absence for its objects. Native parameters and results must be sanitized by the trusted adapter before persistence; the repository rejects known credential fields but does not provide arbitrary secret discovery.
+
+Public session/checkpoint publication atomically checks parent stage, binding generation, Root/source fence and completed native results, then commits the public record, reference, reservations and publication result. Replaying the same publication returns the committed result. No provider snapshot placeholder or separate second save is involved.
+
+A release first prevents new dependent references. Final release requires settled original operations, exact absence for every owned object in the binding generation and no other references. Unpublished creation has a separate compensation finish with the same requirements; unknown delivery cannot be treated as not sent. Partial results, UUIDs and failure history remain after release for reconciliation. Pending intents are dispatched to their persisted joint owner; the application does not create replacement mutations or invoke legacy cleanup.
+
+This API supplies durable storage primitives. `supports_joint_transactions` remains false until a trusted lifecycle adapter implements sending, exact operation queries, resource validation and recovery against this store. These primitives do not enable a server backend or provide a multi-writer deployment contract for the legacy lifecycle.

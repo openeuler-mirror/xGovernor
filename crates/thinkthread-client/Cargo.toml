@@ -6,6 +6,9 @@ license.workspace = true
 rust-version = "1.89"
 
 [dependencies]
+xgovernor-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
 thinkthread-management = { git = "https://gitcode.com/aideveloper/capsule_public.git", rev = "378fd41df1773e00dc01e4ddb5b28ac1df987719", version = "=2.2.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
