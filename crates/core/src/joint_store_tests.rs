@@ -541,3 +541,179 @@ async fn retained_references_prevent_close_until_exact_absence_is_committed() {
         .is_empty());
     assert!(repo.pending_joint_operations().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn independent_connections_serialize_replays_conflicts_and_source_fences() {
+    async fn race(
+        left: &SqliteSessionRepository,
+        right: &SqliteSessionRepository,
+        a: JointPrepareRequest,
+        b: JointPrepareRequest,
+    ) -> (
+        std::result::Result<JointAdmission, SessionDomainError>,
+        std::result::Result<JointAdmission, SessionDomainError>,
+    ) {
+        let barrier = tokio::sync::Barrier::new(2);
+        tokio::join!(
+            async {
+                barrier.wait().await;
+                left.prepare_joint_operation(a).await
+            },
+            async {
+                barrier.wait().await;
+                right.prepare_joint_operation(b).await
+            },
+        )
+    }
+    for different_digest in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let left = SqliteSessionRepository::open(&path).unwrap();
+        let right = SqliteSessionRepository::open(&path).unwrap();
+        let a = request("concurrent", "open", "", "target", "", "root", None);
+        let mut b = a.clone();
+        if different_digest {
+            b.native[0].digest = "b".repeat(64);
+        }
+        let (one, two) = race(&left, &right, a.clone(), b).await;
+        if different_digest {
+            let (winner, loser) = if one.is_ok() { (one, two) } else { (two, one) };
+            winner.unwrap();
+            assert!(matches!(loser, Err(SessionDomainError::Conflict { .. })));
+        } else {
+            assert_eq!(one.unwrap(), two.unwrap());
+        }
+        let db = left.conn.lock().unwrap();
+        for (table, count) in [
+            ("joint_operations", 1),
+            ("joint_bindings", 1),
+            ("joint_roots", 1),
+            ("joint_native_steps", 1),
+            ("joint_public_claims", 1),
+            ("joint_reservations", 2),
+            ("joint_fences", 2),
+        ] {
+            assert_eq!(
+                db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                count
+            );
+        }
+        assert_eq!(
+            db.query_row(
+                "SELECT sum(units) FROM joint_reservations WHERE state='reserved'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT epoch FROM joint_fences WHERE kind='source'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
+        assert_eq!(right.pending_joint_operations().await.unwrap().len(), 1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let left = SqliteSessionRepository::open(&path).unwrap();
+    let right = SqliteSessionRepository::open(&path).unwrap();
+    let (source, _) = open(&left, "source", "source", "root").await;
+    let a = request(
+        "capture-a",
+        "checkpoint",
+        "source",
+        "",
+        "cp-a",
+        "root",
+        Some(source.binding.clone()),
+    );
+    let b = request(
+        "capture-b",
+        "checkpoint",
+        "source",
+        "",
+        "cp-b",
+        "root",
+        Some(source.binding),
+    );
+    let (one, two) = race(&left, &right, a, b).await;
+    let (winner, loser) = if one.is_ok() { (one, two) } else { (two, one) };
+    let winner = winner.unwrap();
+    assert!(matches!(loser, Err(SessionDomainError::Conflict { .. })));
+    let pending = right.pending_joint_operations().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].admission, winner);
+    assert!(pending[0]
+        .native
+        .iter()
+        .all(|(_, outcome)| outcome.is_none()));
+    let db = left.conn.lock().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT holder FROM joint_fences WHERE kind='source' AND id='source'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        winner.intent_id
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM joint_public_claims WHERE kind='checkpoint'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM joint_reservations WHERE kind='checkpoint'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    // Force lock contention independently of all identity and quota checks.
+    right
+        .conn
+        .lock()
+        .unwrap()
+        .busy_timeout(std::time::Duration::ZERO)
+        .unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let busy = right
+        .prepare_joint_operation(pending[0].request.clone())
+        .await
+        .unwrap_err();
+    match busy {
+        SessionDomainError::Internal { message, .. } => {
+            assert!(message.contains("database is locked"), "{message}")
+        }
+        other => panic!("lock contention changed domain meaning: {other}"),
+    }
+    db.execute_batch("ROLLBACK").unwrap();
+    drop(db);
+    assert_eq!(
+        right
+            .prepare_joint_operation(pending[0].request.clone())
+            .await
+            .unwrap(),
+        winner
+    );
+    assert_eq!(
+        right.pending_joint_operations().await.unwrap()[0].native[0]
+            .0
+            .operation_id,
+        pending[0].native[0].0.operation_id
+    );
+}

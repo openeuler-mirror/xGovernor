@@ -467,3 +467,101 @@ async fn message_journal_recovers_and_settles_without_repeating_admission() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_open_reuses_the_winning_durable_request() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut f = Fixture::new("owner-concurrent");
+    let path = f.root.path().join("owner.db");
+    let gate_path = f.root.path().join("preflight.sock");
+    let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+    f.config.base_environment.insert(
+        "XG_TEST_PREFLIGHT_GATE".into(),
+        gate_path.to_string_lossy().into(),
+    );
+    let left = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let right = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON joint_sessions BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;").unwrap();
+    let release = async {
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = gate.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "preflight\n");
+            streams.push(reader);
+        }
+        for stream in &mut streams {
+            stream.get_mut().write_all(b"x").await.unwrap();
+        }
+    };
+    let owner = f.owner();
+    let (one, two, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            owner.open(f.context(), f.input(), left.clone()),
+            owner.open(f.context(), f.input(), right.clone()),
+            release
+        )
+    })
+    .await
+    .unwrap();
+    for result in [one, two] {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            !error.contains("joint operation identity conflict"),
+            "{error}"
+        );
+    }
+    let pending = left.pending_joint_operations().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let original = pending[0].clone();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM joint_reservations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    let mut changed = f.input();
+    changed.request.conversation_id = "changed".into();
+    let before = f.trace().len();
+    assert!(owner
+        .open(f.context(), changed, right.clone())
+        .await
+        .is_err());
+    assert_eq!(f.trace().len(), before);
+    db.execute_batch("DROP TRIGGER fail_publication").unwrap();
+    drop(left);
+    drop(right);
+    drop(db);
+    let reopened = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    owner
+        .reconcile(original.clone(), reopened.clone())
+        .await
+        .unwrap();
+    let record = owner
+        .open(f.context(), f.input(), reopened.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        record.execution_backing.joint(),
+        Some(&original.admission.binding)
+    );
+    assert!(reopened
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .is_empty());
+    let trace = f.trace();
+    for method in ["thinkthread.create", "thinkthread.start"] {
+        assert_eq!(trace.iter().filter(|r| r["method"] == method).count(), 1);
+    }
+    assert_eq!(
+        trace
+            .iter()
+            .find(|r| r["method"] == "thinkthread.create")
+            .unwrap()["params"]["operationId"],
+        original.native[0].0.operation_id
+    );
+}

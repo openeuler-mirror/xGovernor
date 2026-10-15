@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Management v2 lifecycle fixture; never establishes native readiness."""
-import json, os, struct, sys
+import fcntl, json, os, socket, struct, sys
 scenario = os.environ.get("XG_TEST_SCENARIO", "ok")
 trace = os.environ["XG_TEST_TRACE"]
 root = "fixture-owned-root"
@@ -35,13 +35,29 @@ while True:
     size = struct.unpack(">I", prefix)[0]
     req = json.loads(sys.stdin.buffer.read(size))
     method = req["method"]; params = req["params"]
+    if scenario == "owner-concurrent" and state_file and os.path.exists(state_file):
+        with open(state_file) as source: state = json.load(source)["state"]
     with open(trace, "a") as out: out.write(json.dumps({"method": method, "params": params}) + "\n")
+    gate = os.environ.get("XG_TEST_OPERATION_GATE")
+    if gate and os.path.exists(gate) and method in ("thinkthread.create", "operation.get"):
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.connect(gate); connection.sendall((method + "\n").encode()); connection.recv(1)
     if method == "handshake":
         result = {"managementProtocolVersion": 2, "contractFingerprint": params["contractFingerprint"],
                   "hostVersion": "fixture", "hostBuildId": "fixture", "installationId": "fixture",
                   "runtimeDefinitionSchemaRange": {"minimum": 1, "maximum": 1},
                   "runtimeStateSchemaRange": {"minimum": 1, "maximum": 1}, "supportedFeatures": []}
-    elif method == "context.bind": result = {"bound": True}
+    elif method == "context.bind":
+        gate = os.environ.get("XG_TEST_PREFLIGHT_GATE")
+        if gate:
+            with open(gate + ".count", "a+") as counter:
+                fcntl.flock(counter, fcntl.LOCK_EX)
+                counter.seek(0); count = int(counter.read() or "0") + 1
+                counter.seek(0); counter.truncate(); counter.write(str(count)); counter.flush()
+            if count <= 2:
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.connect(gate); connection.sendall(b"preflight\n"); connection.recv(1)
+        result = {"bound": True}
     elif method == "thinkthread.create":
         if scenario in ("drop-create","durable-drop-create"): sys.exit(0)
         result = {"operation": handle(params), "thinkthreadId": root, "changed": True}
@@ -119,7 +135,9 @@ while True:
         result = {"reached": reached, "thinkthreads": [] if state == "Absent" else [view()]}
         if scenario == "not-absent" and params["target"] == "absent": result = {"reached": False, "thinkthreads": [view()]}
     else: sys.exit(2)
-    if scenario.startswith("owner") and state_file:
-        with open(state_file,"w") as sink: json.dump({"state":state,"messages":messages},sink)
+    if scenario.startswith("owner") and state_file and (scenario != "owner-concurrent" or method in ("thinkthread.create", "thinkthread.start", "thinkthread.stop", "thinkthread.remove")):
+        target = state_file + "." + str(os.getpid()) if scenario == "owner-concurrent" else state_file
+        with open(target,"w") as sink: json.dump({"state":state,"messages":messages},sink)
+        if scenario == "owner-concurrent": os.replace(target, state_file)
     if scenario in ("owner-message-drop", "owner-message-partial", "owner-message-unproven") and method == "message.send":sys.exit(0)
     reply(req, result)

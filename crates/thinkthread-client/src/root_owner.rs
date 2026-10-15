@@ -154,12 +154,32 @@ impl RootSessionOwner {
             }
             return Ok(());
         }
-        repository
-            .append_joint_native_step(
-                a.clone(),
-                self.native(client, step, method, params, effect)?,
-            )
+        let native = self.native(client, step, method, params, effect)?;
+        match repository
+            .append_joint_native_step(a.clone(), native.clone())
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error @ SessionDomainError::Conflict { .. }) => {
+                let current = repository
+                    .pending_joint_operations()
+                    .await?
+                    .into_iter()
+                    .find(|p| p.admission == *a);
+                if let Some((old, _)) = current
+                    .as_ref()
+                    .and_then(|p| p.native.iter().find(|(n, _)| n.step == step))
+                {
+                    let mut replay = native;
+                    replay.operation_id = old.operation_id.clone();
+                    if replay == *old {
+                        return Ok(());
+                    }
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
     pub(crate) fn validate_view(
         &self,
@@ -613,7 +633,7 @@ impl JointSessionLifecycle for RootSessionOwner {
                 .close()
                 .await
                 .map_err(|_| unavailable("Management preflight close failed"))?;
-            let request = JointPrepareRequest {
+            let mut request = JointPrepareRequest {
                 turn: None,
                 context,
                 binding: binding.clone(),
@@ -636,12 +656,47 @@ impl JointSessionLifecycle for RootSessionOwner {
                 native: vec![create.clone()],
                 publication_input: Some(record),
             };
-            let admission = repository.prepare_joint_operation(request.clone()).await?;
-            JointPendingOperation {
-                request,
-                admission,
-                stage: "prepared".into(),
-                native: vec![(create, None)],
+            let admission = match repository.prepare_joint_operation(request.clone()).await {
+                Ok(admission) => admission,
+                Err(error @ SessionDomainError::Conflict { .. }) => {
+                    let Some(state) = repository.get_joint_binding(binding.clone()).await? else {
+                        return Err(error);
+                    };
+                    let original = state.creation;
+                    // Only locally generated timestamps and UUIDs may differ on a racing replay.
+                    if let (Some(candidate), Some(stored)) =
+                        (&mut request.publication_input, &original.publication_input)
+                    {
+                        candidate.created_at_ms = stored.created_at_ms;
+                        candidate.updated_at_ms = stored.updated_at_ms;
+                    }
+                    for (candidate, stored) in request.native.iter_mut().zip(&original.native) {
+                        candidate.operation_id = stored.operation_id.clone();
+                    }
+                    if serde_json::to_value(&request).ok() != serde_json::to_value(&original).ok() {
+                        return Err(error);
+                    }
+                    request = original;
+                    repository.prepare_joint_operation(request.clone()).await?
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(pending) = repository
+                .pending_joint_operations()
+                .await?
+                .into_iter()
+                .find(|p| p.admission == admission)
+            {
+                pending
+            } else {
+                let committed = repository
+                    .get(request.context.target_runtime_id.as_deref().unwrap())
+                    .await?
+                    .ok_or_else(|| unavailable("open replay has no pending or committed result"))?;
+                if request.publication_input.as_ref() != Some(&committed) {
+                    return Err(unavailable("open replay committed input changed"));
+                }
+                return Ok(committed);
             }
         };
         self.resume(pending, repository).await
