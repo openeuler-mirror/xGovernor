@@ -10,6 +10,28 @@ use std::{
 use tempfile::TempDir;
 use xgovernor_core::*;
 use xgovernor_thinkthread_client::{root_owner::*, sdk, ManagementConfig};
+fn repository(path: &std::path::Path) -> SqliteSessionRepository {
+    SqliteSessionRepository::open(path)
+        .unwrap()
+        .with_joint_budget_policy(JointBudgetPolicy::from([
+            (
+                "session".into(),
+                JointResourceBudget {
+                    total: 2,
+                    recovery_reserve: 1,
+                },
+            ),
+            (
+                "root".into(),
+                JointResourceBudget {
+                    total: 2,
+                    ..Default::default()
+                },
+            ),
+        ]))
+        .unwrap()
+}
+
 struct Fixture {
     root: TempDir,
     config: ManagementConfig,
@@ -122,11 +144,7 @@ impl Fixture {
 async fn owner_restarts_after_publication_failure_without_recreating_the_root() {
     let f = Fixture::new("owner");
     let path = f.root.path().join("owner.db");
-    let repo = Arc::new(
-        SqliteSessionRepository::open(&path)
-            .unwrap()
-            .with_joint_transactions(),
-    );
+    let repo = Arc::new(repository(&path).with_joint_transactions());
     assert!(repo.supports_joint_transactions());
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON joint_sessions BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;").unwrap();
@@ -156,11 +174,7 @@ async fn owner_restarts_after_publication_failure_without_recreating_the_root() 
     db.execute_batch("DROP TRIGGER fail_publication;").unwrap();
     drop(db);
     drop(repo);
-    let repo = Arc::new(
-        SqliteSessionRepository::open(&path)
-            .unwrap()
-            .with_joint_transactions(),
-    );
+    let repo = Arc::new(repository(&path).with_joint_transactions());
     let owner = f.owner();
     owner.reconcile(pending, repo.clone()).await.unwrap();
     let record = repo.get("public-session").await.unwrap().unwrap();
@@ -204,7 +218,7 @@ async fn owner_restarts_after_publication_failure_without_recreating_the_root() 
 async fn known_start_failure_is_reconciled_before_exact_unpublished_compensation() {
     let f = Fixture::new("owner-start-reject");
     let path = f.root.path().join("owner.db");
-    let repo = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let repo = Arc::new(repository(&path));
     let owner = f.owner();
     assert!(owner
         .open(f.context(), f.input(), repo.clone())
@@ -216,13 +230,90 @@ async fn known_start_failure_is_reconciled_before_exact_unpublished_compensation
         .unwrap()
         .pop()
         .unwrap();
-    assert!(owner.reconcile(pending, repo.clone()).await.is_err());
+    let original = pending.admission.clone();
+    let start_id = pending
+        .native
+        .iter()
+        .find(|(n, _)| n.step == "start")
+        .unwrap()
+        .0
+        .operation_id
+        .clone();
+    assert_eq!(
+        pending
+            .native
+            .iter()
+            .find(|(n, _)| n.step == "start")
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .state,
+        NativeOperationState::Unknown
+    );
+    drop(repo);
+    let repo = Arc::new(repository(&path));
     let pending = repo
         .pending_joint_operations()
         .await
         .unwrap()
         .pop()
         .unwrap();
+    assert_eq!(pending.admission, original);
+    let next = Fixture::new("owner");
+    let mut next_context = next.context();
+    next_context.intent_id = "next-open".into();
+    next_context.target_runtime_id = Some("next-session".into());
+    assert!(matches!(
+        next.owner()
+            .open(next_context.clone(), next.input(), repo.clone())
+            .await,
+        Err(SessionDomainError::QuotaExceeded { limit: 1, .. })
+    ));
+    assert!(next
+        .trace()
+        .iter()
+        .all(|r| ["handshake", "context.bind"].contains(&r["method"].as_str().unwrap())));
+    assert!(owner
+        .compensate_unpublished(pending.clone(), repo.clone())
+        .await
+        .is_err());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT sum(units) FROM joint_reservations WHERE kind='session' AND state='reserved'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert!(owner.reconcile(pending, repo.clone()).await.is_err());
+    let queries: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|r| r["method"] == "operation.get")
+        .collect();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0]["params"]["operationId"], start_id);
+    let pending = repo
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        pending
+            .native
+            .iter()
+            .find(|(n, _)| n.step == "start")
+            .unwrap()
+            .1
+            .as_ref()
+            .unwrap()
+            .state,
+        NativeOperationState::Failed
+    );
     let binding = pending.admission.binding.clone();
     owner.reconcile(pending, repo.clone()).await.unwrap();
     assert!(repo.get("public-session").await.unwrap().is_none());
@@ -268,6 +359,49 @@ async fn known_start_failure_is_reconciled_before_exact_unpublished_compensation
         );
         assert_eq!(row["params"]["force"], false);
     }
+    assert_eq!(
+        db.query_row(
+            "SELECT sum(units) FROM joint_reservations WHERE kind='session' AND state='released'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let admitted = next
+        .owner()
+        .open(next_context, next.input(), repo.clone())
+        .await
+        .unwrap();
+    assert_eq!(admitted.runtime_id, "next-session");
+    repo.finish_joint_compensation(original.clone())
+        .await
+        .unwrap();
+    repo.finish_joint_compensation(original).await.unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT sum(units) FROM joint_reservations WHERE kind='session' AND state='committed'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    let third = Fixture::new("owner");
+    let mut context = third.context();
+    context.intent_id = "third-open".into();
+    context.target_runtime_id = Some("third-session".into());
+    assert!(matches!(
+        third
+            .owner()
+            .open(context, third.input(), repo.clone())
+            .await,
+        Err(SessionDomainError::QuotaExceeded { limit: 1, .. })
+    ));
+    assert!(third
+        .trace()
+        .iter()
+        .all(|r| ["handshake", "context.bind"].contains(&r["method"].as_str().unwrap())));
 }
 
 #[tokio::test]
@@ -284,11 +418,7 @@ async fn message_journal_recovers_and_settles_without_repeating_admission() {
     ] {
         let f = Fixture::new(scenario);
         let path = f.root.path().join("messages.db");
-        let repo = Arc::new(
-            SqliteSessionRepository::open(&path)
-                .unwrap()
-                .with_joint_transactions(),
-        );
+        let repo = Arc::new(repository(&path).with_joint_transactions());
         let owner = f.owner();
         let record = owner
             .open(f.context(), f.input(), repo.clone())
@@ -359,19 +489,11 @@ async fn message_journal_recovers_and_settles_without_repeating_admission() {
                 NativeOperationState::Unknown
             );
             drop(repo);
-            let reopened = Arc::new(
-                SqliteSessionRepository::open(&path)
-                    .unwrap()
-                    .with_joint_transactions(),
-            );
+            let reopened = Arc::new(repository(&path).with_joint_transactions());
             result = owner.resume_message(pending, reopened).await;
             assert!(f.trace().iter().any(|r| r["method"] == "operation.get"));
         }
-        let repo = Arc::new(
-            SqliteSessionRepository::open(&path)
-                .unwrap()
-                .with_joint_transactions(),
-        );
+        let repo = Arc::new(repository(&path).with_joint_transactions());
         let record = repo.get("public-session").await.unwrap().unwrap();
         if [
             "owner-message-eof",
@@ -479,8 +601,8 @@ async fn concurrent_open_reuses_the_winning_durable_request() {
         "XG_TEST_PREFLIGHT_GATE".into(),
         gate_path.to_string_lossy().into(),
     );
-    let left = Arc::new(SqliteSessionRepository::open(&path).unwrap());
-    let right = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let left = Arc::new(repository(&path));
+    let right = Arc::new(repository(&path));
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON joint_sessions BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;").unwrap();
     let release = async {
@@ -535,7 +657,7 @@ async fn concurrent_open_reuses_the_winning_durable_request() {
     drop(left);
     drop(right);
     drop(db);
-    let reopened = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let reopened = Arc::new(repository(&path));
     owner
         .reconcile(original.clone(), reopened.clone())
         .await

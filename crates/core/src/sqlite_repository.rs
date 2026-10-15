@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex};
 pub struct SqliteSessionRepository {
     pub(crate) conn: Arc<Mutex<Connection>>,
     joint_transactions: bool,
+    pub(crate) joint_budget_policy: crate::JointBudgetPolicy,
 }
 
 impl SqliteSessionRepository {
@@ -61,6 +62,7 @@ impl SqliteSessionRepository {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
+            joint_budget_policy: Default::default(),
         })
     }
 
@@ -72,6 +74,7 @@ impl SqliteSessionRepository {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
+            joint_budget_policy: Default::default(),
         })
     }
 
@@ -79,6 +82,24 @@ impl SqliteSessionRepository {
     pub fn with_joint_transactions(mut self) -> Self {
         self.joint_transactions = true;
         self
+    }
+
+    /// Sets admission capacity without enabling joint lifecycle assembly.
+    /// Existing reservations remain charged when a new policy lowers capacity.
+    pub fn with_joint_budget_policy(
+        mut self,
+        policy: crate::JointBudgetPolicy,
+    ) -> Result<Self, SessionDomainError> {
+        if policy.iter().any(|(kind, budget)| {
+            !["session", "root", "replica", "checkpoint", "repair", "disk"].contains(&kind.as_str())
+                || budget.recovery_reserve > budget.total
+        }) {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "invalid joint resource budget".into(),
+            });
+        }
+        self.joint_budget_policy = policy;
+        Ok(self)
     }
 
     fn init(conn: &Connection) -> rusqlite::Result<()> {

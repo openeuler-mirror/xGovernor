@@ -385,11 +385,12 @@ impl SqliteSessionRepository {
         validate_request(&request).map_err(|e| SessionDomainError::InvalidRequest {
             message: e.to_string(),
         })?;
+        let budget_policy = self.joint_budget_policy.clone();
         self.joint_transaction(move |tx| {
             let encoded=encode(&request)?;let id=&request.context.intent_id;
             if let Some((old,admission))=tx.query_row("SELECT request_json,admission_json FROM joint_operations WHERE id=?1",
                 [id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
-                if old!=encoded {return Err(conflict("joint operation identity conflict"));} return decode(&admission);
+                if encode(&decode::<JointPrepareRequest>(&old)?)?!=encoded {return Err(conflict("joint operation identity conflict"));} return decode(&admission);
             }
             if ["open","load","checkpoint"].contains(&request.context.operation.as_str()) {
                 let (kind,id,split,joint,column)=if request.context.operation=="checkpoint" {
@@ -484,11 +485,17 @@ impl SqliteSessionRepository {
                         [request.context.tenant_id.as_deref()],|r|r.get(0))?;
                     used+=legacy;
                 }
-                let mut limit=reservation.limit;
+                let budget=budget_policy.get(&reservation.kind).copied().unwrap_or_default();
+                // All supported admissions are ordinary: every unreleased unit counts in both pools.
+                let mut limit=budget.total-budget.recovery_reserve;
+                let mut total_limit=budget.total;
                 if reservation.kind=="session" && request.context.actor_role==crate::Role::Tenant {
-                    if let Some(quota)=request.context.quota.max_sessions {limit=limit.min(quota);}
+                    if let Some(quota)=request.context.quota.max_sessions {
+                        limit=limit.min(quota);total_limit=total_limit.min(quota);
+                    }
                 }
-                if used+u64::from(reservation.units)>u64::from(limit) {
+                let required=used+u64::from(reservation.units);
+                if required>u64::from(limit) || required>u64::from(total_limit) {
                     return Err(SessionDomainError::QuotaExceeded{scope:format!("joint_{}",reservation.kind),limit}.into());
                 }
                 tx.execute("INSERT INTO joint_reservations VALUES(?1,?2,?3,'reserved')",params![id,reservation.kind,reservation.units])?;

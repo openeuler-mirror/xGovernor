@@ -60,7 +60,27 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
         gate_path.to_string_lossy().into(),
     );
     let path = f.root.path().join("owner.db");
-    let repo = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let repo = Arc::new(
+        SqliteSessionRepository::open(&path)
+            .unwrap()
+            .with_joint_budget_policy(JointBudgetPolicy::from([
+                (
+                    "session".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "root".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]))
+            .unwrap(),
+    );
     let client = f.config.connect().await.unwrap();
     let create:sdk::ThinkThreadCreateRequest=serde_json::from_value(json!({"agent":{"kind":"profile","name":"fixture"},"fs":f.config.fs_root,"models":[],"allowSharedFs":false})).unwrap();
     let params = serde_json::to_value(create).unwrap();
@@ -102,12 +122,12 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
             JointResourceReservation {
                 kind: "session".into(),
                 units: 1,
-                limit: 1,
+                limit: 0,
             },
             JointResourceReservation {
                 kind: "root".into(),
                 units: 1,
-                limit: 1,
+                limit: 0,
             },
         ],
         publication_input: None,
@@ -118,7 +138,27 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut handles = Vec::new();
     for _ in 0..2 {
-        let repository = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+        let repository = Arc::new(
+            SqliteSessionRepository::open(&path)
+                .unwrap()
+                .with_joint_budget_policy(JointBudgetPolicy::from([
+                    (
+                        "session".into(),
+                        JointResourceBudget {
+                            total: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "root".into(),
+                        JointResourceBudget {
+                            total: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ]))
+                .unwrap(),
+        );
         let mut config = f.config.clone();
         config.base_environment.insert(
             "XG_TEST_OPERATION_GATE".into(),
@@ -206,7 +246,27 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
         NativeOperationState::Unknown
     );
     drop(repo);
-    let repo = Arc::new(SqliteSessionRepository::open(&path).unwrap());
+    let repo = Arc::new(
+        SqliteSessionRepository::open(&path)
+            .unwrap()
+            .with_joint_budget_policy(JointBudgetPolicy::from([
+                (
+                    "session".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "root".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]))
+            .unwrap(),
+    );
     let db = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         db.query_row(

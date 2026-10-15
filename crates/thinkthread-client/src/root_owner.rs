@@ -19,17 +19,16 @@ pub struct RootSessionOwner {
     pub(crate) config: ManagementConfig,
     create: sdk::ThinkThreadCreateRequest,
     pub(crate) revision: String,
-    session_limit: u32,
-    root_limit: u32,
     pub(crate) timeout_ms: u64,
 }
 impl RootSessionOwner {
+    /// The legacy limit arguments are ignored; repository assembly owns resource budgets.
     pub fn new(
         config: ManagementConfig,
         create: sdk::ThinkThreadCreateRequest,
         revision: String,
-        session_limit: u32,
-        root_limit: u32,
+        _session_limit: u32,
+        _root_limit: u32,
         timeout_ms: u64,
     ) -> Result<Self, SessionDomainError> {
         config
@@ -38,8 +37,6 @@ impl RootSessionOwner {
         if create.fs.as_ref() != Some(&config.fs_root)
             || create.allow_shared_fs
             || revision.trim().is_empty()
-            || session_limit == 0
-            || root_limit == 0
             || !(1..=120_000).contains(&timeout_ms)
         {
             return Err(unavailable("invalid Root lifecycle deployment"));
@@ -48,8 +45,6 @@ impl RootSessionOwner {
             config,
             create,
             revision,
-            session_limit,
-            root_limit,
             timeout_ms,
         })
     }
@@ -645,12 +640,12 @@ impl JointSessionLifecycle for RootSessionOwner {
                     JointResourceReservation {
                         kind: "session".into(),
                         units: 1,
-                        limit: self.session_limit,
+                        limit: 0,
                     },
                     JointResourceReservation {
                         kind: "root".into(),
                         units: 1,
-                        limit: self.root_limit,
+                        limit: 0,
                     },
                 ],
                 native: vec![create.clone()],

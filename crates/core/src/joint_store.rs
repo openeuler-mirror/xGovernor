@@ -2,6 +2,7 @@
 use crate::{JointBinding, JointCheckpointRecord, JointOperationContext, SessionRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,8 +57,20 @@ pub struct JointNativeOutcome {
 pub struct JointResourceReservation {
     pub kind: String,
     pub units: u32,
+    /// Legacy decoding only; admission uses the repository's assembled policy.
+    #[serde(default, skip_serializing)]
     pub limit: u32,
 }
+
+/// Per-owner resource capacity. Ordinary operations cannot consume the recovery reserve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JointResourceBudget {
+    pub total: u32,
+    pub recovery_reserve: u32,
+}
+
+/// Omitted resource kinds have zero capacity. Deployment must supply the same policy to all writers.
+pub type JointBudgetPolicy = BTreeMap<String, JointResourceBudget>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

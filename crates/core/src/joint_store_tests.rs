@@ -2,6 +2,32 @@ use super::*;
 use crate::domain::{SandboxCapability, WorkspaceAccess};
 use crate::*;
 use std::collections::BTreeSet;
+fn budgets(session_total: u32, recovery_reserve: u32) -> JointBudgetPolicy {
+    JointBudgetPolicy::from([
+        (
+            "session".into(),
+            JointResourceBudget {
+                total: session_total,
+                recovery_reserve,
+            },
+        ),
+        (
+            "root".into(),
+            JointResourceBudget {
+                total: 3,
+                ..Default::default()
+            },
+        ),
+        (
+            "checkpoint".into(),
+            JointResourceBudget {
+                total: 3,
+                ..Default::default()
+            },
+        ),
+    ])
+}
+
 fn sample_record(runtime_id: &str) -> SessionRecord {
     SessionRecord {
         execution_backing: Default::default(),
@@ -76,7 +102,7 @@ fn request(
         vec![JointResourceReservation {
             kind: kind.into(),
             units: 1,
-            limit: 3,
+            limit: 0,
         }]
     } else {
         vec![]
@@ -85,7 +111,7 @@ fn request(
         reservations.push(JointResourceReservation {
             kind: "root".into(),
             units: 1,
-            limit: 3,
+            limit: 0,
         });
     }
     JointPrepareRequest {
@@ -249,7 +275,10 @@ async fn checkpoint(
 async fn durable_admission_preserves_unknown_quota_and_atomic_publication() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let repo = SqliteSessionRepository::open(&path).unwrap();
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let mut legacy = sample_record("legacy");
     repo.save(legacy.clone()).await.unwrap();
     let mut req = request("create", "open", "", "joint", "", "root", None);
@@ -275,7 +304,10 @@ async fn durable_admission_preserves_unknown_quota_and_atomic_publication() {
     )
     .await;
     drop(repo);
-    let repo = SqliteSessionRepository::open(&path).unwrap();
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let pending = repo.pending_joint_operations().await.unwrap();
     assert_eq!(pending[0].admission, a);
     assert_eq!(
@@ -356,7 +388,10 @@ async fn durable_admission_preserves_unknown_quota_and_atomic_publication() {
 async fn source_fences_and_partial_creation_compensation_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let repo = SqliteSessionRepository::open(&path).unwrap();
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let (source, _) = open(&repo, "source", "source", "root").await;
     let req = request(
         "capture",
@@ -376,7 +411,10 @@ async fn source_fences_and_partial_creation_compensation_survive_restart() {
         vec![object(&req.binding)],
     )
     .await;
-    let other = SqliteSessionRepository::open(&path).unwrap();
+    let other = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let mut same = req.clone();
     same.context.intent_id = "racer".into();
     same.binding.binding_id = "racer".into();
@@ -436,7 +474,10 @@ async fn source_fences_and_partial_creation_compensation_survive_restart() {
 
 #[tokio::test]
 async fn retained_references_prevent_close_until_exact_absence_is_committed() {
-    let repo = SqliteSessionRepository::open_in_memory().unwrap();
+    let repo = SqliteSessionRepository::open_in_memory()
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let (source, _) = open(&repo, "source", "source", "root").await;
     let mut foreign = request(
         "foreign",
@@ -568,8 +609,14 @@ async fn independent_connections_serialize_replays_conflicts_and_source_fences()
     for different_digest in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
-        let left = SqliteSessionRepository::open(&path).unwrap();
-        let right = SqliteSessionRepository::open(&path).unwrap();
+        let left = SqliteSessionRepository::open(&path)
+            .unwrap()
+            .with_joint_budget_policy(budgets(3, 0))
+            .unwrap();
+        let right = SqliteSessionRepository::open(&path)
+            .unwrap()
+            .with_joint_budget_policy(budgets(3, 0))
+            .unwrap();
         let a = request("concurrent", "open", "", "target", "", "root", None);
         let mut b = a.clone();
         if different_digest {
@@ -623,8 +670,14 @@ async fn independent_connections_serialize_replays_conflicts_and_source_fences()
     }
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db");
-    let left = SqliteSessionRepository::open(&path).unwrap();
-    let right = SqliteSessionRepository::open(&path).unwrap();
+    let left = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let right = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
     let (source, _) = open(&left, "source", "source", "root").await;
     let a = request(
         "capture-a",
@@ -716,4 +769,226 @@ async fn independent_connections_serialize_replays_conflicts_and_source_fences()
             .operation_id,
         pending[0].native[0].0.operation_id
     );
+}
+
+#[tokio::test]
+async fn lower_assembled_budgets_preserve_existing_occupancy_until_exact_release() {
+    async fn release(repo: &SqliteSessionRepository, session: &JointPrepareRequest, id: &str) {
+        let mut close = request(
+            id,
+            "close",
+            session.context.target_runtime_id.as_deref().unwrap(),
+            "",
+            "",
+            &session.root_id,
+            None,
+        );
+        close.binding = session.binding.clone();
+        let admission = repo.prepare_joint_operation(close.clone()).await.unwrap();
+        let objects = repo
+            .read_joint_binding(session.binding.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .objects;
+        assert!(repo
+            .finish_joint_release(
+                admission.clone(),
+                "session".into(),
+                close.source_id.clone(),
+                10
+            )
+            .await
+            .is_err());
+        result(
+            repo,
+            &admission,
+            &close.native[0],
+            NativeOperationState::Completed,
+            objects,
+        )
+        .await;
+        repo.finish_joint_release(admission, "session".into(), close.source_id, 10)
+            .await
+            .unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    assert!(SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(1, 2))
+        .is_err());
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let (first, _) = open(&repo, "source", "one", "root-one").await;
+    let (second, _) = open(&repo, "create", "two", "root-two").await;
+    drop(repo);
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(2, 1))
+        .unwrap();
+    assert!(!repo.supports_joint_transactions());
+    assert!(repo.get("one").await.unwrap().is_some());
+    assert!(repo.get("two").await.unwrap().is_some());
+    let mut third = request("third", "open", "", "three", "", "root-three", None);
+    for reservation in &mut third.reservations {
+        reservation.limit = u32::MAX;
+    }
+    assert!(matches!(
+        repo.prepare_joint_operation(third.clone()).await,
+        Err(SessionDomainError::QuotaExceeded { limit: 1, .. })
+    ));
+    release(&repo, &first, "close-one").await;
+    assert!(matches!(
+        repo.prepare_joint_operation(third.clone()).await,
+        Err(SessionDomainError::QuotaExceeded { limit: 1, .. })
+    ));
+    release(&repo, &second, "close-two").await;
+    let admission = repo.prepare_joint_operation(third.clone()).await.unwrap();
+    assert_eq!(
+        admission,
+        repo.prepare_joint_operation(third.clone()).await.unwrap()
+    );
+    result(
+        &repo,
+        &admission,
+        &third.native[0],
+        NativeOperationState::NotSent,
+        vec![],
+    )
+    .await;
+    repo.finish_joint_compensation(admission.clone())
+        .await
+        .unwrap();
+    repo.finish_joint_compensation(admission).await.unwrap();
+    assert!(repo.pending_joint_operations().await.unwrap().is_empty());
+    // A tenant's authenticated session ceiling is still narrower than deployment capacity.
+    let mut legacy = sample_record("legacy");
+    legacy.status = SessionStatus::Idle;
+    repo.save(legacy).await.unwrap();
+    let mut tenant = request(
+        "tenant-next",
+        "open",
+        "",
+        "tenant-next",
+        "",
+        "tenant-root",
+        None,
+    );
+    tenant.context.quota.max_sessions = Some(1);
+    assert!(matches!(
+        repo.prepare_joint_operation(tenant).await,
+        Err(SessionDomainError::QuotaExceeded { limit: 1, .. })
+    ));
+}
+
+#[tokio::test]
+async fn legacy_request_limits_decode_and_reconcile_without_controlling_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(1, 0))
+        .unwrap();
+    let mut req = request(
+        "legacy-open",
+        "open",
+        "",
+        "legacy-target",
+        "",
+        "legacy-root",
+        None,
+    );
+    // The zero legacy limit cannot suppress the repository's explicit capacity.
+    let admission = repo.prepare_joint_operation(req.clone()).await.unwrap();
+    let mut old = serde_json::to_value(&req).unwrap();
+    old["reservations"][0]["limit"] = serde_json::json!(u32::MAX);
+    old["reservations"][1]["limit"] = serde_json::json!(0);
+    let old_text = serde_json::to_string(&old).unwrap();
+    repo.conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE joint_operations SET request_json=?1 WHERE id=?2",
+            rusqlite::params![old_text, req.context.intent_id],
+        )
+        .unwrap();
+    drop(repo);
+    // An empty policy denies new allocations, but never prevents recovery of an admitted intent.
+    let repo = SqliteSessionRepository::open(&path).unwrap();
+    let pending = repo
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(pending.request.reservations[0].limit, u32::MAX);
+    assert_eq!(pending.admission, admission);
+    assert_eq!(
+        repo.prepare_joint_operation(pending.request.clone())
+            .await
+            .unwrap(),
+        admission
+    );
+    req.reservations[0].limit = 0;
+    req.reservations[1].limit = u32::MAX;
+    assert_eq!(
+        repo.prepare_joint_operation(req.clone()).await.unwrap(),
+        admission
+    );
+    let mut changed = req.clone();
+    changed.native[0].digest = "b".repeat(64);
+    assert!(matches!(
+        repo.prepare_joint_operation(changed).await,
+        Err(SessionDomainError::Conflict { .. })
+    ));
+    result(
+        &repo,
+        &admission,
+        &req.native[0],
+        NativeOperationState::Completed,
+        vec![
+            object(&req.binding),
+            JointNativeObject {
+                kind: "root".into(),
+                id: "legacy-owned-root".into(),
+            },
+        ],
+    )
+    .await;
+    let mut record = sample_record("legacy-target");
+    record.execution_backing = SessionExecutionBacking::JointV1 {
+        binding: req.binding.clone(),
+    };
+    repo.publish_joint_session(admission, record.clone())
+        .await
+        .unwrap();
+    assert_eq!(repo.get("legacy-target").await.unwrap(), Some(record));
+    assert_eq!(
+        repo.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT request_json FROM joint_operations WHERE id=?1",
+                [&req.context.intent_id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        old_text
+    );
+    let mut next = request("next", "open", "", "next", "", "next-root", None);
+    next.reservations[0].limit = u32::MAX;
+    assert!(matches!(
+        repo.prepare_joint_operation(next).await,
+        Err(SessionDomainError::QuotaExceeded { limit: 0, .. })
+    ));
+    let encoded = serde_json::to_value(&req).unwrap();
+    assert!(encoded["reservations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r.get("limit").is_none()));
+    assert!(repo.pending_joint_operations().await.unwrap().is_empty());
 }

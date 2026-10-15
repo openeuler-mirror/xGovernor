@@ -34,3 +34,57 @@ phase: ordinary sends and publication are excluded, including after restart befo
 the first cleanup step. Native steps identify their execution or compensation
 purpose; new optional fields preserve the encoding of legacy intents. Safe Session
 publication input can be persisted with admission and cannot be replaced later.
+
+## Assembled resource budgets
+
+Configure `SqliteSessionRepository::with_joint_budget_policy` on every repository
+that admits joint resources. `JointBudgetPolicy` maps a resource kind to a
+`JointResourceBudget { total, recovery_reserve }`; `recovery_reserve` defaults to
+zero. An omitted kind has zero capacity, and an empty policy denies new
+allocations. Assembly rejects a reserve larger than its total or an unknown
+resource kind. Setting a policy does not enable `supports_joint_transactions`;
+the separate lifecycle opt-in remains necessary.
+
+The policy is supplied by trusted server assembly, not by an operation request.
+It is not persisted or revisioned in SQLite. All processes accessing one database
+must be assembled with the same policy, and coordinated configuration changes
+must update every writer. This deployment requirement does not introduce a
+multi-writer contract for the legacy lifecycle. Reopening with lower limits
+retains existing records and reservations, and rejects new ordinary allocations
+while the remaining capacity is insufficient. Recovery, exact request replay,
+publication and release of an admitted operation do not allocate again and are
+not blocked by a later policy reduction or an empty policy.
+
+All supported allocations (`open`, `load`, `checkpoint`) are ordinary. For each
+kind they must satisfy both `ordinary_used + units <= total - recovery_reserve`
+and `total_used + units <= total` in the same prepare transaction, before native
+execution. Every unreleased reservation contributes to both counts; for sessions,
+active legacy sessions contribute too. An authenticated tenant's `max_sessions`
+further limits session admission. Each tenant/owner is accounted independently.
+Session and Root reserves are zero unless explicitly configured otherwise.
+
+`JointResourceReservation.limit` is accepted only for decoding older requests
+and source compatibility. Its value is ignored for admission and replay identity,
+and new serialized requests omit it. Older stored request bodies remain intact
+and can be decoded, reconciled and published. Other request fields, including
+native UUIDs, digests, parameters and resource quantities, still have to match on
+replay. The legacy Session/Root limit arguments to `RootSessionOwner::new` are
+also accepted for source compatibility and do not control admission; repository
+assembly is the sole resource-budget authority.
+
+Reserved and committed units both remain charged. Unknown delivery,
+`needs_recovery`, known failure with residual objects and pending cleanup do not
+release capacity through timeout, TTL, restart or a single missing projection.
+Release requires confirmed non-delivery without residual resources, or settled
+original operations, validated absence of all owned objects and no surviving
+references. Release is transactional and idempotent; repeating it cannot return
+capacity twice.
+
+A nonzero recovery reserve withholds capacity from ordinary admissions; it does
+not create resources or provide a repair facility. The Root/direct owner consumes
+only ordinary Session/Root capacity. No supported operation consumes the reserved
+recovery pool. Replica creation, failure budgets, minimum retained copies,
+replacement publication and retirement of old copies require their own resource
+lifecycle implementations. Reservation names such as `replica` and `repair` do
+not establish those capabilities, and capacity pressure never authorizes deletion
+of a last usable copy.
