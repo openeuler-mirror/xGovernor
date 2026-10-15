@@ -31,6 +31,9 @@ impl DockerProvider {
                 &args(&[
                     "exec",
                     "-i",
+                    // Docker exec --privileged grants capabilities only to this
+                    // trusted initialization process, not to the container or agent.
+                    "--privileged",
                     "--user",
                     "0:0",
                     "--workdir",

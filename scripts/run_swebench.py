@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import getpass
 import importlib.metadata
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -101,7 +103,7 @@ def read_records(path):
     return data
 
 
-def load_instances(args, ids):
+def load_instances(args, ids=None):
     if args.dataset_file:
         records = read_records(args.dataset_file)
     else:
@@ -119,7 +121,13 @@ def load_instances(args, ids):
         else:
             records = load_dataset(args.dataset, split=args.split,
                                    cache_dir=str(cache) if cache else None)
-    selected = {row["instance_id"]: dict(row) for row in records if row["instance_id"] in ids}
+    wanted = set(ids) if ids is not None else None
+    selected = {row["instance_id"]: dict(row) for row in records
+                if wanted is None or row["instance_id"] in wanted}
+    if not selected:
+        raise ValueError("Dataset selection is empty")
+    if ids is None:
+        ids = list(selected)
     missing = set(ids) - selected.keys()
     if missing:
         raise ValueError(f"Instances not found in dataset: {', '.join(sorted(missing))}")
@@ -431,6 +439,9 @@ def parser():
     p.add_argument("instances", nargs="*", help="Instance IDs (spaces or commas)")
     p.add_argument("--instance-ids", nargs="+", action="extend", default=[])
     p.add_argument("--instances-file", type=Path, help="One ID per line; commas and # comments supported")
+    p.add_argument("--all", action="store_true", help="Run every instance in the selected dataset split")
+    p.add_argument("--jobs", type=int, choices=(1, 2), default=1,
+                   help="Maximum concurrent cases (limited to 2)")
     p.add_argument("--mode", choices=["run", "evaluate", "baseline"], default="run")
     p.add_argument("--predictions", type=Path, help="JSON/JSONL predictions for evaluate mode")
     p.add_argument("--patch", type=Path, help="Single-instance patch for evaluate mode")
@@ -468,11 +479,18 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if sys.version_info < (3, 11):
         raise ValueError("Python 3.11 or newer is required")
-    ids = parse_instance_ids(args.instances + args.instance_ids, args.instances_file)
+    requested = args.instances + args.instance_ids
+    if args.all and (requested or args.instances_file):
+        raise ValueError("--all cannot be combined with instance IDs or --instances-file")
+    if not args.all and not requested and not args.instances_file:
+        raise ValueError("Provide instance IDs, --instances-file, or --all")
+    ids = None if args.all else parse_instance_ids(requested, args.instances_file)
     if args.mode != "evaluate" and (args.patch or args.predictions):
         raise ValueError("--patch/--predictions require --mode evaluate")
     if args.mode == "evaluate" and bool(args.patch) == bool(args.predictions):
         raise ValueError("evaluate mode requires exactly one of --patch or --predictions")
+    if args.patch and ids is None:
+        raise ValueError("--patch cannot be combined with --all; use --predictions")
     if args.patch and len(ids) != 1:
         raise ValueError("--patch requires exactly one instance; use --predictions for multiple instances")
     for name in ("cpus", "max_turns", "agent_timeout", "test_timeout", "prepare_timeout"):
@@ -487,6 +505,8 @@ def main(argv=None):
         raise ValueError(f"Install scripts/swebench-requirements.txt (swebench=={HARNESS_VERSION})")
     from swebench.harness.test_spec.test_spec import make_test_spec
     rows = load_instances(args, ids)
+    if ids is None:
+        ids = list(rows)
     predictions = {}
     if args.predictions:
         predictions = {row["instance_id"]: row for row in read_records(args.predictions)}
@@ -516,15 +536,17 @@ def main(argv=None):
 
 
 def run_batch(args, root, runner, rows, ids, predictions, make_test_spec):
-    results = []
-    interrupted = False
-    for index, iid in enumerate(ids, 1):
+    batch_start = time.monotonic()
+    results = {}
+    completed = 0
+    interruption = threading.Event()
+
+    def run_one(index, iid):
         row = rows[iid]
         log(f"[{index}/{len(ids)}] {iid}")
         start = time.monotonic()
         result = {"instance_id": iid, "status": "error", "resolved": False}
-        # Only trace.jsonl is promoted to the output directory. All control-plane
-        # state, predictions, logs, and grading reports are temporary.
+        # Each concurrent case owns its daemon state, temp directory, and trace path.
         with tempfile.TemporaryDirectory(prefix="xgovernor-swe-") as temporary:
             folder = Path(temporary)
             try:
@@ -544,34 +566,94 @@ def run_batch(args, root, runner, rows, ids, predictions, make_test_spec):
                     result["error"] = f"Cleanup was incomplete: {errors}"
             except KeyboardInterrupt:
                 result.update(status="interrupted", error="Interrupted by user")
-                interrupted = True
+                interruption.set()
             except Exception as exc:
                 result["error"] = redact(str(exc))
             finally:
                 trace = folder / "trace.jsonl"
                 if trace.is_file():
                     destination = root / iid
-                    destination.mkdir(mode=0o700)
+                    destination.mkdir(mode=0o700, exist_ok=True)
                     shutil.copyfile(trace, destination / "trace.jsonl")
                     (destination / "trace.jsonl").chmod(0o600)
-                    log(f"  Context: {destination / 'trace.jsonl'}")
+                    log(f"[{index}/{len(ids)}] Context: {destination / 'trace.jsonl'}")
             result["elapsed_seconds"] = round(time.monotonic() - start, 2)
-            log(f"  {result['status']} ({result['elapsed_seconds']}s)" + (f": {result['error']}" if "error" in result else ""))
             if "error" in result:
-                # Surface useful diagnostics before the temporary directory disappears.
                 logs = sorted(folder.rglob("*.log"), key=lambda path: path.stat().st_mtime)
                 for path in logs[-2:]:
                     with path.open("rb") as source:
                         source.seek(max(0, path.stat().st_size - 2000))
-                        log(f"  {path.name}:\n{source.read().decode(errors='replace')}")
-        results.append(result)
-        if interrupted:
-            break
-    passed = sum(r["status"] in ("resolved", "baseline_verified") for r in results)
-    log(f"Summary: {passed}/{len(results)} passed; {len(ids) - len(results)} not run")
+                        log(f"[{index}/{len(ids)}] {path.name}:\n{source.read().decode(errors='replace')}")
+        return result
+
+    pool = ThreadPoolExecutor(max_workers=args.jobs, thread_name_prefix="swebench")
+    futures = {pool.submit(run_one, index, iid): iid for index, iid in enumerate(ids, 1)}
+    interrupted = False
+    try:
+        for future in as_completed(futures):
+            iid = futures[future]
+            try:
+                results[iid] = future.result()
+            except KeyboardInterrupt:
+                interrupted = True
+                results[iid] = {"instance_id": iid, "status": "interrupted", "error": "Interrupted by user"}
+                raise
+            except Exception as exc:
+                results[iid] = {"instance_id": iid, "status": "error", "resolved": False,
+                                "error": redact(str(exc))}
+            completed += 1
+            item = results[iid]
+            log(f"[{completed}/{len(ids)} done] {iid}: {item['status']} ({item.get('elapsed_seconds', 0)}s)"
+                + (f": {item['error']}" if "error" in item else ""))
+            if interruption.is_set():
+                raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        interrupted = True
+        for future, iid in futures.items():
+            if future.cancel():
+                results[iid] = {"instance_id": iid, "status": "not_run", "resolved": False}
+    finally:
+        pool.shutdown(wait=True, cancel_futures=interrupted)
     if interrupted:
+        for iid in ids:
+            results.setdefault(iid, {"instance_id": iid, "status": "not_run", "resolved": False})
+
+    ordered = [results.get(iid, {"instance_id": iid, "status": "not_run", "resolved": False}) for iid in ids]
+    passed = sum(r["status"] in ("resolved", "baseline_verified") for r in ordered)
+    batch_elapsed = round(time.monotonic() - batch_start, 2)
+    summary = {
+        "run_id": root.name, "dataset": args.dataset, "split": args.split, "mode": args.mode,
+        "jobs": args.jobs, "total": len(ids),
+        "completed": sum(r["status"] != "not_run" for r in ordered),
+        "passed": passed,
+        "failed": sum(r["status"] in ("error", "unresolved", "interrupted") for r in ordered),
+        "not_run": sum(r["status"] == "not_run" for r in ordered),
+        "elapsed_seconds": batch_elapsed, "cases": ordered,
+    }
+    save(root / "summary.json", summary)
+    (root / "summary.json").chmod(0o600)
+    write_summary_markdown(root / "summary.md", summary)
+    log(f"Summary: {passed}/{len(ids)} passed; {summary['failed']} failed; "
+        f"{summary['not_run']} not run in {batch_elapsed}s")
+    if any(r["status"] == "interrupted" for r in ordered):
         return 130
-    return 0 if passed == len(results) else 1
+    return 0 if passed == len(ids) else 1
+
+
+def write_summary_markdown(path, summary):
+    lines = [f"# SWE-bench run: {summary['run_id']}", "",
+             f"- Dataset: `{summary['dataset']}` ({summary['split']})",
+             f"- Mode: `{summary['mode']}`; concurrency: **{summary['jobs']}**",
+             f"- Result: **{summary['passed']}/{summary['total']} passed**, "
+             f"{summary['failed']} failed, {summary['not_run']} not run",
+             f"- Wall time: **{summary['elapsed_seconds']} s**", "",
+             "| Instance | Status | Time (s) | Error |", "|---|---|---:|---|"]
+    for case in summary["cases"]:
+        error = redact(str(case.get("error", ""))).replace("|", "\\|").replace("\n", " ")
+        lines.append(f"| `{case['instance_id']}` | {case['status']} | "
+                     f"{case.get('elapsed_seconds', '')} | {error} |")
+    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).chmod(0o600)
 
 
 if __name__ == "__main__":
