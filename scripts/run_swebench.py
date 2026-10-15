@@ -51,7 +51,8 @@ def save(path: Path, value) -> None:
 
 
 def log(message: str) -> None:
-    print(redact(message), flush=True)
+    # print(redact(message), flush=True)
+    pass
 
 
 def command(argv, *, log_path=None, timeout=1800, check=True, env=None):
