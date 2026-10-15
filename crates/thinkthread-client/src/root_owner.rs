@@ -229,6 +229,41 @@ impl RootSessionOwner {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+    async fn committed_open(
+        &self,
+        request: &JointPrepareRequest,
+        admission: &JointAdmission,
+        record: &SessionRecord,
+        repository: &Arc<dyn SessionRepository>,
+    ) -> Result<Option<SessionRecord>, SessionDomainError> {
+        if request.context.intent_id != admission.intent_id || request.binding != admission.binding
+        {
+            return Ok(None);
+        }
+        let Some(binding) = repository
+            .get_joint_binding(admission.binding.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if binding.stage != "active"
+            || binding.generation != admission.generation
+            || serde_json::to_value(&binding.creation)
+                .map_err(|_| unavailable("creation encoding failed"))?
+                != serde_json::to_value(&request)
+                    .map_err(|_| unavailable("request encoding failed"))?
+            || binding.creation.publication_input.as_ref() != Some(record)
+            || repository.get(&record.runtime_id).await?.as_ref() != Some(record)
+        {
+            return Ok(None);
+        }
+        // The idempotent publication transaction also verifies the complete original admission token.
+        repository
+            .publish_joint_session(admission.clone(), record.clone())
+            .await
+            .map(Some)
+    }
+
     async fn resume(
         &self,
         pending: JointPendingOperation,
@@ -277,12 +312,25 @@ impl RootSessionOwner {
             })?;
             Ok::<(), SessionDomainError>(())
         };
-        tokio::time::timeout(Duration::from_millis(self.timeout_ms), native_work)
-            .await
-            .map_err(|_| timeout("root_open", self.timeout_ms))??;
-        repository
-            .publish_joint_session(pending.admission, record)
-            .await
+        let result = async {
+            tokio::time::timeout(Duration::from_millis(self.timeout_ms), native_work)
+                .await
+                .map_err(|_| timeout("root_open", self.timeout_ms))??;
+            repository
+                .publish_joint_session(pending.admission.clone(), record.clone())
+                .await
+        }
+        .await;
+        match result {
+            Ok(record) => Ok(record),
+            Err(error) => match self
+                .committed_open(&pending.request, &pending.admission, &record, &repository)
+                .await?
+            {
+                Some(committed) => Ok(committed),
+                None => Err(error),
+            },
+        }
     }
 
     /// Compensates only an unpublished creation with all original mutations already settled.
@@ -341,9 +389,15 @@ impl RootSessionOwner {
             .as_ref()
             .is_some_and(|o| o.state == NativeOperationState::Failed && o.resources.is_empty())
         {
-            return Err(unavailable(
-                "failed create has no trustworthy residual identity; ownership retained",
-            ));
+            let known = repository
+                .get_joint_binding(pending.admission.binding.clone())
+                .await?
+                .ok_or_else(|| unavailable("missing durable binding"))?;
+            if known.objects.is_empty() {
+                return Err(unavailable(
+                    "failed create has no trustworthy residual identity; ownership retained",
+                ));
+            }
         }
         repository
             .begin_joint_compensation(pending.admission.clone())
@@ -684,14 +738,14 @@ impl JointSessionLifecycle for RootSessionOwner {
             {
                 pending
             } else {
-                let committed = repository
-                    .get(request.context.target_runtime_id.as_deref().unwrap())
+                let record = request
+                    .publication_input
+                    .as_ref()
+                    .ok_or_else(|| unavailable("missing durable publication input"))?;
+                return self
+                    .committed_open(&request, &admission, record, &repository)
                     .await?
-                    .ok_or_else(|| unavailable("open replay has no pending or committed result"))?;
-                if request.publication_input.as_ref() != Some(&committed) {
-                    return Err(unavailable("open replay committed input changed"));
-                }
-                return Ok(committed);
+                    .ok_or_else(|| unavailable("open replay has no verified committed result"));
             }
         };
         self.resume(pending, repository).await

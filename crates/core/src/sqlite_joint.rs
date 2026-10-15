@@ -707,19 +707,27 @@ impl SqliteSessionRepository {
                 params![admission.intent_id,step],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let native:JointNativeIntent=decode(&native)?;
             if native.operation_id!=operation_id || native.digest!=digest {return Err(conflict("joint native result identity mismatch"));}
+            let mut outcome=outcome;
+            let observed_resources=outcome.resources.clone();
             if let Some(old)=old {
                 if old==encode(&outcome)? {return Ok(());}
                 let old:JointNativeOutcome=decode(&old)?;
                 if matches!(old.state,NativeOperationState::Completed|NativeOperationState::Failed|NativeOperationState::NotSent) {return Err(conflict("joint terminal result changed"));}
+                for resource in old.resources {
+                    if !outcome.resources.contains(&resource) {outcome.resources.push(resource);}
+                }
             }
             if outcome.state==NativeOperationState::Completed && native.effect==NativeEffect::Create && outcome.resources.is_empty() {
                 return Err(conflict("completed create must identify owned objects"));
             }
             for resource in &outcome.resources {
                 if !nonempty(&resource.id)||!nonempty(&resource.kind) {return Err(conflict("invalid native object identity"));}
+                if native.effect==NativeEffect::Create && outcome.state==NativeOperationState::NotSent {return Err(conflict("not-sent operation cannot own objects"));}
+                if native.effect==NativeEffect::Create && resource.kind=="root" && request.context.operation!="open" {return Err(conflict("shared Root requires parent reference"));}
+            }
+            // Retained identities do not turn an empty observation into a new sighting of an object.
+            for resource in &observed_resources {
                 if native.effect==NativeEffect::Create {
-                    if outcome.state==NativeOperationState::NotSent {return Err(conflict("not-sent operation cannot own objects"));}
-                    if resource.kind=="root" && request.context.operation!="open" {return Err(conflict("shared Root requires parent reference"));}
                     tx.execute("INSERT INTO joint_objects VALUES(?1,?2,?3,?4,?5,0) ON CONFLICT(binding_id,generation,kind,native_id) DO UPDATE SET absent=0",
                         params![admission.binding.binding_id,admission.generation,request.root_id,resource.kind,resource.id])?;
                 }

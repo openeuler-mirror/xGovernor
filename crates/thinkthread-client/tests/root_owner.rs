@@ -687,3 +687,311 @@ async fn concurrent_open_reuses_the_winning_durable_request() {
         original.native[0].0.operation_id
     );
 }
+
+#[tokio::test]
+async fn partial_create_identity_survives_empty_outcomes_and_restart_compensation() {
+    for (known, erased_legacy_outcome) in [(false, false), (true, false), (true, true)] {
+        let f = Fixture::new("owner-create-drop");
+        let path = f.root.path().join("owner.db");
+        let repo = Arc::new(repository(&path));
+        let owner = f.owner();
+        assert!(owner
+            .open(f.context(), f.input(), repo.clone())
+            .await
+            .is_err());
+        let pending = repo
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let a = pending.admission.clone();
+        let native = pending.native[0].0.clone();
+        let root = JointNativeObject {
+            kind: "root".into(),
+            id: "fixture-owned-root".into(),
+        };
+        if known {
+            repo.record_joint_native_result(
+                a.clone(),
+                native.step.clone(),
+                native.operation_id.clone(),
+                native.digest.clone(),
+                JointNativeOutcome {
+                    state: NativeOperationState::Accepted,
+                    resources: vec![root.clone()],
+                    payload: json!({"partial":"first"}),
+                },
+            )
+            .await
+            .unwrap();
+            repo.record_joint_native_result(
+                a.clone(),
+                native.step.clone(),
+                native.operation_id.clone(),
+                native.digest.clone(),
+                JointNativeOutcome {
+                    state: NativeOperationState::Unknown,
+                    resources: vec![],
+                    payload: json!({"result":null}),
+                },
+            )
+            .await
+            .unwrap();
+            let current = repo
+                .pending_joint_operations()
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                current.native[0].1.as_ref().unwrap().resources,
+                vec![root.clone()]
+            );
+            assert_eq!(
+                current.native[0].1.as_ref().unwrap().payload,
+                json!({"result":null})
+            );
+        }
+        repo.record_joint_native_result(
+            a.clone(),
+            native.step.clone(),
+            native.operation_id.clone(),
+            native.digest.clone(),
+            JointNativeOutcome {
+                state: NativeOperationState::Failed,
+                resources: vec![],
+                payload: json!({"terminal":"failed"}),
+            },
+        )
+        .await
+        .unwrap();
+        let current = repo
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            current.native[0].1.as_ref().unwrap().resources,
+            if known { vec![root.clone()] } else { vec![] }
+        );
+        assert!(repo
+            .record_joint_native_result(
+                a.clone(),
+                native.step.clone(),
+                native.operation_id.clone(),
+                native.digest.clone(),
+                JointNativeOutcome {
+                    state: NativeOperationState::Unknown,
+                    resources: vec![],
+                    payload: json!({})
+                }
+            )
+            .await
+            .is_err());
+        if erased_legacy_outcome {
+            // Reproduce a journal row written before resource identities were retained monotonically.
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let mut outcome = current.native[0].1.clone().unwrap();
+            outcome.resources.clear();
+            db.execute(
+                "UPDATE joint_native_steps SET outcome_json=?1 WHERE intent_id=?2 AND step=?3",
+                rusqlite::params![
+                    serde_json::to_string(&outcome).unwrap(),
+                    a.intent_id,
+                    native.step
+                ],
+            )
+            .unwrap();
+        }
+        drop(repo);
+        let repo = Arc::new(repository(&path));
+        let pending = repo
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(pending.native[0].0.operation_id, native.operation_id);
+        if !known {
+            assert!(owner
+                .compensate_unpublished(pending, repo.clone())
+                .await
+                .is_err());
+            let db = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                db.query_row(
+                    "SELECT sum(units) FROM joint_reservations WHERE state='reserved'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                2
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT holder FROM joint_fences WHERE kind='source'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                a.intent_id
+            );
+            assert!(!f
+                .trace()
+                .iter()
+                .any(|r| ["thinkthread.stop", "thinkthread.remove"]
+                    .contains(&r["method"].as_str().unwrap())));
+            continue;
+        }
+        assert!(repo.finish_joint_compensation(a.clone()).await.is_err());
+        owner
+            .compensate_unpublished(pending, repo.clone())
+            .await
+            .unwrap();
+        assert!(repo.pending_joint_operations().await.unwrap().is_empty());
+        let binding = repo
+            .get_joint_binding(a.binding.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.stage, "removed");
+        assert!(binding.objects.is_empty());
+        let db = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT sum(units) FROM joint_reservations WHERE state='released'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM joint_fences WHERE holder IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let trace = f.trace();
+        for method in [
+            "thinkthread.create",
+            "thinkthread.stop",
+            "thinkthread.remove",
+        ] {
+            assert_eq!(trace.iter().filter(|r| r["method"] == method).count(), 1);
+        }
+        for row in trace.iter().filter(|r| {
+            ["thinkthread.stop", "thinkthread.remove"].contains(&r["method"].as_str().unwrap())
+        }) {
+            assert_eq!(row["params"]["thinkthreadIds"], json!([root.id]));
+            assert_eq!(row["params"]["force"], false);
+        }
+        assert!(trace
+            .iter()
+            .any(|r| r["method"] == "thinkthread.get" && r["params"]["thinkthreadId"] == root.id));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_open_returns_the_exact_publication_committed_by_another_connection() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    for gate_at in [1, 2] {
+        let mut f = Fixture::new("owner-concurrent");
+        f.config
+            .base_environment
+            .insert("XG_TEST_OPEN_GATE_AT".into(), gate_at.to_string());
+        let path = f.root.path().join("owner.db");
+        let gate_path = f.root.path().join("resume.sock");
+        let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
+        f.config.base_environment.insert(
+            "XG_TEST_RESUME_GATE".into(),
+            gate_path.to_string_lossy().into(),
+        );
+        let left = Arc::new(repository(&path));
+        let right = Arc::new(repository(&path));
+        let owner = f.owner();
+        let delayed = {
+            let owner = owner.clone();
+            let context = f.context();
+            let input = f.input();
+            let right = right.clone();
+            tokio::spawn(async move { owner.open(context, input, right).await })
+        };
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), gate.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "resume\n");
+        let snapshot = left.pending_joint_operations().await.unwrap().pop();
+        assert_eq!(snapshot.is_some(), gate_at == 2);
+        if let Some(original) = &snapshot {
+            assert!(original.native.iter().all(|(_, o)| o.is_none()));
+        }
+        let committed = owner
+            .open(f.context(), f.input(), left.clone())
+            .await
+            .unwrap();
+        let original = if let Some(original) = snapshot {
+            original
+        } else {
+            let creation = left
+                .get_joint_binding(committed.execution_backing.joint().unwrap().clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .creation;
+            let admission = left
+                .prepare_joint_operation(creation.clone())
+                .await
+                .unwrap();
+            JointPendingOperation {
+                admission,
+                native: creation.native.iter().cloned().map(|n| (n, None)).collect(),
+                request: creation,
+                stage: "prepared".into(),
+            }
+        };
+        assert!(left.pending_joint_operations().await.unwrap().is_empty());
+        stream.get_mut().write_all(b"x").await.unwrap();
+        let replayed = tokio::time::timeout(Duration::from_secs(5), delayed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, committed);
+        for variant in 0..5 {
+            let mut changed = original.clone();
+            match variant {
+                0 => changed.admission.generation += 1,
+                1 => changed.admission.intent_id = "foreign-intent".into(),
+                2 => changed.admission.binding.binding_id = "foreign-binding".into(),
+                3 => changed.admission.root_epoch += 1,
+                _ => changed.request.context.principal = "changed-principal".into(),
+            }
+            assert!(owner.reconcile(changed, right.clone()).await.is_err());
+        }
+        assert_eq!(left.get("public-session").await.unwrap(), Some(committed));
+        let trace = f.trace();
+        for method in ["thinkthread.create", "thinkthread.start"] {
+            assert_eq!(trace.iter().filter(|r| r["method"] == method).count(), 1);
+        }
+        assert_eq!(
+            trace
+                .iter()
+                .find(|r| r["method"] == "thinkthread.create")
+                .unwrap()["params"]["operationId"],
+            original.native[0].0.operation_id
+        );
+    }
+}

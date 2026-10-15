@@ -57,9 +57,18 @@ while True:
             if count <= 2:
                 with socket.socket(socket.AF_UNIX) as connection:
                     connection.connect(gate); connection.sendall(b"preflight\n"); connection.recv(1)
+        gate = os.environ.get("XG_TEST_RESUME_GATE")
+        if gate:
+            with open(gate + ".count", "a+") as counter:
+                fcntl.flock(counter, fcntl.LOCK_EX)
+                counter.seek(0); count = int(counter.read() or "0") + 1
+                counter.seek(0); counter.truncate(); counter.write(str(count)); counter.flush()
+            if count == int(os.environ.get("XG_TEST_OPEN_GATE_AT", "2")):
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.connect(gate); connection.sendall(b"resume\n"); connection.recv(1)
         result = {"bound": True}
     elif method == "thinkthread.create":
-        if scenario in ("drop-create","durable-drop-create"): sys.exit(0)
+        if scenario in ("drop-create","durable-drop-create","owner-create-drop"): sys.exit(0)
         result = {"operation": handle(params), "thinkthreadId": root, "changed": True}
         if scenario == "wrong-operation": result["operation"]["operationId"] = "bad-operation"
         if scenario == "wrong-digest": result["operation"]["operationDigest"] = "0" * 64

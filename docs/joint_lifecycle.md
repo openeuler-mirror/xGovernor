@@ -20,11 +20,11 @@ SQLite stores joint sessions and checkpoints in independent tables in the same d
 
 The durable repository API commits a binding, public identity claim, native UUID/digest/parameters, reservations, parent reference and Root/source fence before downstream effects. A repeated parent intent must match the original request exactly. Admission counts active legacy sessions plus joint reservations, including unpublished and unknown operations. A new Root requires its own reservation. Every later binding in that Root has an explicit active parent with matching tenant, owner, runtime and configuration revision. Independent native objects have one owner within a Root.
 
-Record native outcomes with their exact original UUID and digest. Accepted, unknown and failed results retain any known partial objects. An unknown result does not release a reservation, identity claim or fence. A later create result invalidates earlier absence for its objects. Native parameters and results must be sanitized by the trusted adapter before persistence; the repository rejects known credential fields but does not provide arbitrary secret discovery.
+Record native outcomes with their exact original UUID and digest. Accepted, unknown and failed results retain the union of resource identities already observed for the same native step. The payload is the latest observation; intermediate payload history is not retained. Terminal outcomes remain immutable. An unknown result does not release a reservation, identity claim or fence. A later create result invalidates earlier absence for its objects. Native parameters and results must be sanitized by the trusted adapter before persistence; the repository rejects known credential fields but does not provide arbitrary secret discovery.
 
 Public session/checkpoint publication atomically checks parent stage, binding generation, Root/source fence and completed native results, then commits the public record, reference, reservations and publication result. Replaying the same publication returns the committed result. No provider snapshot placeholder or separate second save is involved.
 
-A release first prevents new dependent references. Final release requires settled original operations, exact absence for every owned object in the binding generation and no other references. Unpublished creation has a separate compensation finish with the same requirements; unknown delivery cannot be treated as not sent. Partial results, UUIDs and failure history remain after release for reconciliation. Pending intents are dispatched to their persisted joint owner; the application does not create replacement mutations or invoke legacy cleanup.
+A release first prevents new dependent references. Final release requires settled original operations, exact absence for every owned object in the binding generation and no other references. Unpublished creation has a separate compensation finish with the same requirements; unknown delivery cannot be treated as not sent. Known resource identities, UUIDs and terminal outcomes remain after release for reconciliation. Pending intents are dispatched to their persisted joint owner; the application does not create replacement mutations or invoke legacy cleanup.
 
 This API supplies durable storage primitives. `supports_joint_transactions` remains false by default; an explicitly assembled owner can opt into the verified SQLite implementation. These primitives do not enable a server backend or provide a multi-writer deployment contract for the legacy lifecycle.
 
@@ -88,3 +88,17 @@ replacement publication and retirement of old copies require their own resource
 lifecycle implementations. Reservation names such as `replica` and `repair` do
 not establish those capabilities, and capacity pressure never authorizes deletion
 of a last usable copy.
+
+
+Concurrent open recovery accepts a committed Session only after matching the
+original intent, binding, generation, complete creation request and publication
+input. The idempotent publication transaction verifies the full admission token
+and persisted result. A public runtime ID alone is insufficient. If another
+executor publishes while a caller is resuming a pending operation, that caller
+returns the verified committed result without another native mutation. Missing or
+mismatching durable evidence remains an error.
+
+Unpublished Root compensation resolves residual identities from the durable
+binding, including older journals whose last outcome omitted a previously known
+Root. A failed create with no known object in either the outcome or binding keeps
+its ownership and capacity; an empty result is not proof of absence.

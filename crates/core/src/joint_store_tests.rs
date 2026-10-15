@@ -992,3 +992,72 @@ async fn legacy_request_limits_decode_and_reconcile_without_controlling_admissio
         .all(|r| r.get("limit").is_none()));
     assert!(repo.pending_joint_operations().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn failed_prepare_rolls_back_every_claim_before_durable_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let mut req = request(
+        "interrupted",
+        "open",
+        "",
+        "interrupted-target",
+        "",
+        "root",
+        None,
+    );
+    let mut record = sample_record("interrupted-target");
+    record.execution_backing = SessionExecutionBacking::JointV1 {
+        binding: req.binding.clone(),
+    };
+    req.publication_input = Some(record);
+    repo.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_prepare BEFORE INSERT ON joint_native_steps BEGIN SELECT RAISE(ABORT,'injected prepare interruption'); END;").unwrap();
+    assert!(matches!(
+        repo.prepare_joint_operation(req.clone()).await,
+        Err(SessionDomainError::Internal { .. })
+    ));
+    drop(repo);
+    let repo = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let db = repo.conn.lock().unwrap();
+    for table in [
+        "joint_operations",
+        "joint_reservations",
+        "joint_public_claims",
+        "joint_workspace_claims",
+        "joint_fences",
+        "joint_bindings",
+        "joint_roots",
+        "joint_native_steps",
+        "joint_refs",
+        "joint_sessions",
+    ] {
+        assert_eq!(
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    db.execute_batch("DROP TRIGGER fail_prepare").unwrap();
+    drop(db);
+    let admission = repo.prepare_joint_operation(req.clone()).await.unwrap();
+    drop(repo);
+    let reopened = SqliteSessionRepository::open(&path).unwrap();
+    let pending = reopened
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(pending.admission, admission);
+    assert_eq!(pending.native[0].0.operation_id, req.native[0].operation_id);
+    assert!(pending.native[0].1.is_none());
+}

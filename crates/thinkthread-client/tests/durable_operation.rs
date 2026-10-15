@@ -2,7 +2,7 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -10,6 +10,30 @@ use xgovernor_core::*;
 use xgovernor_thinkthread_client::{
     durable_operation::DurableManagementOperation, sdk, ManagementConfig,
 };
+fn repository(path: &Path) -> Arc<SqliteSessionRepository> {
+    Arc::new(
+        SqliteSessionRepository::open(path)
+            .unwrap()
+            .with_joint_budget_policy(JointBudgetPolicy::from([
+                (
+                    "session".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "root".into(),
+                    JointResourceBudget {
+                        total: 1,
+                        ..Default::default()
+                    },
+                ),
+            ]))
+            .unwrap(),
+    )
+}
+
 struct Fixture {
     root: TempDir,
     config: ManagementConfig,
@@ -52,6 +76,20 @@ impl Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
+    if let Some(path) = std::env::var_os("XG_TEST_PREPARE_CHILD") {
+        let value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let repo = repository(Path::new(value["db"].as_str().unwrap()));
+        let request: JointPrepareRequest =
+            serde_json::from_value(value["request"].clone()).unwrap();
+        let admission = repo.prepare_joint_operation(request).await.unwrap();
+        std::fs::write(
+            value["admission_file"].as_str().unwrap(),
+            serde_json::to_vec(&admission).unwrap(),
+        )
+        .unwrap();
+        // Bypass connection destructors after the admission commit and before any send claim.
+        std::process::exit(23);
+    }
     let mut f = Fixture::new("durable-drop-create");
     let gate_path = f.root.path().join("operation.sock");
     let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
@@ -60,27 +98,8 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
         gate_path.to_string_lossy().into(),
     );
     let path = f.root.path().join("owner.db");
-    let repo = Arc::new(
-        SqliteSessionRepository::open(&path)
-            .unwrap()
-            .with_joint_budget_policy(JointBudgetPolicy::from([
-                (
-                    "session".into(),
-                    JointResourceBudget {
-                        total: 1,
-                        ..Default::default()
-                    },
-                ),
-                (
-                    "root".into(),
-                    JointResourceBudget {
-                        total: 1,
-                        ..Default::default()
-                    },
-                ),
-            ]))
-            .unwrap(),
-    );
+    let reopen = || repository(&path);
+    let repo = reopen();
     let client = f.config.connect().await.unwrap();
     let create:sdk::ThinkThreadCreateRequest=serde_json::from_value(json!({"agent":{"kind":"profile","name":"fixture"},"fs":f.config.fs_root,"models":[],"allowSharedFs":false})).unwrap();
     let params = serde_json::to_value(create).unwrap();
@@ -133,32 +152,47 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
         publication_input: None,
         native: vec![native.clone()],
     };
-    let admission = repo.prepare_joint_operation(request.clone()).await.unwrap();
     client.close().await.unwrap();
+    let child_input = f.root.path().join("prepare-child.json");
+    let admission_file = f.root.path().join("admission.json");
+    std::fs::write(
+        &child_input,
+        serde_json::to_vec(&json!({"db":path,"request":request,"admission_file":admission_file}))
+            .unwrap(),
+    )
+    .unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "competing_senders_recover_original_uuid_after_claimant_disappears",
+            "--nocapture",
+        ])
+        .env("XG_TEST_PREPARE_CHILD", &child_input)
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let admission: JointAdmission =
+        serde_json::from_slice(&std::fs::read(admission_file).unwrap()).unwrap();
+    drop(repo);
+    let repo = reopen();
+    let durable = repo
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(durable.admission, admission);
+    assert_eq!(durable.native[0].0.operation_id, native.operation_id);
+    assert!(durable.native[0].1.is_none());
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut handles = Vec::new();
     for _ in 0..2 {
-        let repository = Arc::new(
-            SqliteSessionRepository::open(&path)
-                .unwrap()
-                .with_joint_budget_policy(JointBudgetPolicy::from([
-                    (
-                        "session".into(),
-                        JointResourceBudget {
-                            total: 1,
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "root".into(),
-                        JointResourceBudget {
-                            total: 1,
-                            ..Default::default()
-                        },
-                    ),
-                ]))
-                .unwrap(),
-        );
+        let repository = repository(&path);
         let mut config = f.config.clone();
         config.base_environment.insert(
             "XG_TEST_OPERATION_GATE".into(),
@@ -246,27 +280,7 @@ async fn competing_senders_recover_original_uuid_after_claimant_disappears() {
         NativeOperationState::Unknown
     );
     drop(repo);
-    let repo = Arc::new(
-        SqliteSessionRepository::open(&path)
-            .unwrap()
-            .with_joint_budget_policy(JointBudgetPolicy::from([
-                (
-                    "session".into(),
-                    JointResourceBudget {
-                        total: 1,
-                        ..Default::default()
-                    },
-                ),
-                (
-                    "root".into(),
-                    JointResourceBudget {
-                        total: 1,
-                        ..Default::default()
-                    },
-                ),
-            ]))
-            .unwrap(),
-    );
+    let repo = repository(&path);
     let db = rusqlite::Connection::open(&path).unwrap();
     assert_eq!(
         db.query_row(
