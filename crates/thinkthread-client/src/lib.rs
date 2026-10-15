@@ -3,6 +3,7 @@
 //! This crate is not registered as a Session runtime or execution backend.
 
 pub mod durable_operation;
+pub mod root_owner;
 
 use std::collections::BTreeMap;
 use std::fmt;

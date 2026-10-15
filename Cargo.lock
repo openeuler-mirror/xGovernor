@@ -3483,6 +3483,8 @@ dependencies = [
 name = "xgovernor-thinkthread-client"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

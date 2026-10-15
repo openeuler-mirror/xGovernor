@@ -89,6 +89,8 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
           kind TEXT NOT NULL, id TEXT NOT NULL, root_id TEXT NOT NULL, tenant_key TEXT NOT NULL,
           epoch INTEGER NOT NULL, holder TEXT,
           PRIMARY KEY(kind,id));
+        CREATE TABLE IF NOT EXISTS joint_workspace_claims (
+          path TEXT PRIMARY KEY, binding_id TEXT NOT NULL UNIQUE REFERENCES joint_bindings(id));
         CREATE TABLE IF NOT EXISTS joint_public_claims (
           kind TEXT NOT NULL, public_id TEXT NOT NULL, intent_id TEXT NOT NULL UNIQUE,
           PRIMARY KEY(kind,public_id));
@@ -191,6 +193,16 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
             .any(|r| r.kind == "root" && r.units == 1)
     {
         return Err(conflict("new Root requires a resource reservation"));
+    }
+    if let Some(record) = &request.publication_input {
+        crate::joint_lifecycle::validate_committed_session(record, c, &request.binding.owner_kind)?;
+        if !["open", "load"].contains(&c.operation.as_str())
+            || record.execution_backing.joint() != Some(&request.binding)
+            || record.status != SessionStatus::Idle
+            || !no_credentials(&serde_json::to_value(record)?)
+        {
+            return Err(conflict("invalid durable publication input"));
+        }
     }
     let mut kinds = BTreeSet::new();
     for reservation in &request.reservations {
@@ -398,6 +410,9 @@ impl SqliteSessionRepository {
                 tx.execute("INSERT INTO joint_bindings VALUES(?1,?2,?3,?4,?5,?6,1,'prepared',?7,?8)",
                     params![binding.binding_id,binding.owner_kind,binding.configuration_revision,request.context.runtime_kind,tenant,request.root_id,id,request.parent_binding.as_ref().map(|v|&v.binding_id)])?;
             }
+            if let Some(record)=&request.publication_input {
+                tx.execute("INSERT INTO joint_workspace_claims VALUES(?1,?2)",params![record.workspace.root,binding.binding_id])?;
+            }
             if request.context.operation=="open" {
                 tx.execute("INSERT INTO joint_roots VALUES(?1,?2,?3,?4,?5)",params![request.root_id,binding.owner_kind,binding.configuration_revision,tenant,binding.binding_id])?;
             } else {
@@ -451,6 +466,25 @@ impl SqliteSessionRepository {
         }).await
     }
 
+    /// Excludes ordinary dispatch/publication before any compensation side effect.
+    pub async fn begin_joint_compensation(
+        &self,
+        admission: JointAdmission,
+    ) -> std::result::Result<(), SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            let (request,stage,_)=operation(tx,&admission)?;check_fences(tx,&request,&admission)?;
+            if stage=="compensating" {return Ok(());}
+            if !["prepared","accepted","unknown"].contains(&stage.as_str()) {return Err(conflict("operation cannot enter compensation"));}
+            let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_native_steps WHERE intent_id=?1 AND coalesce(json_extract(intent_json,'$.compensation'),0)=0 AND (outcome_json IS NULL OR json_extract(outcome_json,'$.state') NOT IN ('completed','failed','not_sent')))",[&admission.intent_id],|r|r.get(0))?;
+            let refs:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_refs WHERE binding_id=?1)",[&admission.binding.binding_id],|r|r.get(0))?;
+            if unsettled||refs {return Err(conflict("unsettled execution or references prevent compensation"));}
+            let changed=tx.execute("UPDATE joint_bindings SET state='compensating' WHERE id=?1 AND generation=?2 AND creation_intent=?3 AND state='prepared'",
+                params![admission.binding.binding_id,admission.generation,admission.intent_id])?;
+            if changed!=1 {return Err(conflict("binding is no longer unpublished"));}
+            tx.execute("UPDATE joint_operations SET stage='compensating' WHERE id=?1",[&admission.intent_id])?;Ok(())
+        }).await
+    }
+
     /// Claims the sole initial send. A crash after this commit requires an exact UUID query.
     pub async fn claim_joint_native_send(
         &self,
@@ -460,15 +494,17 @@ impl SqliteSessionRepository {
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;
             check_fences(tx,&request,&admission)?;
-            if !["prepared","accepted","unknown"].contains(&stage.as_str()) {return Err(conflict("joint operation no longer permits sending"));}
+            if !["prepared","accepted","unknown","compensating"].contains(&stage.as_str()) {return Err(conflict("joint operation no longer permits sending"));}
             let (intent,outcome):(String,Option<String>)=tx.query_row("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2",
                 params![admission.intent_id,step],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            let native:JointNativeIntent=decode(&intent)?;
+            if native.compensation!=(stage=="compensating") {return Err(conflict("native dispatch phase mismatch"));}
             if outcome.is_some() {return Ok(None);}
             let unknown=JointNativeOutcome {state:NativeOperationState::Unknown,resources:vec![],payload:serde_json::json!({"delivery":"sent_unknown"})};
             let changed=tx.execute("UPDATE joint_native_steps SET outcome_json=?1 WHERE intent_id=?2 AND step=?3 AND outcome_json IS NULL",
                 params![encode(&unknown)?,admission.intent_id,step])?;
             if changed!=1 {return Err(conflict("joint send claim changed"));}
-            tx.execute("UPDATE joint_operations SET stage='unknown' WHERE id=?1",[&admission.intent_id])?;
+            tx.execute("UPDATE joint_operations SET stage=CASE WHEN stage='compensating' THEN stage ELSE 'unknown' END WHERE id=?1",[&admission.intent_id])?;
             Ok(Some(decode(&intent)?))
         }).await
     }
@@ -484,8 +520,19 @@ impl SqliteSessionRepository {
         self.joint_transaction(move |tx| {
             let (request, stage, _) = operation(tx, &admission)?;
             check_fences(tx, &request, &admission)?;
-            if !["prepared", "accepted", "unknown", "releasing"].contains(&stage.as_str()) {
+            if ![
+                "prepared",
+                "accepted",
+                "unknown",
+                "releasing",
+                "compensating",
+            ]
+            .contains(&stage.as_str())
+            {
                 return Err(conflict("joint operation no longer admits native steps"));
+            }
+            if native.compensation != (stage == "compensating") {
+                return Err(conflict("native append phase mismatch"));
             }
             if let Some(old) = tx
                 .query_row(
@@ -530,7 +577,7 @@ impl SqliteSessionRepository {
         }
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;check_fences(tx,&request,&admission)?;
-            if !["prepared","accepted","unknown","releasing"].contains(&stage.as_str()) {return Err(conflict("joint result belongs to a settled operation"));}
+            if !["prepared","accepted","unknown","releasing","compensating"].contains(&stage.as_str()) {return Err(conflict("joint result belongs to a settled operation"));}
             let (native,old):(String,Option<String>)=tx.query_row("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2",
                 params![admission.intent_id,step],|r|Ok((r.get(0)?,r.get(1)?)))?;
             let native:JointNativeIntent=decode(&native)?;
@@ -561,7 +608,7 @@ impl SqliteSessionRepository {
             let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_native_steps WHERE intent_id=?1 AND (outcome_json IS NULL OR json_extract(outcome_json,'$.state') IN ('unknown','needs_recovery','failed')))",
                 [&admission.intent_id],|r|r.get(0))?;
             let next=if unsettled {"unknown"}else{"accepted"};
-            tx.execute("UPDATE joint_operations SET stage=?1 WHERE id=?2",params![next,admission.intent_id])?;Ok(())
+            tx.execute("UPDATE joint_operations SET stage=CASE WHEN stage='compensating' THEN stage ELSE ?1 END WHERE id=?2",params![next,admission.intent_id])?;Ok(())
         }).await
     }
 
@@ -590,6 +637,9 @@ impl SqliteSessionRepository {
                 let roots:i64=tx.query_row("SELECT count(*) FROM joint_objects WHERE binding_id=?1 AND generation=?2 AND kind='root' AND absent=0",
                     params![admission.binding.binding_id,admission.generation],|r|r.get(0))?;
                 if roots!=1 {return Err(conflict("new session must identify its owned Root"));}
+            }
+            if request.publication_input.as_ref().is_some_and(|input|input!=&record) {
+                return Err(conflict("durable publication input changed"));
             }
             crate::joint_lifecycle::validate_committed_session(
                 &record,
@@ -710,6 +760,7 @@ impl SqliteSessionRepository {
             } else {tx.execute("DELETE FROM joint_checkpoints WHERE checkpoint_id=?1",[public_id])?;}
             tx.execute("DELETE FROM joint_refs WHERE kind='binding' AND public_id=?1",[&admission.binding.binding_id])?;
             tx.execute("UPDATE joint_bindings SET state='removed' WHERE id=?1",[&admission.binding.binding_id])?;
+            tx.execute("DELETE FROM joint_workspace_claims WHERE binding_id=?1",[&admission.binding.binding_id])?;
             tx.execute("UPDATE joint_reservations SET state='released' WHERE intent_id IN (?1,?2)",params![created,admission.intent_id])?;
             tx.execute("UPDATE joint_operations SET stage='released' WHERE id IN (?1,?2)",params![created,admission.intent_id])?;
             release_fences(tx,&admission.intent_id)?;Ok(())
@@ -725,7 +776,7 @@ impl SqliteSessionRepository {
             let (request,stage,_)=operation(tx,&admission)?;
             if stage=="compensated" {return Ok(());}
             check_fences(tx,&request,&admission)?;
-            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_bindings WHERE id=?1 AND state='prepared' AND creation_intent=?2)",
+            let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_bindings WHERE id=?1 AND state IN ('prepared','compensating') AND creation_intent=?2)",
                 params![admission.binding.binding_id,admission.intent_id],|r|r.get(0))?;
             if !valid {return Err(conflict("published binding cannot use creation compensation"));}
             let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_native_steps WHERE intent_id=?1 AND (outcome_json IS NULL OR json_extract(outcome_json,'$.state') NOT IN ('completed','failed','not_sent')))",
@@ -736,10 +787,27 @@ impl SqliteSessionRepository {
             if unsettled || refs || alive {return Err(conflict("joint compensation is not confirmed"));}
             tx.execute("DELETE FROM joint_refs WHERE kind='binding' AND public_id=?1",[&admission.binding.binding_id])?;
             tx.execute("UPDATE joint_bindings SET state='removed' WHERE id=?1",[&admission.binding.binding_id])?;
+            tx.execute("DELETE FROM joint_workspace_claims WHERE binding_id=?1",[&admission.binding.binding_id])?;
             tx.execute("UPDATE joint_reservations SET state='released' WHERE intent_id=?1",[&admission.intent_id])?;
             tx.execute("UPDATE joint_operations SET stage='compensated' WHERE id=?1",[&admission.intent_id])?;
             tx.execute("DELETE FROM joint_public_claims WHERE intent_id=?1",[&admission.intent_id])?;
             release_fences(tx,&admission.intent_id)?;Ok(())
+        }).await
+    }
+
+    pub async fn read_joint_binding(
+        &self,
+        binding: crate::JointBinding,
+    ) -> std::result::Result<Option<JointBindingState>, SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            let row:Option<(String,String,u64,String,String)>=tx.query_row("SELECT owner_kind,revision,generation,state,creation_intent FROM joint_bindings WHERE id=?1",[&binding.binding_id],
+                |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+            let Some((owner,revision,generation,stage,intent))=row else {return Ok(None);};
+            if owner!=binding.owner_kind || revision!=binding.configuration_revision {return Err(conflict("joint binding ownership mismatch"));}
+            let creation:String=tx.query_row("SELECT request_json FROM joint_operations WHERE id=?1",[intent],|r|r.get(0))?;
+            let objects=tx.prepare("SELECT kind,native_id FROM joint_objects WHERE binding_id=?1 AND generation=?2 AND absent=0")?
+                .query_map(params![binding.binding_id,generation],|r|Ok(JointNativeObject{kind:r.get(0)?,id:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Some(JointBindingState{binding,generation,stage,creation:decode(&creation)?,objects}))
         }).await
     }
 

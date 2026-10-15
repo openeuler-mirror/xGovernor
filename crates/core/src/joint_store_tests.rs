@@ -121,6 +121,7 @@ fn request(
         exclusive_root: false,
         parent_binding: parent,
         reservations,
+        publication_input: None,
         native: vec![JointNativeIntent {
             step: "native".into(),
             operation_id: format!(
@@ -132,6 +133,7 @@ fn request(
             digest: "a".repeat(64),
             method: if creating { "create" } else { "inspect" }.into(),
             params: serde_json::json!({"source":source}),
+            compensation: false,
             effect: if creating {
                 NativeEffect::Create
             } else {
@@ -403,10 +405,16 @@ async fn source_fences_and_partial_creation_compensation_survive_restart() {
         vec![object(&req.binding)],
     )
     .await;
+    repo.begin_joint_compensation(a.clone()).await.unwrap();
+    assert!(repo
+        .claim_joint_native_send(a.clone(), req.native[0].step.clone())
+        .await
+        .is_err());
     let mut cleanup = req.native[0].clone();
     cleanup.step = "absence".into();
     cleanup.operation_id = "11111111-1111-4111-8111-111111111111".into();
     cleanup.effect = NativeEffect::ObserveAbsence;
+    cleanup.compensation = true;
     repo.append_joint_native_step(a.clone(), cleanup.clone())
         .await
         .unwrap();
@@ -429,6 +437,19 @@ async fn source_fences_and_partial_creation_compensation_survive_restart() {
 async fn retained_references_prevent_close_until_exact_absence_is_committed() {
     let repo = SqliteSessionRepository::open_in_memory().unwrap();
     let (source, _) = open(&repo, "source", "source", "root").await;
+    let mut foreign = request(
+        "foreign",
+        "checkpoint",
+        "source",
+        "",
+        "foreign-checkpoint",
+        "root",
+        Some(source.binding.clone()),
+    );
+    foreign.context.tenant_id = Some("another-tenant".into());
+    foreign.context.owner_ref = "tenant/another-tenant".into();
+    assert!(repo.prepare_joint_operation(foreign).await.is_err());
+    assert!(repo.pending_joint_operations().await.unwrap().is_empty());
     let cp = checkpoint(&repo, "checkpoint", &source).await;
     let mut close = request("close", "close", "source", "", "", "root", None);
     close.binding = source.binding.clone();

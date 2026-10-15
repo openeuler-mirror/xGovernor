@@ -8,10 +8,13 @@ state = "Ready"
 messages = {}
 starts = 0
 stops = 0
+state_file = os.environ.get("XG_TEST_STATE")
+if scenario.startswith("owner") and state_file and os.path.exists(state_file):
+    with open(state_file) as source: state = json.load(source)["state"]
 
 def view():
     return {"thinkthreadId": root, "rootId": root, "state": state,
-            "sessionState": "Ready", "agent": "fixture", "fs": "/fixture",
+            "sessionState": "Ready", "agent": "fixture", "fs": os.environ.get("XG_TEST_FS", "/fixture"),
             "contentRevision": "1", "needsRecovery": scenario == "needs-recovery"}
 
 def handle(params):
@@ -46,8 +49,23 @@ while True:
             original = next(json.loads(line) for line in source if json.loads(line)["method"] == "thinkthread.create")
         result = {"operation": handle(original["params"]), "method": "thinkthread.create", "state": "succeeded",
                   "acceptedAt": "2026-01-01T00:00:00Z", "result": {"thinkthreadId": root, "changed": True}}
-    elif method == "thinkthread.get": result = view()
+    elif method == "operation.get" and scenario.startswith("owner"):
+        with open(trace) as source:
+            original = next(json.loads(line) for line in source if json.loads(line)["params"].get("operationId") == params["operationId"])
+        failed = scenario == "owner-start-reject" and original["method"] == "thinkthread.start"
+        result = {"operation": handle(original["params"]), "method": original["method"], "state": "failed" if failed else "succeeded",
+                  "acceptedAt": "2026-01-01T00:00:00Z", "result": {"thinkthreadId": root, "changed": True}}
+    elif method == "thinkthread.get":
+        if scenario.startswith("owner") and state == "Absent":
+            data = json.dumps({"protocolVersion": 2, "id": req["id"], "ok": False,
+                "error": {"code": "ThinkThreadNotFound", "message": "absent", "retryable": False, "delivery": "accepted"}}).encode()
+            sys.stdout.buffer.write(struct.pack(">I", len(data)) + data); sys.stdout.buffer.flush(); continue
+        result = view()
     elif method == "thinkthread.start":
+        if scenario == "owner-start-reject":
+            data = json.dumps({"protocolVersion": 2, "id": req["id"], "ok": False,
+                "error": {"code": "ManagementFailed", "message": "start rejected", "retryable": False, "delivery": "accepted"}}).encode()
+            sys.stdout.buffer.write(struct.pack(">I", len(data)) + data); sys.stdout.buffer.flush(); continue
         starts += 1; state = "Running"
         result = {"operation": handle(params), "thinkthreadId": root, "changed": starts == 1}
     elif method == "message.send":
@@ -87,4 +105,6 @@ while True:
         result = {"reached": reached, "thinkthreads": [] if state == "Absent" else [view()]}
         if scenario == "not-absent" and params["target"] == "absent": result = {"reached": False, "thinkthreads": [view()]}
     else: sys.exit(2)
+    if scenario.startswith("owner") and state_file:
+        with open(state_file,"w") as sink: json.dump({"state":state},sink)
     reply(req, result)

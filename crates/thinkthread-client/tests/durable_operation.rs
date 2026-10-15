@@ -65,6 +65,7 @@ async fn lost_create_response_recovers_original_uuid_without_a_second_mutation()
         method: "thinkthread.create".into(),
         params,
         effect: NativeEffect::Create,
+        compensation: false,
     };
     let request = JointPrepareRequest {
         context: JointOperationContext {
@@ -102,6 +103,7 @@ async fn lost_create_response_recovers_original_uuid_without_a_second_mutation()
                 limit: 1,
             },
         ],
+        publication_input: None,
         native: vec![native.clone()],
     };
     let admission = repo.prepare_joint_operation(request).await.unwrap();
@@ -137,6 +139,7 @@ async fn lost_create_response_recovers_original_uuid_without_a_second_mutation()
         method: "thinkthread.start".into(),
         params,
         effect: NativeEffect::Mutate,
+        compensation: false,
     };
     repo.append_joint_native_step(admission.clone(), start)
         .await

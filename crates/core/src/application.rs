@@ -1482,7 +1482,7 @@ impl SessionApplication {
         if let Some(binding) = record.execution_backing.joint() {
             return self
                 .joint_owner(&record.runtime.runtime_kind, binding)?
-                .check_alive(&record)
+                .check_alive(&record, self.records.clone())
                 .await;
         }
         let registration = self.registration_for_record(&record)?;
@@ -3141,6 +3141,12 @@ pub trait SessionRepository: Send + Sync {
     fn supports_joint_transactions(&self) -> bool {
         false
     }
+    async fn get_joint_binding(
+        &self,
+        _binding: crate::JointBinding,
+    ) -> Result<Option<crate::JointBindingState>, SessionDomainError> {
+        Err(crate::unsupported_joint("binding_lookup"))
+    }
     async fn get_joint_checkpoint(
         &self,
         _id: &str,
@@ -3153,6 +3159,12 @@ pub trait SessionRepository: Send + Sync {
         _request: crate::JointPrepareRequest,
     ) -> Result<crate::JointAdmission, SessionDomainError> {
         Err(crate::unsupported_joint("prepare_joint_operation"))
+    }
+    async fn begin_joint_compensation(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("begin_compensation"))
     }
     async fn claim_joint_native_send(
         &self,

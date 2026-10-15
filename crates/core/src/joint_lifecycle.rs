@@ -167,7 +167,11 @@ pub trait JointSessionLifecycle: Send + Sync {
     ) -> Result<(), SessionDomainError> {
         Err(unsupported_joint("attach"))
     }
-    async fn check_alive(&self, _session: &SessionRecord) -> Result<bool, SessionDomainError> {
+    async fn check_alive(
+        &self,
+        _session: &SessionRecord,
+        _repository: Arc<dyn SessionRepository>,
+    ) -> Result<bool, SessionDomainError> {
         Err(unsupported_joint("check_alive"))
     }
     async fn delete_checkpoint(

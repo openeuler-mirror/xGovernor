@@ -55,7 +55,14 @@ impl<'a> DurableManagementOperation<'a> {
             .find(|(n, _)| n.step == step)
             .cloned()
             .ok_or(DurableOperationError::Identity("native step not found"))?;
-        if !["thinkthread.create", "thinkthread.start"].contains(&native.method.as_str()) {
+        if ![
+            "thinkthread.create",
+            "thinkthread.start",
+            "thinkthread.stop",
+            "thinkthread.remove",
+        ]
+        .contains(&native.method.as_str())
+        {
             return Err(DurableOperationError::Identity(
                 "method is not supported by durable dispatch",
             ));
@@ -111,6 +118,58 @@ impl<'a> DurableManagementOperation<'a> {
                     ));
                 }
             }
+            "thinkthread.stop" | "thinkthread.remove" => {
+                if pending.request.context.operation != "open"
+                    || pending.request.publication_input.is_none()
+                {
+                    return Err(DurableOperationError::Identity(
+                        "only unpublished creation compensation is supported",
+                    ));
+                }
+                let (params, targets, force) = if native.method == "thinkthread.stop" {
+                    let req: sdk::ThinkThreadStopRequest = decode(native.params.clone())?;
+                    (
+                        serde_json::to_value(&req)
+                            .map_err(|_| DurableOperationError::Identity("stop encoding"))?,
+                        req.thinkthread_ids,
+                        req.force,
+                    )
+                } else {
+                    let req: sdk::ThinkThreadRemoveRequest = decode(native.params.clone())?;
+                    (
+                        serde_json::to_value(&req)
+                            .map_err(|_| DurableOperationError::Identity("remove encoding"))?,
+                        req.thinkthread_ids,
+                        req.force,
+                    )
+                };
+                let expected = if native.method == "thinkthread.remove" {
+                    NativeEffect::Remove
+                } else {
+                    NativeEffect::Mutate
+                };
+                let binding = self
+                    .repository
+                    .get_joint_binding(admission.binding.clone())
+                    .await?
+                    .ok_or(DurableOperationError::Identity(
+                        "compensation binding not found",
+                    ))?;
+                if native.params != params
+                    || force
+                    || native.effect != expected
+                    || targets.len() != 1
+                    || binding.stage != "compensating"
+                    || !binding
+                        .objects
+                        .iter()
+                        .any(|o| o.kind == "root" && o.id == targets[0])
+                {
+                    return Err(DurableOperationError::Identity(
+                        "compensation target is not owned or requires force",
+                    ));
+                }
+            }
             _ => unreachable!(),
         }
         Ok((pending, native, outcome))
@@ -144,23 +203,45 @@ impl<'a> DurableManagementOperation<'a> {
                 .thinkthreads()
                 .create_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
                 .await
-                .map(|r| (r.operation, r.thinkthread_id, r.changed)),
+                .map(|r| {
+                    (
+                        r.operation,
+                        json!({"thinkthreadId":r.thinkthread_id,"changed":r.changed}),
+                    )
+                }),
             "thinkthread.start" => self
                 .client
                 .thinkthreads()
                 .start_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
                 .await
-                .map(|r| (r.operation, r.thinkthread_id, r.changed)),
+                .map(|r| {
+                    (
+                        r.operation,
+                        json!({"thinkthreadId":r.thinkthread_id,"changed":r.changed}),
+                    )
+                }),
+            "thinkthread.stop" => self
+                .client
+                .thinkthreads()
+                .stop_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
+                .await
+                .map(|r| (r.operation, json!({"targets":r.targets}))),
+            "thinkthread.remove" => self
+                .client
+                .thinkthreads()
+                .remove_with_operation(native.operation_id.clone(), decode(native.params.clone())?)
+                .await
+                .map(|r| (r.operation, json!({"targets":r.targets}))),
             _ => unreachable!(),
         };
         match reply {
-            Ok((handle, id, changed)) => {
+            Ok((handle, result)) => {
                 validate_handle(&native, &handle)?;
                 self.save(
                     admission,
                     &native,
                     NativeOperationState::Completed,
-                    Some(json!({"thinkthreadId":id,"changed":changed})),
+                    Some(result),
                 )
                 .await
             }
@@ -222,12 +303,58 @@ impl<'a> DurableManagementOperation<'a> {
         state: NativeOperationState,
         result: Option<Value>,
     ) -> Result<JointNativeOutcome, DurableOperationError> {
+        let mut state = state;
+        if ["thinkthread.stop", "thinkthread.remove"].contains(&native.method.as_str()) {
+            if let Some(result) = &result {
+                let targets: Vec<sdk::ThinkThreadTargetStatus> = decode(
+                    result
+                        .get("targets")
+                        .cloned()
+                        .ok_or(DurableOperationError::Identity("missing batch targets"))?,
+                )?;
+                let expected = native.params["thinkthreadIds"]
+                    .as_array()
+                    .ok_or(DurableOperationError::Identity("missing owned target"))?;
+                if targets.len() != 1
+                    || expected.len() != 1
+                    || expected[0] != targets[0].thinkthread_id
+                {
+                    return Err(DurableOperationError::Identity(
+                        "batch result target mismatch",
+                    ));
+                }
+                let target = &targets[0];
+                let success = if native.method == "thinkthread.stop" {
+                    "stopped"
+                } else {
+                    "removed"
+                };
+                let noop = if native.method == "thinkthread.stop" {
+                    "already_stopped"
+                } else {
+                    "already_removed"
+                };
+                if state == NativeOperationState::Completed
+                    && !((target.accepted && target.status == success)
+                        || (!target.accepted && !target.changed && target.status == noop))
+                {
+                    state = NativeOperationState::Failed;
+                }
+            } else if state == NativeOperationState::Completed {
+                return Err(DurableOperationError::Identity(
+                    "completed batch has no result",
+                ));
+            }
+        }
         let id = result
             .as_ref()
             .and_then(|r| r.get("thinkthreadId"))
             .and_then(Value::as_str)
             .filter(|v| !v.trim().is_empty());
-        if state == NativeOperationState::Completed && id.is_none() {
+        if state == NativeOperationState::Completed
+            && !["thinkthread.stop", "thinkthread.remove"].contains(&native.method.as_str())
+            && id.is_none()
+        {
             return Err(DurableOperationError::Identity(
                 "completed result lacks target identity",
             ));

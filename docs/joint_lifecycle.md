@@ -10,7 +10,7 @@ Session routing is persisted as a versioned `SessionExecutionBacking`. Existing 
 
 Open, capture, load, close, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction, cancel, fork and Host operations fail before invoking a split runtime/provider. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
 
-`SessionRepository::supports_joint_transactions` defaults to false. The standard SQLite repository does not yet enable this capability, so the joint strategy remains unavailable until transactional ownership, fencing and publication are provided. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
+`SessionRepository::supports_joint_transactions` defaults to false. The SQLite repository requires an explicit `with_joint_transactions()` assembly opt-in for a verified joint owner; its default remains disabled. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
 
 Joint checkpoint records use a real binding reference; legacy checkpoints keep their real provider snapshot and runtime state. No placeholder provider snapshot ID is used to represent a joint resource. Durable migration/publication and recovery are requirements for enabling a joint owner, and do not follow merely from selecting the strategy.
 
@@ -26,4 +26,11 @@ Public session/checkpoint publication atomically checks parent stage, binding ge
 
 A release first prevents new dependent references. Final release requires settled original operations, exact absence for every owned object in the binding generation and no other references. Unpublished creation has a separate compensation finish with the same requirements; unknown delivery cannot be treated as not sent. Partial results, UUIDs and failure history remain after release for reconciliation. Pending intents are dispatched to their persisted joint owner; the application does not create replacement mutations or invoke legacy cleanup.
 
-This API supplies durable storage primitives. `supports_joint_transactions` remains false until a trusted lifecycle adapter implements sending, exact operation queries, resource validation and recovery against this store. These primitives do not enable a server backend or provide a multi-writer deployment contract for the legacy lifecycle.
+This API supplies durable storage primitives. `supports_joint_transactions` remains false by default; an explicitly assembled owner can opt into the verified SQLite implementation. These primitives do not enable a server backend or provide a multi-writer deployment contract for the legacy lifecycle.
+
+A prepared operation can atomically enter compensation after all original mutations
+are settled and no public/dependent reference exists. Compensation is a durable
+phase: ordinary sends and publication are excluded, including after restart before
+the first cleanup step. Native steps identify their execution or compensation
+purpose; new optional fields preserve the encoding of legacy intents. Safe Session
+publication input can be persisted with admission and cannot be replaced later.

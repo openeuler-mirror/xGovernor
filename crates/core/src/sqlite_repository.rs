@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex};
 /// Durable, single-process SQLite-backed [`SessionRepository`].
 pub struct SqliteSessionRepository {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    joint_transactions: bool,
 }
 
 impl SqliteSessionRepository {
@@ -59,6 +60,7 @@ impl SqliteSessionRepository {
         Self::init(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            joint_transactions: false,
         })
     }
 
@@ -69,7 +71,14 @@ impl SqliteSessionRepository {
         Self::init(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            joint_transactions: false,
         })
+    }
+
+    /// Explicit assembly opt-in for a verified joint lifecycle owner. Defaults to disabled.
+    pub fn with_joint_transactions(mut self) -> Self {
+        self.joint_transactions = true;
+        self
     }
 
     fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -255,6 +264,15 @@ fn read_session(conn: &Connection, id: &str) -> Result<Option<SessionRecord>, St
 
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
+    fn supports_joint_transactions(&self) -> bool {
+        self.joint_transactions
+    }
+    async fn get_joint_binding(
+        &self,
+        binding: crate::JointBinding,
+    ) -> Result<Option<crate::JointBindingState>, SessionDomainError> {
+        self.read_joint_binding(binding).await
+    }
     async fn get_joint_checkpoint(
         &self,
         id: &str,
@@ -266,6 +284,12 @@ impl SessionRepository for SqliteSessionRepository {
         request: crate::JointPrepareRequest,
     ) -> Result<crate::JointAdmission, SessionDomainError> {
         SqliteSessionRepository::prepare_joint_operation(self, request).await
+    }
+    async fn begin_joint_compensation(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::begin_joint_compensation(self, admission).await
     }
     async fn claim_joint_native_send(
         &self,

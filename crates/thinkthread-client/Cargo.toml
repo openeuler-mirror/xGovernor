@@ -6,6 +6,8 @@ license.workspace = true
 rust-version = "1.89"
 
 [dependencies]
+async-trait.workspace = true
+uuid.workspace = true
 xgovernor-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
@@ -14,6 +16,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+rusqlite.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

@@ -28,6 +28,8 @@ pub struct JointNativeIntent {
     pub method: String,
     pub params: Value,
     pub effect: NativeEffect,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compensation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +70,8 @@ pub struct JointPrepareRequest {
     pub parent_binding: Option<JointBinding>,
     pub reservations: Vec<JointResourceReservation>,
     pub native: Vec<JointNativeIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_input: Option<SessionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,4 +98,19 @@ pub struct JointPendingOperation {
 pub enum JointPublication {
     Session { record: SessionRecord },
     Checkpoint { record: JointCheckpointRecord },
+}
+
+/// Durable ownership lookup; native identities stay behind the application boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointBindingState {
+    pub binding: JointBinding,
+    pub generation: u64,
+    pub stage: String,
+    pub creation: JointPrepareRequest,
+    pub objects: Vec<JointNativeObject>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
