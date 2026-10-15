@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -24,6 +26,23 @@ class InputTests(unittest.TestCase):
             ids = Path(directory) / "ids.txt"
             ids.write_text(f"# selection\n{SECOND}, {FIRST}\n")
             self.assertEqual(runner.parse_instance_ids([FIRST], ids), [FIRST, SECOND])
+
+    def test_all_selects_every_dataset_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset.json"
+            dataset.write_text(json.dumps([{"instance_id": iid, "base_commit": "a" * 40}
+                                           for iid in (FIRST, SECOND)]))
+            args = runner.parser().parse_args(["--all", "--dataset-file", str(dataset)])
+            rows = runner.load_instances(args, None)
+            self.assertEqual(list(rows), [FIRST, SECOND])
+
+    def test_all_cannot_be_combined_with_instance_ids(self):
+        # This is a semantic validation performed by main(), rather than an
+        # argparse syntax error (both options are individually valid).
+        with patch.object(runner.sys, "version_info", (3, 11)), \
+             self.assertRaisesRegex(ValueError, "--all cannot be combined"):
+            runner.main(["--all", "--instance-ids", FIRST])
 
     def test_paths_and_shell_fragments_are_not_instance_ids(self):
         for value in ["../astropy__astropy-12907", "$(touch /tmp/no)", "a__b-1;rm", "a__b"]:
@@ -87,12 +106,15 @@ class ImageTests(unittest.TestCase):
 
 
 class BatchTests(unittest.TestCase):
-    def batch(self, root, outcomes, mode="baseline", run_id="test"):
+    def batch(self, root, outcomes, mode="baseline", run_id="test", jobs=1):
         dataset = root / "dataset.json"
         dataset.write_text(json.dumps([{"instance_id": iid, "base_commit": "a" * 40,
             "problem_statement": "issue", "patch": "DO NOT EXPOSE", "test_patch": "HELD OUT"}
             for iid in (FIRST, SECOND)]))
         workspaces = []
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
 
         class FakeRunner:
             def __init__(self, *args):
@@ -113,8 +135,15 @@ class BatchTests(unittest.TestCase):
                 return {"instance_id": row["instance_id"], "model_patch": "diff"}
 
             def evaluate(self, spec, row, prediction, folder):
+                nonlocal active, max_active
                 workspaces.append(folder)
                 (folder / "result.json").write_text("{}")
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.02)
+                with active_lock:
+                    active -= 1
                 value = outcomes[row["instance_id"]]
                 if isinstance(value, BaseException):
                     raise value
@@ -123,7 +152,7 @@ class BatchTests(unittest.TestCase):
         module = types.ModuleType("swebench.harness.test_spec.test_spec")
         module.make_test_spec = lambda row, **kwargs: row
         arguments = ["--mode", mode, "--dataset-file", str(dataset), "--output-dir", str(root),
-                     "--run-id", run_id, "--instance-ids", FIRST, SECOND, "--skip-model-check"]
+                     "--run-id", run_id, "--jobs", str(jobs), "--instance-ids", FIRST, SECOND, "--skip-model-check"]
         if mode == "evaluate":
             predictions = root / "predictions.jsonl"
             predictions.write_text("\n".join(json.dumps({"instance_id": iid, "model_patch": "diff"})
@@ -134,58 +163,73 @@ class BatchTests(unittest.TestCase):
              patch.object(runner.importlib.metadata, "version", return_value=runner.HARNESS_VERSION), \
              patch.object(runner, "Runner", FakeRunner), \
              patch.object(runner, "read_key", return_value="fake-key") as read_key, \
+             patch.object(runner.sys, "version_info", (3, 11)), \
              contextlib.redirect_stdout(output):
             code = runner.main(arguments)
             if mode != "run":
                 read_key.assert_not_called()
         self.assertTrue(all(not path.exists() for path in workspaces))
-        return code, output.getvalue()
+        return code, output.getvalue(), max_active
 
     def test_failure_does_not_prevent_the_next_instance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, output = self.batch(root, {FIRST: RuntimeError("cannot apply patch"), SECOND: False})
+            code, output, _ = self.batch(root, {FIRST: RuntimeError("cannot apply patch"), SECOND: False})
             self.assertEqual(code, 1)
             self.assertIn("baseline_verified", output)
             self.assertIn("Summary: 1/2 passed", output)
-            self.assertFalse((root / "test").exists())
+            summary = json.loads((root / "test/summary.json").read_text())
+            self.assertEqual(summary["failed"], 1)
+            self.assertTrue((root / "test/summary.md").is_file())
 
     def test_unresolved_evaluation_returns_nonzero_without_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, output = self.batch(root, {FIRST: True, SECOND: False}, mode="evaluate")
+            code, output, _ = self.batch(root, {FIRST: True, SECOND: False}, mode="evaluate")
             self.assertEqual(code, 1)
             self.assertIn("Summary: 1/2 passed", output)
-            self.assertFalse((root / "test").exists())
+            self.assertTrue((root / "test/summary.json").is_file())
 
     def test_baseline_failure_is_the_expected_success_condition(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(self.batch(Path(directory), {FIRST: False, SECOND: False})[0], 0)
 
+    def test_jobs_two_runs_at_most_two_cases_concurrently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code, _, max_active = self.batch(root, {FIRST: False, SECOND: False}, jobs=2)
+            self.assertEqual(code, 0)
+            self.assertEqual(max_active, 2)
+            summary = json.loads((root / "test/summary.json").read_text())
+            self.assertEqual(summary["jobs"], 2)
+            self.assertEqual(summary["total"], 2)
+            self.assertIn("Wall time", (root / "test/summary.md").read_text())
+
     def test_success_keeps_only_pi_context(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, _ = self.batch(root, {FIRST: True, SECOND: True}, mode="run")
+            code, _, _ = self.batch(root, {FIRST: True, SECOND: True}, mode="run")
             self.assertEqual(code, 0)
             files = sorted(str(path.relative_to(root / "test")) for path in (root / "test").rglob("*") if path.is_file())
-            self.assertEqual(files, [f"{FIRST}/trace.jsonl", f"{SECOND}/trace.jsonl"])
+            self.assertEqual(files, [f"{FIRST}/trace.jsonl", f"{SECOND}/trace.jsonl", "summary.json", "summary.md"])
 
     def test_interruption_preserves_context_and_removes_work_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, output = self.batch(root, {FIRST: KeyboardInterrupt(), SECOND: True}, mode="run")
+            code, output, _ = self.batch(root, {FIRST: KeyboardInterrupt(), SECOND: True}, mode="run")
             self.assertEqual(code, 130)
             self.assertIn("1 not run", output)
             files = [path for path in (root / "test").rglob("*") if path.is_file()]
-            self.assertEqual(files, [root / f"test/{FIRST}/trace.jsonl"])
+            self.assertIn(root / "test/summary.json", files)
+            self.assertIn(root / "test/summary.md", files)
 
     def test_grading_error_still_preserves_context(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            code, _ = self.batch(root, {FIRST: RuntimeError("grading failed"), SECOND: True}, mode="run")
+            code, _, _ = self.batch(root, {FIRST: RuntimeError("grading failed"), SECOND: True}, mode="run")
             self.assertEqual(code, 1)
             files = sorted(str(path.relative_to(root / "test")) for path in (root / "test").rglob("*") if path.is_file())
-            self.assertEqual(files, [f"{FIRST}/trace.jsonl", f"{SECOND}/trace.jsonl"])
+            self.assertEqual(files, [f"{FIRST}/trace.jsonl", f"{SECOND}/trace.jsonl", "summary.json", "summary.md"])
 
     def test_existing_run_is_not_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:

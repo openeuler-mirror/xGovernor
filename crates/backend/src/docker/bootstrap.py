@@ -1,6 +1,7 @@
 """Container-only initialization, invoked by the provider before exposing tools."""
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 workspace = Path(sys.argv[1])
@@ -14,10 +15,17 @@ if not workspace.is_dir():
 helper = Path('/usr/local/lib/xgovernor/helper.py')
 helper.parent.mkdir(parents=True, exist_ok=True)
 # Root owns this directory in supported images; the agent cannot replace the helper.
-if helper.is_symlink():
-    helper.unlink()
-helper.write_bytes(sys.stdin.buffer.read())
-helper.chmod(0o555)
+fd, temporary_helper = tempfile.mkstemp(prefix='.helper.py.', dir=helper.parent)
+try:
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(sys.stdin.buffer.read())
+    os.chmod(temporary_helper, 0o555)
+    # Atomic replacement also handles a previous 0555 helper and never follows
+    # a pre-existing symlink at the destination.
+    os.replace(temporary_helper, helper)
+finally:
+    if os.path.exists(temporary_helper):
+        os.unlink(temporary_helper)
 python = Path('/usr/local/bin/python3')
 python.parent.mkdir(parents=True, exist_ok=True)
 if os.path.realpath(python) != os.path.realpath(sys.executable):

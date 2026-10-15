@@ -1,6 +1,22 @@
 # SWE-bench Verified 批量运行
 
-`scripts/run_swebench.sh` 统一执行环境准备、xGovernor Docker/pi 解题、trace 导出、SWE-bench 验证和资源清理。支持多个 instance ID，默认逐题运行；某题失败不会阻止下一题。每次调用使用新的输出目录，不覆盖历史实验。
+`scripts/run_swebench.sh` 统一执行环境准备、xGovernor Docker/pi 解题、trace 导出、SWE-bench 验证和资源清理。支持指定题目或 `--all` 运行所选数据集 split 的全部题目；默认顺序执行，可用 `--jobs 2` 最多同时运行两题。每题失败不会阻止其他题，最终总会生成 JSON 和 Markdown 汇总。
+
+hubinserver（4 CPU / 16 GiB）上运行全部本地缓存的 Verified 测试集，最多两个 case 并行：
+
+```bash
+cd /home/cz/xGovernor
+env XGOVERNOR_SWE_PYTHON=/mnt2/swebench-venv/bin/python \
+  ./scripts/run_swebench.sh \
+  --dataset-cache /mnt2/swebench-cache \
+  --all --jobs 2 \
+  --run-id verified-2way-20261015 \
+  --output-dir /mnt2/pi-trace \
+  --cpus 1 --memory-mb 3072 \
+  --agent-timeout 1800 --prepare-timeout 1800 --test-timeout 1800
+```
+
+`--all` 与显式 instance ID/`--instances-file` 不能同时指定；`--jobs` 仅接受 `1` 或 `2`，默认 `1`。运行目录会保留在 `/mnt2/pi-trace/<run-id>/`，包含 `summary.json`、`summary.md` 和已启动 Pi 会话的逐题 trace。Summary 记录每题状态、耗时、错误和总 wall time；被中断、失败及尚未运行的题目也会列出。运行目录重名时会拒绝覆盖。
 
 ## 在 xxyserver 使用
 
@@ -81,7 +97,7 @@ astropy__astropy-14995
 
 ## 输出和清理
 
-`pi-trace` **只保留 pi 的原始上下文 `trace.jsonl`**：包括 pi 会话元数据、用户消息、模型返回内容、工具调用和工具结果。不再生成 HTML、事件流副本、独立补丁、预测文件、报告或汇总文件。
+`pi-trace` 保留 pi 的原始上下文 `trace.jsonl`：包括 pi 会话元数据、用户消息、模型返回内容、工具调用和工具结果；另外在每次 run 根目录保留 `summary.json` 和 `summary.md`。不生成 HTML、事件流副本、独立补丁、预测文件或逐题判分报告。
 
 默认路径是仓库同级的 `pi-trace/<UTC时间-随机ID>/<instance-id>/trace.jsonl`，在 xxyserver 即 `/mnt/cz/pi-trace/`。可以通过 `--output-dir` 指定根目录、`--run-id` 指定新的子目录名；已有运行目录不会覆盖。
 
@@ -95,7 +111,7 @@ astropy__astropy-14995
 
 构建文件、daemon 状态、补丁和判分数据只放在系统临时目录中，处理完每题后删除。运行结果、汇总和错误诊断只在终端输出。`--mode evaluate`、`--mode baseline` 不产生 pi 上下文，因此不留下输出文件；`--predictions` 或 `--patch` 接收用户自行提供的文件，脚本不再额外导出这些文件。
 
-每题创建独立 daemon、端口、session 和容器。正常结束、错误、Ctrl-C、SIGTERM 均尝试保留已有上下文，并清理本次临时文件、session、进程和容器。尚未产生 pi 上下文的失败不保留空目录。镜像和依赖缓存不属于 trace，仍保留供后续运行复用。SIGKILL、机器掉电等无法执行清理逻辑的情况不在此保证内。
+每题创建独立 daemon、端口、session 和容器。正常结束、错误、Ctrl-C、SIGTERM 均尝试保留已有上下文，并清理本次临时文件、session、进程和容器；最多 `--jobs` 个 case 同时活动。尚未产生 pi 上下文的失败不保留空 case 目录，但会计入根目录 summary。镜像和依赖缓存不属于 trace，仍保留供后续运行复用。SIGKILL、机器掉电等无法执行清理逻辑的情况不在此保证内。
 
 退出码：`0` 表示所有题目通过（或基线符合预期）；`1` 表示至少一题未解决/执行失败；`2` 表示参数或启动前检查失败；`130` 表示中断。
 
@@ -155,4 +171,4 @@ pi 和 xiaoO 均支持在会话打开请求中指定**容器内**的工作目录
 
 初始化要求镜像已有 `/bin/sh`、`/bin/bash`、`/usr/bin/sleep` 和 Python 3.11+（自动检查 `/usr/local/bin/python3`、`/usr/bin/python3`、`/opt/miniconda3/bin/python`）。不自动下载依赖。初始化目录不能为 `/` 或符号链接；递归修改所有权不会跟随仓库中的符号链接。测试依赖仍由镜像提供，SWE-bench 的 Python 测试使用 `conda run --no-capture-output -n testbed ...`。
 
-初始化由管控进程执行 root 命令，容器仅增加 `CHOWN` capability 到 bounding set 用于改所有权；agent 默认仍是 UID 10001，有效与 permitted capabilities 均为 0，保留 `no-new-privileges`、无挂载和所选网络策略。失败时新容器被移除，不向 agent 开放工具。默认 `bootstrap: false` 保持已有预配置镜像的行为及全部 capabilities 被移除的策略。
+初始化由管控进程执行 root 命令；只有写入 helper 和修复工作区所有权的 bootstrap `docker exec` 使用 `--privileged`，该权限仅作用于这次可信 exec，不改变容器的 `Privileged=false`。容器仍只将 `CHOWN` 加入 capability bounding set，并保留 `CapDrop=ALL`、`no-new-privileges`、无挂载和所选网络策略；agent 默认仍是 UID 10001，有效与 permitted capabilities 均为 0。helper 通过同目录临时文件和原子替换安装，可覆盖先前失败留下的只读 helper，并避免跟随目标符号链接。失败时新容器被移除，不向 agent 开放工具。默认 `bootstrap: false` 保持已有预配置镜像的行为及全部 capabilities 被移除的策略。
