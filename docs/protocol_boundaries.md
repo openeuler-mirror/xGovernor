@@ -61,6 +61,10 @@ worker 的 NDJSON 控制消息 (`WorkerRequest` / `WorkerResponse`) 也是 runti
 
 runtime 不执行 provider create/delete，不持有 `InstanceManager`，也不实现 checkpoint snapshot 删除。
 
+## 联合生命周期策略
+
+registration 可显式选择内部 [联合生命周期策略](joint_lifecycle.md)。它在 core 授权后接收同一父操作 context，统一处理不可分的执行资源；默认构造函数继续采用原 provider/runtime 分离路径。联合记录按持久版本路由，未支持操作显式拒绝，不能回落到旧资源清理器。装配必须具备真实持久事务与 source/Root fence，默认 no-op repository 不满足要求。
+
 ## 状态与能力
 
 session 持久化 `runtime_kind` 和版本化 opaque runtime state。state schema 的解释只属于对应 runtime；未知 runtime kind 或 schema 版本必须失败。

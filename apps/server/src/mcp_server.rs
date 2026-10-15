@@ -1695,6 +1695,7 @@ mod tests {
         runtime_profile_id: Option<&str>,
     ) -> SessionRecord {
         SessionRecord {
+            execution_backing: Default::default(),
             session_id: session_id.to_string(),
             conversation_id: "conversation".to_string(),
             sender_id: "sender".to_string(),

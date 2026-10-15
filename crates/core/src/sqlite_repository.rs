@@ -112,7 +112,17 @@ impl SqliteSessionRepository {
                 created_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_checkpoints_tenant_runtime ON checkpoints(tenant_id, source_runtime_id);",
-        )
+        )?;
+        let has_execution = conn
+            .prepare("PRAGMA table_info(sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "execution_json");
+        if !has_execution {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{\"kind\":\"split_v1\"}';")?;
+        }
+        Ok(())
     }
 }
 
@@ -163,6 +173,7 @@ fn row_to_record(row: &Row) -> rusqlite::Result<Result<SessionRecord, String>> {
     let isolation_json: String = row.get("isolation_json")?;
     let capabilities_json: String = row.get("capabilities_json")?;
     let runtime_json: String = row.get("runtime_json")?;
+    let execution_json: String = row.get("execution_json")?;
     let llm_json: Option<String> = row.get("llm_json")?;
     let lease_json: Option<String> = row.get("lease_json")?;
     let lineage_json: Option<String> = row.get("lineage_json")?;
@@ -189,6 +200,7 @@ fn row_to_record(row: &Row) -> rusqlite::Result<Result<SessionRecord, String>> {
             lineage_json.as_deref().map(json_decode).transpose()?;
 
         Ok(SessionRecord {
+            execution_backing: json_decode(&execution_json)?,
             runtime_id,
             conversation_id,
             sender_id,
@@ -248,12 +260,16 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
+        if record.execution_backing.joint().is_some() {
+            return Err(crate::unsupported_joint("publication"));
+        }
         let conn = self.conn.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let workspace_json = json_encode(&record.workspace)?;
             let isolation_json = json_encode(&record.isolation)?;
             let capabilities_json = json_encode(&record.capabilities)?;
             let runtime_json = json_encode(&record.runtime)?;
+            let execution_json = json_encode(&record.execution_backing)?;
             let llm_json = record.llm.as_ref().map(json_encode).transpose()?;
             let lease_json = record.lease.as_ref().map(json_encode).transpose()?;
             let lineage_json = record.lineage.as_ref().map(json_encode).transpose()?;
@@ -261,13 +277,14 @@ impl SessionRepository for SqliteSessionRepository {
             let conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            conn.execute(
-                "INSERT INTO sessions (
+            let changed = conn
+                .execute(
+                    "INSERT INTO sessions (
                     runtime_id, conversation_id, sender_id, status,
                     created_at_ms, updated_at_ms, workspace_json, isolation_json,
                     capabilities_json, runtime_json, llm_json, lease_json,
-                    lineage_json, last_error, tenant_id, created_by
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                    lineage_json, last_error, tenant_id, created_by, execution_json
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                 ON CONFLICT(runtime_id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     sender_id = excluded.sender_id,
@@ -282,27 +299,33 @@ impl SessionRepository for SqliteSessionRepository {
                     lineage_json = excluded.lineage_json,
                     last_error = excluded.last_error,
                     tenant_id = excluded.tenant_id,
-                    created_by = excluded.created_by",
-                params![
-                    record.runtime_id,
-                    record.conversation_id,
-                    record.sender_id,
-                    status_to_str(record.status),
-                    record.created_at_ms as i64,
-                    record.updated_at_ms as i64,
-                    workspace_json,
-                    isolation_json,
-                    capabilities_json,
-                    runtime_json,
-                    llm_json,
-                    lease_json,
-                    lineage_json,
-                    record.last_error,
-                    record.tenant_id,
-                    record.created_by,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+                    created_by = excluded.created_by,
+                    execution_json = excluded.execution_json
+                WHERE sessions.execution_json = excluded.execution_json",
+                    params![
+                        record.runtime_id,
+                        record.conversation_id,
+                        record.sender_id,
+                        status_to_str(record.status),
+                        record.created_at_ms as i64,
+                        record.updated_at_ms as i64,
+                        workspace_json,
+                        isolation_json,
+                        capabilities_json,
+                        runtime_json,
+                        llm_json,
+                        lease_json,
+                        lineage_json,
+                        record.last_error,
+                        record.tenant_id,
+                        record.created_by,
+                        execution_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("persisted execution route cannot be replaced".into());
+            }
             Ok(())
         })
         .await
@@ -567,6 +590,7 @@ mod tests {
 
     fn sample_record(runtime_id: &str) -> SessionRecord {
         SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: runtime_id.to_string(),
             conversation_id: "conversation-1".to_string(),
             sender_id: "sender-1".to_string(),
@@ -808,5 +832,61 @@ mod tests {
         let counts = repo.active_session_counts_by_tenant().await.unwrap();
         assert_eq!(counts.get("tenant-a"), Some(&2));
         assert!(!counts.contains_key("admin"));
+    }
+
+    #[tokio::test]
+    async fn legacy_database_migrates_without_changing_session_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite");
+        let record = sample_record("legacy-session");
+        let repo = SqliteSessionRepository::open(&path).unwrap();
+        repo.save(record.clone()).await.unwrap();
+        drop(repo);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE sessions DROP COLUMN execution_json;")
+            .unwrap();
+        drop(conn);
+        let reopened = SqliteSessionRepository::open(&path).unwrap();
+        assert_eq!(reopened.get("legacy-session").await.unwrap(), Some(record));
+    }
+
+    #[tokio::test]
+    async fn unknown_execution_backing_is_rejected_before_legacy_read() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        repo.save(sample_record("unknown-backing")).await.unwrap();
+        repo.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET execution_json=?1 WHERE runtime_id='unknown-backing'",
+                [r#"{"kind":"joint_v99"}"#],
+            )
+            .unwrap();
+        assert!(repo.get("unknown-backing").await.is_err());
+        assert!(repo.save(sample_record("unknown-backing")).await.is_err());
+        let binding = crate::SessionExecutionBacking::JointV1 {
+            binding: crate::JointBinding {
+                owner_kind: "joint-test".into(),
+                binding_id: "binding-1".into(),
+                configuration_revision: "revision-1".into(),
+            },
+        };
+        repo.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET execution_json=?1 WHERE runtime_id='unknown-backing'",
+                [serde_json::to_string(&binding).unwrap()],
+            )
+            .unwrap();
+        assert!(repo.save(sample_record("unknown-backing")).await.is_err());
+        assert_eq!(
+            repo.get("unknown-backing")
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_backing,
+            binding
+        );
     }
 }

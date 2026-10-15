@@ -45,6 +45,7 @@ impl SessionRepository for EmptyRepository {
 
 fn test_record() -> SessionRecord {
     SessionRecord {
+        execution_backing: Default::default(),
         runtime_id: "runtime-1".into(),
         conversation_id: "conversation-1".into(),
         sender_id: "sender-1".into(),

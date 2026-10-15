@@ -140,6 +140,8 @@ pub struct CheckpointLineage {
 /// `projection::project_session` and must never serialize it directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub execution_backing: crate::SessionExecutionBacking,
     pub runtime_id: String,
     pub conversation_id: String,
     pub sender_id: String,

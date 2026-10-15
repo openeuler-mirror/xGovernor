@@ -188,6 +188,7 @@ mod tests {
     #[test]
     fn domain_projection_exposes_only_wire_facts() {
         let record = SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: "runtime-1".into(),
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),

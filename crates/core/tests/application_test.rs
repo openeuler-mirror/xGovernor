@@ -261,6 +261,7 @@ impl SessionRepository for EmptyRepository {
 
 fn test_record() -> SessionRecord {
     SessionRecord {
+        execution_backing: Default::default(),
         runtime_id: "runtime-1".into(),
         conversation_id: "conversation-1".into(),
         sender_id: "sender-1".into(),
@@ -1917,6 +1918,7 @@ fn quota_tenant_ctx(max_sessions: u32) -> SecurityContext {
 
 fn tenant_test_record() -> SessionRecord {
     SessionRecord {
+        execution_backing: Default::default(),
         tenant_id: Some("tenant-a".to_string()),
         ..test_record()
     }
@@ -2867,3 +2869,41 @@ mod cancel_contract;
 
 #[path = "application_test/snapshot_recovery.rs"]
 mod snapshot_recovery;
+
+#[tokio::test]
+async fn persisted_joint_sessions_never_fall_back_to_split_cleanup() {
+    let mut record = test_record();
+    record.execution_backing = SessionExecutionBacking::JointV1 {
+        binding: JointBinding {
+            owner_kind: "joint-test".into(),
+            binding_id: "binding-1".into(),
+            configuration_revision: "revision-1".into(),
+        },
+    };
+    let repository = Arc::new(MemoryRepository(Mutex::new(Some(record.clone()))));
+    let runtime = Arc::new(CompletingRuntime::default());
+    let application = SessionApplication::new(
+        runtime.clone(),
+        test_provider_managers(),
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    let ctx = SecurityContext::admin("joint-test");
+    assert!(application
+        .close(&ctx, &record.runtime_id, Default::default())
+        .await
+        .is_err());
+    assert!(application
+        .check_alive(&ctx, &record.runtime_id)
+        .await
+        .is_err());
+    assert!(!*runtime.stopped.lock().await);
+    assert!(runtime.started.lock().await.is_none());
+    assert_eq!(
+        repository.get(&record.runtime_id).await.unwrap(),
+        Some(record)
+    );
+}

@@ -297,6 +297,7 @@ pub struct RuntimeRegistration {
     pub runtime: Arc<dyn AgentRuntime>,
     pub providers: Arc<HashMap<String, Arc<InstanceManager>>>,
     pub environment: Arc<dyn SessionEnvironmentNormalizer>,
+    pub joint_lifecycle: Option<Arc<dyn crate::JointSessionLifecycle>>,
 }
 
 impl RuntimeRegistration {
@@ -309,7 +310,13 @@ impl RuntimeRegistration {
             runtime,
             providers: Arc::new(providers),
             environment,
+            joint_lifecycle: None,
         }
+    }
+
+    pub fn with_joint_lifecycle(mut self, owner: Arc<dyn crate::JointSessionLifecycle>) -> Self {
+        self.joint_lifecycle = Some(owner);
+        self
     }
 
     pub fn with_providers(
@@ -539,6 +546,67 @@ impl SessionApplication {
         self.registration(&record.runtime.runtime_kind)
     }
 
+    fn joint_owner(
+        &self,
+        runtime_kind: &str,
+        binding: &crate::JointBinding,
+    ) -> Result<Arc<dyn crate::JointSessionLifecycle>, SessionDomainError> {
+        binding.validate()?;
+        if !self.records.supports_joint_transactions() {
+            return Err(crate::unsupported_joint("durable_repository"));
+        }
+        self.registration(runtime_kind)?
+            .joint_lifecycle
+            .clone()
+            .filter(|owner| owner.owner_kind() == binding.owner_kind)
+            .ok_or_else(|| SessionDomainError::Unavailable {
+                message: "persisted joint execution owner is unavailable".into(),
+            })
+    }
+
+    fn joint_context(
+        &self,
+        ctx: &SecurityContext,
+        record: &SessionRecord,
+        operation: &str,
+        target: Option<&str>,
+        checkpoint: Option<&str>,
+    ) -> crate::JointOperationContext {
+        let revision = &record
+            .execution_backing
+            .joint()
+            .unwrap()
+            .configuration_revision;
+        let mut context = crate::joint_lifecycle::context(
+            ctx,
+            format!("joint-{}", self.runtime_ids.next_runtime_id()),
+            operation,
+            &record.runtime.runtime_kind,
+            revision,
+            Some(&record.runtime_id),
+            target,
+            checkpoint,
+        );
+        context.tenant_id = record.tenant_id.clone();
+        context.owner_ref = record
+            .tenant_id
+            .as_ref()
+            .map(|id| format!("tenant/{id}"))
+            .unwrap_or_else(|| crate::ADMIN_OWNER_REF.into());
+        context
+    }
+
+    fn reject_joint_resource(
+        record: &SessionRecord,
+        operation: &str,
+    ) -> Result<(), SessionDomainError> {
+        if let Some(binding) = record.execution_backing.joint() {
+            binding.validate()?;
+            return Err(crate::unsupported_joint(operation));
+        }
+        Ok(())
+    }
+
     /// Opt in to `SessionLeaseTable`-backed single-writer enforcement
     /// (Phase 3 of `docs/session_orchestration_skeleton.md`). Left unset by
     /// `new()` so existing callers are unaffected.
@@ -750,6 +818,72 @@ impl SessionApplication {
             }
         }
 
+        if let Some(owner) = registration.joint_lifecycle.clone() {
+            if !self.records.supports_joint_transactions() {
+                return Err(crate::unsupported_joint("durable_repository"));
+            }
+            crate::JointBinding {
+                owner_kind: owner.owner_kind().into(),
+                binding_id: runtime_id.clone(),
+                configuration_revision: owner.configuration_revision().into(),
+            }
+            .validate()?;
+            runtime
+                .probe_llm(&RuntimeStartRequest {
+                    runtime_id: runtime_id.clone(),
+                    conversation_id: request.conversation_id.clone(),
+                    sender_id: request.sender_id.clone(),
+                    workspace: normalized.workspace.clone(),
+                    state: None,
+                    llm: request.llm.clone(),
+                    ext: request.ext.clone(),
+                })
+                .await
+                .map_err(map_runtime_error)?;
+            let expected_workspace = normalized.workspace.clone();
+            let expected_isolation = normalized.isolation.clone();
+            let context = crate::joint_lifecycle::context(
+                ctx,
+                format!("joint-{}", self.runtime_ids.next_runtime_id()),
+                "open",
+                runtime_kind,
+                owner.configuration_revision(),
+                None,
+                Some(&runtime_id),
+                None,
+            );
+            let capabilities = EffectiveCapabilities {
+                sandbox: normalized.sandbox_capabilities.clone(),
+                runtime: runtime_wire_capabilities
+                    .into_iter()
+                    .filter_map(domain_runtime_capability)
+                    .collect(),
+            };
+            let record = owner
+                .open(
+                    context.clone(),
+                    crate::JointOpenInput {
+                        request,
+                        normalized,
+                        capabilities,
+                    },
+                    self.records.clone(),
+                )
+                .await?;
+            crate::joint_lifecycle::validate_committed_session(
+                &record,
+                &context,
+                owner.owner_kind(),
+            )?;
+            if record.workspace != expected_workspace || record.isolation != expected_isolation {
+                return Err(crate::unsupported_joint("normalization_mismatch"));
+            }
+            if self.records.get(&record.runtime_id).await?.as_ref() != Some(&record) {
+                return Err(crate::unsupported_joint("uncommitted_publication"));
+            }
+            return Ok(project_session(&record));
+        }
+
         let tenant_id_for_quota = ctx.tenant_id().map(str::to_string);
         if let Some(tenant_id) = &tenant_id_for_quota {
             self.reserve_tenant_session(tenant_id, ctx.quota.max_sessions)
@@ -843,6 +977,7 @@ impl SessionApplication {
             };
 
         let record = SessionRecord {
+            execution_backing: Default::default(),
             runtime_id,
             conversation_id: request.conversation_id,
             sender_id: request.sender_id,
@@ -896,6 +1031,7 @@ impl SessionApplication {
         request: SessionTurnRequest,
     ) -> Result<SessionSubmission, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
+        Self::reject_joint_resource(&record, "submit_turn_impl")?;
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
         runtime
@@ -1136,6 +1272,7 @@ impl SessionApplication {
         request: SessionInteractionRequest,
     ) -> Result<SessionSubmitReceipt, SessionDomainError> {
         let record = self.require_session(ctx, &request.runtime_id).await?;
+        Self::reject_joint_resource(&record, "answer_interaction_impl")?;
         self.ensure_runtime_attached(ctx, &record).await?;
         if !record
             .capabilities
@@ -1187,10 +1324,20 @@ impl SessionApplication {
         runtime_id: &str,
         lease: SessionLeaseClaim,
     ) -> Result<SessionControlResponse, SessionDomainError> {
-        let _publication = self.snapshot_publication.lock().await;
+        let joint_route = self
+            .records
+            .get(runtime_id)
+            .await?
+            .is_some_and(|record| record.execution_backing.joint().is_some());
+        let _publication = if joint_route {
+            None
+        } else {
+            Some(self.snapshot_publication.lock().await)
+        };
         let record = self.require_session(ctx, runtime_id).await?;
         self.check_lease_holder(runtime_id, &lease).await?;
-        self.finalize_closed_session(record, runtime_id, None).await
+        self.finalize_closed_session(ctx, record, runtime_id, None)
+            .await
     }
 
     /// System-forced counterpart to `close`: called only by the reclaim
@@ -1232,6 +1379,7 @@ impl SessionApplication {
             });
         }
         self.finalize_closed_session(
+            ctx,
             record,
             runtime_id,
             Some("provider sandbox no longer exists (idle-timeout expiry)".to_string()),
@@ -1248,10 +1396,37 @@ impl SessionApplication {
     /// untouched.
     async fn finalize_closed_session(
         &self,
+        ctx: &SecurityContext,
         mut record: SessionRecord,
         runtime_id: &str,
         note: Option<String>,
     ) -> Result<SessionControlResponse, SessionDomainError> {
+        if let Some(binding) = record.execution_backing.joint() {
+            let owner = self.joint_owner(&record.runtime.runtime_kind, binding)?;
+            let context = self.joint_context(ctx, &record, "close", Some(runtime_id), None);
+            let committed = owner
+                .close(context.clone(), record, note, self.records.clone())
+                .await?;
+            crate::joint_lifecycle::validate_committed_session(
+                &committed,
+                &context,
+                owner.owner_kind(),
+            )?;
+            if committed.status != SessionStatus::Closed
+                || self.records.get(runtime_id).await?.as_ref() != Some(&committed)
+            {
+                return Err(crate::unsupported_joint("uncommitted_close"));
+            }
+            if let Some(leases) = &self.lease_table {
+                leases.remove(runtime_id).await;
+            }
+            self.turn_gate.forget_session(runtime_id);
+            return Ok(SessionControlResponse {
+                runtime_id: runtime_id.into(),
+                status: SessionLifecycleStatus::Closed,
+                updated_at_ms: committed.updated_at_ms,
+            });
+        }
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
         match runtime.stop(runtime_id).await.map_err(map_runtime_error) {
@@ -1304,6 +1479,12 @@ impl SessionApplication {
         runtime_id: &str,
     ) -> Result<bool, SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
+        if let Some(binding) = record.execution_backing.joint() {
+            return self
+                .joint_owner(&record.runtime.runtime_kind, binding)?
+                .check_alive(&record)
+                .await;
+        }
         let registration = self.registration_for_record(&record)?;
         let runtime = Arc::clone(&registration.runtime);
         let runtime_alive = runtime
@@ -1437,6 +1618,7 @@ impl SessionApplication {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
+        Self::reject_joint_resource(&record, "cancel_impl")?;
         if let Some(turn_id) = turn_id {
             let active = self
                 .turn_gate
@@ -1512,6 +1694,7 @@ impl SessionApplication {
         capability: crate::SandboxCapability,
     ) -> Result<(Arc<dyn OperationBackend>, SessionOperationGuard), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
+        Self::reject_joint_resource(&record, "operation_backend")?;
         self.check_lease_holder(runtime_id, lease).await?;
         if !record.capabilities.sandbox.contains(&capability) {
             return Err(SessionDomainError::UnsupportedCapability {
@@ -1721,7 +1904,16 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
-        let _transaction = self.snapshot_transactions.lock().await;
+        let joint_route = self
+            .records
+            .get(&request.runtime_id)
+            .await?
+            .is_some_and(|record| record.execution_backing.joint().is_some());
+        let _transaction = if joint_route {
+            None
+        } else {
+            Some(self.snapshot_transactions.lock().await)
+        };
         let mut record = self.require_session(ctx, &request.runtime_id).await?;
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
@@ -1761,6 +1953,39 @@ impl SessionApplication {
             return Err(SessionDomainError::UnsupportedCapability {
                 family: crate::CapabilityFamily::Runtime,
                 capability: "checkpoint".into(),
+            });
+        }
+        if let Some(binding) = record.execution_backing.joint() {
+            let owner = self.joint_owner(&record.runtime.runtime_kind, binding)?;
+            let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
+            let context =
+                self.joint_context(ctx, &record, "checkpoint", None, Some(&checkpoint_id));
+            let expected_source = record.runtime_id.clone();
+            let checkpoint = owner
+                .checkpoint(context.clone(), record, self.records.clone())
+                .await?;
+            checkpoint.binding.validate()?;
+            if checkpoint.checkpoint_id != checkpoint_id
+                || checkpoint.source_runtime_id != expected_source
+                || checkpoint.tenant_id != context.tenant_id
+                || checkpoint.runtime_kind != context.runtime_kind
+                || checkpoint.binding.owner_kind != owner.owner_kind()
+                || checkpoint.binding.configuration_revision != context.configuration_revision
+                || checkpoint.owner_ref != context.owner_ref
+                || self
+                    .records
+                    .get_joint_checkpoint(&checkpoint_id)
+                    .await?
+                    .as_ref()
+                    != Some(&checkpoint)
+            {
+                return Err(crate::unsupported_joint("uncommitted_checkpoint"));
+            }
+            return Ok(SessionCheckpointResult {
+                checkpoint_id,
+                runtime_id: expected_source,
+                checkpoint_scope: session_protocol::SessionCheckpointScope::Full,
+                created_at_ms: checkpoint.created_at_ms,
             });
         }
         let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
@@ -1863,7 +2088,15 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionLoadRequest,
     ) -> Result<SessionOpenResponse, SessionDomainError> {
-        let _transaction = self.snapshot_transactions.lock().await;
+        let joint_checkpoint = self
+            .records
+            .get_joint_checkpoint(&request.checkpoint_id)
+            .await?;
+        let _transaction = if joint_checkpoint.is_some() {
+            None
+        } else {
+            Some(self.snapshot_transactions.lock().await)
+        };
         let resolved_llm = request.llm.as_ref().and_then(|llm| {
             let provider = llm.provider.as_deref()?.trim();
             let model = llm.model.as_deref()?.trim();
@@ -1894,9 +2127,42 @@ impl SessionApplication {
         });
         let runtime_id = request
             .runtime_id
+            .clone()
             .unwrap_or_else(|| self.runtime_ids.next_runtime_id());
         let _deployment = request.deployment.clone();
         let _requested_capabilities = request.requested_capabilities.clone();
+        if let Some(checkpoint) = joint_checkpoint {
+            if !ctx.owns(checkpoint.tenant_id.as_deref()) {
+                return Err(SessionDomainError::NotFound {
+                    runtime_id: request.checkpoint_id,
+                });
+            }
+            let owner = self.joint_owner(&checkpoint.runtime_kind, &checkpoint.binding)?;
+            let mut context = crate::joint_lifecycle::context(
+                ctx,
+                format!("load:{runtime_id}"),
+                "load",
+                &checkpoint.runtime_kind,
+                &checkpoint.binding.configuration_revision,
+                Some(&checkpoint.source_runtime_id),
+                Some(&runtime_id),
+                Some(&checkpoint.checkpoint_id),
+            );
+            context.tenant_id = checkpoint.tenant_id.clone();
+            context.owner_ref = checkpoint.owner_ref.clone();
+            let record = owner
+                .load(context.clone(), checkpoint, request, self.records.clone())
+                .await?;
+            crate::joint_lifecycle::validate_committed_session(
+                &record,
+                &context,
+                owner.owner_kind(),
+            )?;
+            if self.records.get(&record.runtime_id).await?.as_ref() != Some(&record) {
+                return Err(crate::unsupported_joint("uncommitted_publication"));
+            }
+            return Ok(project_session(&record));
+        }
         let checkpoint = self
             .records
             .get_checkpoint(&request.checkpoint_id)
@@ -1984,6 +2250,7 @@ impl SessionApplication {
             };
         let now = self.clock.now_ms();
         let record = SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: runtime_id.clone(),
             conversation_id: request
                 .conversation_id
@@ -2077,7 +2344,51 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionCheckpointDeleteRequest,
     ) -> Result<SessionCheckpointDeleteResult, SessionDomainError> {
-        let _transaction = self.snapshot_transactions.lock().await;
+        let joint_checkpoint = self
+            .records
+            .get_joint_checkpoint(&request.checkpoint_id)
+            .await?;
+        let _transaction = if joint_checkpoint.is_some() {
+            None
+        } else {
+            Some(self.snapshot_transactions.lock().await)
+        };
+        if let Some(checkpoint) = joint_checkpoint {
+            if !ctx.owns(checkpoint.tenant_id.as_deref()) {
+                return Err(SessionDomainError::NotFound {
+                    runtime_id: request.checkpoint_id,
+                });
+            }
+            let owner = self.joint_owner(&checkpoint.runtime_kind, &checkpoint.binding)?;
+            let mut context = crate::joint_lifecycle::context(
+                ctx,
+                format!("delete:{}", request.checkpoint_id),
+                "delete_checkpoint",
+                &checkpoint.runtime_kind,
+                &checkpoint.binding.configuration_revision,
+                Some(&checkpoint.source_runtime_id),
+                None,
+                Some(&checkpoint.checkpoint_id),
+            );
+            context.tenant_id = checkpoint.tenant_id.clone();
+            context.owner_ref = checkpoint.owner_ref.clone();
+            let deleted = owner
+                .delete_checkpoint(context, checkpoint, self.records.clone())
+                .await?;
+            if deleted
+                && self
+                    .records
+                    .get_joint_checkpoint(&request.checkpoint_id)
+                    .await?
+                    .is_some()
+            {
+                return Err(crate::unsupported_joint("uncommitted_delete"));
+            }
+            return Ok(SessionCheckpointDeleteResult {
+                checkpoint_id: request.checkpoint_id,
+                deleted,
+            });
+        }
         let checkpoint = self
             .records
             .get_checkpoint(&request.checkpoint_id)
@@ -2124,6 +2435,7 @@ impl SessionApplication {
         let mut parent = self
             .require_session(ctx, &request.parent_runtime_id)
             .await?;
+        Self::reject_joint_resource(&parent, "fork")?;
         self.check_lease_holder(&request.parent_runtime_id, &request.lease)
             .await?;
         let _guard = self.claim_operation(&request.parent_runtime_id)?;
@@ -2334,6 +2646,7 @@ impl SessionApplication {
             });
         }
         let record = SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: runtime_id.clone(),
             conversation_id,
             sender_id,
@@ -2449,7 +2762,9 @@ impl SessionApplication {
         &self,
         record: &mut SessionRecord,
     ) -> Result<(), SessionDomainError> {
-        if provider_id_from_metadata(&record.isolation.metadata) != Some("docker") {
+        if record.execution_backing.joint().is_some()
+            || provider_id_from_metadata(&record.isolation.metadata) != Some("docker")
+        {
             return Ok(());
         }
         let registration = self.registration_for_record(record)?;
@@ -2502,6 +2817,12 @@ impl SessionApplication {
         _ctx: &SecurityContext,
         record: &SessionRecord,
     ) -> Result<(), SessionDomainError> {
+        if let Some(binding) = record.execution_backing.joint() {
+            return self
+                .joint_owner(&record.runtime.runtime_kind, binding)?
+                .ensure_attached(record, self.records.clone())
+                .await;
+        }
         let registration = self.registration_for_record(record)?;
         let runtime = Arc::clone(&registration.runtime);
         match runtime
@@ -2685,6 +3006,9 @@ impl SessionApplication {
         id: &str,
         body: &serde_json::Value,
     ) -> Result<(), SessionDomainError> {
+        if body.get("execution_backing").is_some() {
+            return Err(crate::unsupported_joint("legacy_intent"));
+        }
         let kind = body["runtime_kind"].as_str().unwrap_or("");
         let registration = self.registration(kind)?;
         let provider = body["provider"].as_str().unwrap_or("");
@@ -2801,6 +3125,16 @@ pub struct CheckpointListEntry {
 
 #[async_trait::async_trait]
 pub trait SessionRepository: Send + Sync {
+    fn supports_joint_transactions(&self) -> bool {
+        false
+    }
+    async fn get_joint_checkpoint(
+        &self,
+        _id: &str,
+    ) -> Result<Option<crate::JointCheckpointRecord>, SessionDomainError> {
+        Ok(None)
+    }
+
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError>;
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError>;
     async fn list_active(
