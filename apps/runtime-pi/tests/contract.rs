@@ -33,8 +33,8 @@ use session_protocol::{
 };
 use std::time::{Duration, Instant};
 use support::{
-    application, fake_pi_path, new_pi_runtime, no_entry, pi_runtime_ext, started_runtime,
-    workspace_facts, LOCAL_BACKEND_ID,
+    application, fake_pi_path, new_pi_runtime, pi_runtime_ext, started_runtime, workspace_facts,
+    LOCAL_BACKEND_ID,
 };
 use tempfile::TempDir;
 use xgovernor_core::SecurityContext;
@@ -81,7 +81,7 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
             runtime_id: "runtime-llm".into(),
             turn_id: "turn-llm".into(),
             text: "hello-after-switch".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: Some(llm("anthropic", "claude-test-model", "anthropic-key")),
             reasoning_effort: None,
             ext: Default::default(),
@@ -453,7 +453,7 @@ async fn submit_turn_returns_without_waiting_for_the_turn_to_finish() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "hello".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -489,7 +489,7 @@ async fn native_pi_crash_is_reported_as_worker_unavailable() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "trigger-worker-crash".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -534,7 +534,7 @@ async fn cancel_interrupts_a_real_pi_turn_before_its_natural_completion() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "hello".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -595,7 +595,7 @@ async fn answer_interaction_round_trips_through_a_real_pi_confirm_dialog() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "trigger-interaction".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
