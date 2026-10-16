@@ -1334,6 +1334,7 @@ impl AgentRuntime for PiRuntime {
     fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
         BTreeSet::from([
             RuntimeCapability::Interaction,
+            RuntimeCapability::StateExport,
             RuntimeCapability::ModelOverride,
         ])
     }

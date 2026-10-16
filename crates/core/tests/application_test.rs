@@ -360,6 +360,23 @@ impl SessionEnvironmentNormalizer for TestEnvironment {
     }
 }
 
+struct SnapshotTestEnvironment;
+
+#[async_trait]
+impl SessionEnvironmentNormalizer for SnapshotTestEnvironment {
+    async fn normalize(
+        &self,
+        ctx: &SecurityContext,
+        request: &SessionOpenRequest,
+    ) -> Result<NormalizedSessionEnvironment, SessionDomainError> {
+        let mut normalized = TestEnvironment.normalize(ctx, request).await?;
+        normalized
+            .sandbox_capabilities
+            .insert(SandboxCapability::Snapshot);
+        Ok(normalized)
+    }
+}
+
 /// Simulates a buggy normalizer that ignores `ctx` entirely and always
 /// grants a host isolation boundary — i.e. it does *not* call
 /// `enforce_workspace_axiom` itself. Used to prove the fail-closed second
@@ -974,7 +991,9 @@ impl AgentRuntime for ForkableRuntime {
     }
 
     fn capabilities(&self) -> BTreeSet<agent_runtime_protocol::RuntimeCapability> {
-        BTreeSet::new()
+        [agent_runtime_protocol::RuntimeCapability::StateExport]
+            .into_iter()
+            .collect()
     }
 
     async fn start(
@@ -1403,10 +1422,20 @@ async fn cancel_delegates_to_the_runtime_without_a_lease_check() {
 #[tokio::test]
 async fn fork_fails_with_unsupported_capability_when_the_adapter_has_not_implemented_export_state()
 {
+    let mut parent = test_record();
+    parent
+        .capabilities
+        .sandbox
+        .insert(SandboxCapability::Snapshot);
+    parent
+        .capabilities
+        .runtime
+        .insert(RuntimeCapability::StateExport);
+    parent.capabilities.runtime.insert(RuntimeCapability::Fork);
     let application = SessionApplication::new(
         Arc::new(CompletingRuntime::default()),
         test_provider_managers(),
-        Arc::new(EmptyRepository),
+        Arc::new(MemoryRepository(Mutex::new(Some(parent)))),
         Arc::new(FixedTurnId),
         Arc::new(FixedTurnId),
         Arc::new(UnusedEnvironment),
@@ -1439,7 +1468,17 @@ async fn fork_fails_with_unsupported_capability_when_the_adapter_has_not_impleme
 
 #[tokio::test]
 async fn fork_starts_a_new_runtime_from_the_parents_exported_state() {
-    let repository = Arc::new(MemoryRepository(Mutex::new(Some(test_record()))));
+    let mut parent = test_record();
+    parent
+        .capabilities
+        .sandbox
+        .insert(SandboxCapability::Snapshot);
+    parent
+        .capabilities
+        .runtime
+        .insert(RuntimeCapability::StateExport);
+    parent.capabilities.runtime.insert(RuntimeCapability::Fork);
+    let repository = Arc::new(MemoryRepository(Mutex::new(Some(parent))));
     let runtime = Arc::new(ForkableRuntime::default());
     let providers = snapshot_provider_managers(false);
     start_test_provider(&providers, "runtime-1").await;
@@ -2341,11 +2380,21 @@ async fn open_rolls_back_the_reservation_when_runtime_start_fails() {
 #[tokio::test]
 async fn fork_counts_against_the_same_tenant_session_quota() {
     let repository = Arc::new(MapRepository::default());
+    let mut parent = tenant_test_record();
+    parent
+        .capabilities
+        .sandbox
+        .insert(SandboxCapability::Snapshot);
+    parent
+        .capabilities
+        .runtime
+        .insert(RuntimeCapability::StateExport);
+    parent.capabilities.runtime.insert(RuntimeCapability::Fork);
     repository
         .0
         .lock()
         .await
-        .insert("runtime-1".to_string(), tenant_test_record());
+        .insert("runtime-1".to_string(), parent);
     let providers = snapshot_provider_managers(false);
     start_test_provider(&providers, "runtime-1").await;
     let application = SessionApplication::new(
