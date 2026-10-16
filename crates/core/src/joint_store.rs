@@ -123,7 +123,11 @@ pub struct JointBindingState {
     pub generation: u64,
     pub stage: String,
     pub creation: JointPrepareRequest,
+    /// Owned objects whose absence has not yet been confirmed.
     pub objects: Vec<JointNativeObject>,
+    /// Known objects with durable absence evidence in this binding generation.
+    #[serde(default)]
+    pub absent_objects: Vec<JointNativeObject>,
 }
 
 fn is_false(value: &bool) -> bool {

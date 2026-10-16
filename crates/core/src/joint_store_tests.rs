@@ -1061,3 +1061,140 @@ async fn failed_prepare_rolls_back_every_claim_before_durable_restart() {
     assert_eq!(pending.native[0].0.operation_id, req.native[0].operation_id);
     assert!(pending.native[0].1.is_none());
 }
+
+#[tokio::test]
+async fn terminal_observations_are_idempotent_after_retaining_partial_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let left = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let right = SqliteSessionRepository::open(&path)
+        .unwrap()
+        .with_joint_budget_policy(budgets(3, 0))
+        .unwrap();
+    let req = request("terminal", "open", "", "target", "", "root", None);
+    let a = left.prepare_joint_operation(req.clone()).await.unwrap();
+    let native = &req.native[0];
+    let root = JointNativeObject {
+        kind: "root".into(),
+        id: "partial-root".into(),
+    };
+    result(
+        &left,
+        &a,
+        native,
+        NativeOperationState::Accepted,
+        vec![root.clone()],
+    )
+    .await;
+    let failed = JointNativeOutcome {
+        state: NativeOperationState::Failed,
+        resources: vec![],
+        payload: serde_json::json!({"failure":"P"}),
+    };
+    left.record_joint_native_result(
+        a.clone(),
+        native.step.clone(),
+        native.operation_id.clone(),
+        native.digest.clone(),
+        failed.clone(),
+    )
+    .await
+    .unwrap();
+    let original = left
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .native[0]
+        .1
+        .clone()
+        .unwrap();
+    assert_eq!(original.resources, vec![root.clone()]);
+    let barrier = tokio::sync::Barrier::new(2);
+    let (one, two) = tokio::join!(
+        async {
+            barrier.wait().await;
+            left.record_joint_native_result(
+                a.clone(),
+                native.step.clone(),
+                native.operation_id.clone(),
+                native.digest.clone(),
+                failed.clone(),
+            )
+            .await
+        },
+        async {
+            barrier.wait().await;
+            right
+                .record_joint_native_result(
+                    a.clone(),
+                    native.step.clone(),
+                    native.operation_id.clone(),
+                    native.digest.clone(),
+                    failed.clone(),
+                )
+                .await
+        }
+    );
+    assert!(
+        one.is_ok() && two.is_ok(),
+        "same terminal observation: {one:?}, {two:?}"
+    );
+    left.record_joint_native_result(
+        a.clone(),
+        native.step.clone(),
+        native.operation_id.clone(),
+        native.digest.clone(),
+        failed.clone(),
+    )
+    .await
+    .unwrap();
+    for variant in 0..3 {
+        let mut changed = failed.clone();
+        match variant {
+            0 => changed.payload = serde_json::json!({"failure":"different"}),
+            1 => changed.state = NativeOperationState::Unknown,
+            _ => changed.resources.push(JointNativeObject {
+                kind: "root".into(),
+                id: "another-root".into(),
+            }),
+        }
+        assert!(matches!(
+            right
+                .record_joint_native_result(
+                    a.clone(),
+                    native.step.clone(),
+                    native.operation_id.clone(),
+                    native.digest.clone(),
+                    changed
+                )
+                .await,
+            Err(SessionDomainError::Conflict { .. })
+        ));
+    }
+    assert_eq!(
+        right
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .native[0]
+            .1
+            .as_ref(),
+        Some(&original)
+    );
+    assert_eq!(
+        right
+            .read_joint_binding(a.binding.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .objects,
+        vec![root]
+    );
+}

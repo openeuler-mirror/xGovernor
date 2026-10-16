@@ -710,12 +710,13 @@ impl SqliteSessionRepository {
             let mut outcome=outcome;
             let observed_resources=outcome.resources.clone();
             if let Some(old)=old {
-                if old==encode(&outcome)? {return Ok(());}
                 let old:JointNativeOutcome=decode(&old)?;
-                if matches!(old.state,NativeOperationState::Completed|NativeOperationState::Failed|NativeOperationState::NotSent) {return Err(conflict("joint terminal result changed"));}
-                for resource in old.resources {
+                let incoming=std::mem::replace(&mut outcome.resources,old.resources.clone());
+                for resource in incoming {
                     if !outcome.resources.contains(&resource) {outcome.resources.push(resource);}
                 }
+                if old==outcome {return Ok(());}
+                if matches!(old.state,NativeOperationState::Completed|NativeOperationState::Failed|NativeOperationState::NotSent) {return Err(conflict("joint terminal result changed"));}
             }
             if outcome.state==NativeOperationState::Completed && native.effect==NativeEffect::Create && outcome.resources.is_empty() {
                 return Err(conflict("completed create must identify owned objects"));
@@ -940,7 +941,9 @@ impl SqliteSessionRepository {
             let creation:String=tx.query_row("SELECT request_json FROM joint_operations WHERE id=?1",[intent],|r|r.get(0))?;
             let objects=tx.prepare("SELECT kind,native_id FROM joint_objects WHERE binding_id=?1 AND generation=?2 AND absent=0")?
                 .query_map(params![binding.binding_id,generation],|r|Ok(JointNativeObject{kind:r.get(0)?,id:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(Some(JointBindingState{binding,generation,stage,creation:decode(&creation)?,objects}))
+            let absent_objects=tx.prepare("SELECT kind,native_id FROM joint_objects WHERE binding_id=?1 AND generation=?2 AND absent=1")?
+                .query_map(params![binding.binding_id,generation],|r|Ok(JointNativeObject{kind:r.get(0)?,id:r.get(1)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Some(JointBindingState{binding,generation,stage,creation:decode(&creation)?,objects,absent_objects}))
         }).await
     }
 

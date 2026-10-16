@@ -838,6 +838,18 @@ async fn partial_create_identity_survives_empty_outcomes_and_restart_compensatio
                 .unwrap(),
                 a.intent_id
             );
+            repo.begin_joint_compensation(a.clone()).await.unwrap();
+            let unknown = repo
+                .pending_joint_operations()
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(unknown.stage, "compensating");
+            assert!(owner
+                .compensate_unpublished(unknown, repo.clone())
+                .await
+                .is_err());
             assert!(!f
                 .trace()
                 .iter()
@@ -846,6 +858,94 @@ async fn partial_create_identity_survives_empty_outcomes_and_restart_compensatio
             continue;
         }
         assert!(repo.finish_joint_compensation(a.clone()).await.is_err());
+        let (repo, pending) = if erased_legacy_outcome {
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TRIGGER interrupt_finish BEFORE UPDATE ON joint_operations WHEN NEW.stage='compensated' BEGIN SELECT RAISE(ABORT,'injected finish interruption'); END;").unwrap();
+            assert!(owner
+                .compensate_unpublished(pending, repo.clone())
+                .await
+                .is_err());
+            assert!(repo
+                .get_joint_binding(a.binding.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .objects
+                .is_empty());
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM joint_objects WHERE binding_id=?1 AND generation=?2 AND kind='root' AND native_id=?3 AND absent=1",
+                    rusqlite::params![a.binding.binding_id, a.generation, root.id],
+                    |r| r.get::<_, i64>(0)
+                ).unwrap(),
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT stage FROM joint_operations WHERE id=?1",
+                    [&a.intent_id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                "compensating"
+            );
+            for (table, condition, expected) in [
+                ("joint_reservations", "state='reserved'", 2),
+                ("joint_public_claims", "1=1", 1),
+                ("joint_workspace_claims", "1=1", 1),
+                ("joint_fences", "holder IS NOT NULL", 1),
+            ] {
+                assert_eq!(
+                    db.query_row(
+                        &format!("SELECT count(*) FROM {table} WHERE {condition}"),
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+            let mutations_before = f
+                .trace()
+                .into_iter()
+                .filter(|r| {
+                    ["thinkthread.stop", "thinkthread.remove"]
+                        .contains(&r["method"].as_str().unwrap())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(mutations_before.len(), 2);
+            drop(db);
+            drop(repo);
+            let repo = Arc::new(repository(&path));
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch("DROP TRIGGER interrupt_finish").unwrap();
+            drop(db);
+            let pending = repo
+                .pending_joint_operations()
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(pending.admission, a);
+            assert_eq!(pending.stage, "compensating");
+            let mut stale = pending.clone();
+            stale.admission.generation += 1;
+            assert!(owner
+                .compensate_unpublished(stale, repo.clone())
+                .await
+                .is_err());
+            assert_eq!(
+                f.trace()
+                    .into_iter()
+                    .filter(|r| ["thinkthread.stop", "thinkthread.remove"]
+                        .contains(&r["method"].as_str().unwrap()))
+                    .collect::<Vec<_>>(),
+                mutations_before
+            );
+            (repo, pending)
+        } else {
+            (repo, pending)
+        };
         owner
             .compensate_unpublished(pending, repo.clone())
             .await
@@ -877,6 +977,14 @@ async fn partial_create_identity_survives_empty_outcomes_and_restart_compensatio
             .unwrap(),
             0
         );
+        for table in ["joint_public_claims", "joint_workspace_claims"] {
+            assert_eq!(
+                db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
         let trace = f.trace();
         for method in [
             "thinkthread.create",

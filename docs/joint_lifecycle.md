@@ -102,3 +102,17 @@ Unpublished Root compensation resolves residual identities from the durable
 binding, including older journals whose last outcome omitted a previously known
 Root. A failed create with no known object in either the outcome or binding keeps
 its ownership and capacity; an empty result is not proof of absence.
+
+The internal binding lookup keeps live objects in `objects` and exposes known
+objects with durable absence evidence separately in `absent_objects`, scoped to
+the same binding generation. After compensation reaches durable absence, a
+restart can complete the existing strict finish transaction without repeating
+stop/remove, including older journals whose create result omitted the identity.
+A failed create with no identity in either object collection or its outcome is
+still rejected, even if its operation is already compensating. Release still
+requires settled native steps, no surviving references and no live objects.
+
+Repeated terminal observations first retain the previously known resource
+identities, then compare the normalized result. The same state and payload with
+no new resource identity is idempotent, including an empty incoming resource list.
+A changed terminal state, payload or added resource identity remains a conflict.

@@ -393,7 +393,10 @@ impl RootSessionOwner {
                 .get_joint_binding(pending.admission.binding.clone())
                 .await?
                 .ok_or_else(|| unavailable("missing durable binding"))?;
-            if known.objects.is_empty() {
+            let confirmed_cleanup = known.stage == "compensating"
+                && known.generation == pending.admission.generation
+                && !known.absent_objects.is_empty();
+            if known.objects.is_empty() && !confirmed_cleanup {
                 return Err(unavailable(
                     "failed create has no trustworthy residual identity; ownership retained",
                 ));
@@ -407,8 +410,13 @@ impl RootSessionOwner {
             .await?
             .ok_or_else(|| unavailable("missing durable binding"))?;
         if binding.stage != "compensating"
-            || binding.objects.iter().any(|o| o.kind != "root")
-            || binding.objects.len() > 1
+            || binding.generation != pending.admission.generation
+            || binding
+                .objects
+                .iter()
+                .chain(&binding.absent_objects)
+                .any(|o| o.kind != "root")
+            || binding.objects.len() + binding.absent_objects.len() > 1
         {
             return Err(unavailable(
                 "compensation does not own an unpublished single Root",
