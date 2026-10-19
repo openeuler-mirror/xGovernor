@@ -723,6 +723,8 @@ impl SessionApplication {
         if normalized
             .sandbox_capabilities
             .contains(&crate::SandboxCapability::Snapshot)
+            && runtime_wire_capabilities
+                .contains(&session_protocol::SessionRuntimeCapability::StateExport)
         {
             runtime_wire_capabilities
                 .insert(session_protocol::SessionRuntimeCapability::Checkpoint);
@@ -1724,6 +1726,16 @@ impl SessionApplication {
         self.check_lease_holder(&request.runtime_id, &request.lease)
             .await?;
         let _guard = self.claim_operation(&request.runtime_id)?;
+        if !record
+            .capabilities
+            .runtime
+            .contains(&RuntimeCapability::StateExport)
+        {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability: "state_export".into(),
+            });
+        }
         self.ensure_runtime_attached(ctx, &record).await?;
         self.refresh_docker_snapshot_capabilities(&mut record)
             .await?;
@@ -2115,11 +2127,35 @@ impl SessionApplication {
         self.check_lease_holder(&request.parent_runtime_id, &request.lease)
             .await?;
         let _guard = self.claim_operation(&request.parent_runtime_id)?;
+        if !parent
+            .capabilities
+            .runtime
+            .contains(&RuntimeCapability::StateExport)
+        {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability: "state_export".into(),
+            });
+        }
         self.ensure_runtime_attached(ctx, &parent).await?;
         self.refresh_docker_snapshot_capabilities(&mut parent)
             .await?;
         let registration = self.registration_for_record(&parent)?;
         let runtime = Arc::clone(&registration.runtime);
+        if !parent
+            .capabilities
+            .runtime
+            .contains(&RuntimeCapability::Fork)
+            || !parent
+                .capabilities
+                .sandbox
+                .contains(&crate::SandboxCapability::Snapshot)
+        {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Runtime,
+                capability: "fork".into(),
+            });
+        }
 
         let runtime_id = request
             .runtime_id
@@ -2431,16 +2467,27 @@ impl SessionApplication {
                 .capabilities
                 .sandbox
                 .insert(crate::SandboxCapability::Snapshot);
+        } else {
+            record
+                .capabilities
+                .sandbox
+                .remove(&crate::SandboxCapability::Snapshot);
+        }
+        if record
+            .capabilities
+            .sandbox
+            .contains(&crate::SandboxCapability::Snapshot)
+            && record
+                .capabilities
+                .runtime
+                .contains(&RuntimeCapability::StateExport)
+        {
             record
                 .capabilities
                 .runtime
                 .insert(RuntimeCapability::Checkpoint);
             record.capabilities.runtime.insert(RuntimeCapability::Fork);
         } else {
-            record
-                .capabilities
-                .sandbox
-                .remove(&crate::SandboxCapability::Snapshot);
             record
                 .capabilities
                 .runtime

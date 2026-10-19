@@ -81,7 +81,7 @@ async fn real_model_probe_start_switch_checkpoint_and_failed_switch() {
         runtime_id: "real-model".into(),
         turn_id: uuid::Uuid::new_v4().to_string(),
         text: "Reply OK".into(),
-        entry: support::no_entry(),
+        entry: Default::default(),
         llm,
         reasoning_effort: None,
         ext: Default::default(),

@@ -28,12 +28,13 @@ use agent_runtime_protocol::{
 use serde_json::{json, Value};
 use session_protocol::{
     LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionOpenRequest,
-    SessionToolActivityPhase, SessionToolActivityStatus, SessionTurnOutcome, SessionTurnRequest,
+    SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
+    SessionTurnOutcome, SessionTurnRequest,
 };
 use std::time::{Duration, Instant};
 use support::{
-    application, fake_pi_path, new_pi_runtime, no_entry, pi_runtime_ext, started_runtime,
-    workspace_facts, LOCAL_BACKEND_ID,
+    application, fake_pi_path, new_pi_runtime, pi_runtime_ext, started_runtime, workspace_facts,
+    LOCAL_BACKEND_ID,
 };
 use tempfile::TempDir;
 use xgovernor_core::SecurityContext;
@@ -80,7 +81,7 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
             runtime_id: "runtime-llm".into(),
             turn_id: "turn-llm".into(),
             text: "hello-after-switch".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: Some(llm("anthropic", "claude-test-model", "anthropic-key")),
             reasoning_effort: None,
             ext: Default::default(),
@@ -123,14 +124,16 @@ async fn llm_selection_is_wired_into_pi_start_and_turn_requests() {
     assert_eq!(flag_value("--api-key"), None);
     assert!(!launch_args.iter().any(|arg| arg == "open-key"));
 
-    let commands: Vec<Value> = std::fs::read_to_string(session_dir
-        .parent()
-        .expect("the session dir has a parent")
-        .join("fake_pi_commands.jsonl"))
-        .expect("command log")
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("command JSON"))
-        .collect();
+    let commands: Vec<Value> = std::fs::read_to_string(
+        session_dir
+            .parent()
+            .expect("the session dir has a parent")
+            .join("fake_pi_commands.jsonl"),
+    )
+    .expect("command log")
+    .lines()
+    .map(|line| serde_json::from_str(line).expect("command JSON"))
+    .collect();
     assert_eq!(commands[0]["type"], "get_state");
     assert_eq!(
         commands[2]["provider"], "openai",
@@ -249,23 +252,37 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
     let (app, repository) = application(workspace.path().to_str().unwrap().to_string());
     let ctx = SecurityContext::admin("test");
 
-    app.open(
-        &ctx,
-        SessionOpenRequest {
-            runtime_id: None,
-            runtime_kind: None,
-            conversation_id: "conversation-1".into(),
-            sender_id: "sender-1".into(),
-            workspace: Default::default(),
-            deployment: Default::default(),
-            requested_capabilities: Default::default(),
-            llm: None,
-            ext: pi_runtime_ext(),
-            lease: Default::default(),
-        },
-    )
-    .await
-    .expect("open must succeed against a real pi subprocess");
+    let response = app
+        .open(
+            &ctx,
+            SessionOpenRequest {
+                runtime_id: None,
+                runtime_kind: None,
+                conversation_id: "conversation-1".into(),
+                sender_id: "sender-1".into(),
+                workspace: Default::default(),
+                deployment: Default::default(),
+                requested_capabilities: session_protocol::SessionCapabilityRequest {
+                    runtime: [SessionRuntimeCapability::StateExport]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                llm: None,
+                ext: pi_runtime_ext(),
+                lease: Default::default(),
+            },
+        )
+        .await
+        .expect("open must succeed when Pi advertises state export");
+
+    assert!(
+        response
+            .effective_capabilities
+            .runtime
+            .contains(&SessionRuntimeCapability::StateExport),
+        "open response must advertise the requested state-export capability"
+    );
 
     // Phase 1 (`docs/pi_session_restore_plan.md` §2): `open_impl` must have
     // called `PiRuntime::export_state` and persisted a non-null blob
@@ -277,6 +294,13 @@ async fn open_and_submit_turn_streams_output_from_a_real_pi_process_and_complete
         .clone()
         .expect("open() must have saved a SessionRecord");
     assert_eq!(record.runtime.runtime_kind, "pi");
+    assert!(
+        record
+            .capabilities
+            .runtime
+            .contains(&xgovernor_core::RuntimeCapability::StateExport),
+        "persisted session capabilities must include state export"
+    );
     assert_ne!(
         record.runtime.state,
         Value::Null,
@@ -429,7 +453,7 @@ async fn submit_turn_returns_without_waiting_for_the_turn_to_finish() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "hello".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -465,7 +489,7 @@ async fn native_pi_crash_is_reported_as_worker_unavailable() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "trigger-worker-crash".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -510,7 +534,7 @@ async fn cancel_interrupts_a_real_pi_turn_before_its_natural_completion() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "hello".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),
@@ -571,7 +595,7 @@ async fn answer_interaction_round_trips_through_a_real_pi_confirm_dialog() {
             runtime_id: "runtime-1".into(),
             turn_id: "turn-1".into(),
             text: "trigger-interaction".into(),
-            entry: no_entry(),
+            entry: Default::default(),
             llm: None,
             reasoning_effort: None,
             ext: Default::default(),

@@ -218,11 +218,6 @@ pub fn application(root: String) -> (SessionApplication, StdArc<MemoryRepository
 /// `PiRuntime` instances (simulating a daemon restart) while still going
 /// through `SessionApplication` for the close-path test.
 ///
-/// `#[allow(dead_code)]`: only `tests/restore.rs` calls this; `tests/support`
-/// is compiled fresh into every integration-test binary that includes it
-/// (`mod support;`), so `tests/contract.rs`'s own binary would otherwise warn
-/// on it as unused.
-#[allow(dead_code)]
 pub fn application_with_runtime(
     runtime: PiRuntime,
     managers: HashMap<String, StdArc<InstanceManager>>,
@@ -238,15 +233,6 @@ pub fn application_with_runtime(
         StdArc::new(TempWorkspaceEnvironment { root }),
         StdArc::new(FixedIds),
     )
-}
-
-pub fn no_entry() -> RuntimeEntryContext {
-    RuntimeEntryContext {
-        kind: None,
-        instance_id: None,
-        message_id: None,
-        reply_to_message_id: None,
-    }
 }
 
 pub async fn started_runtime(workspace_root: &str) -> PiRuntime {
