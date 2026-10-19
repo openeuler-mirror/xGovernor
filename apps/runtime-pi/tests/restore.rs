@@ -365,3 +365,93 @@ async fn close_after_restart_destroys_provider_without_spawning_pi() {
     let closed = repository.0.lock().unwrap().clone().unwrap();
     assert_eq!(closed.status, SessionStatus::Closed);
 }
+
+/// Same shape as [`seed_valid_session_file`] plus a trailing `compaction`
+/// bookkeeping record — what a real `pi` leaves behind once context
+/// compaction runs after a completed turn. Restoration (and checkpoint)
+/// validation must anchor on the last `message` record, not the physical
+/// last line.
+fn seed_compacted_session_file(session_dir: &str, file_name: &str) -> String {
+    let path = Path::new(session_dir).join(file_name);
+    std::fs::write(
+        &path,
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"stopReason\":\"end_turn\",\"usage\":{\"input\":100000,\"output\":2000,\"totalTokens\":102000}}}\n\
+         {\"type\":\"compaction\",\"id\":\"compaction-1\",\"parentId\":\"leaf\",\"timestamp\":\"2026-10-19T00:00:00.000Z\",\"summary\":\"compacted earlier history\",\"firstKeptEntryId\":\"kept-1\",\"tokensBefore\":12345,\"usage\":{\"input\":10,\"output\":20}}\n",
+    )
+    .expect("seed a compacted session jsonl file");
+    path.to_string_lossy().into_owned()
+}
+
+/// Regression for the pi context-compaction tail: a session file that ends
+/// with a bookkeeping `compaction` record (not an assistant message) must
+/// still restore cleanly — the old "physical last line must be an assistant
+/// message" rule misread it as an incomplete session and failed the restore
+/// (and, on the same helper, checkpoints) with 400.
+#[tokio::test]
+async fn restart_with_trailing_compaction_record_still_restores_the_session() {
+    let workspace = TempDir::new().expect("tempdir");
+    let workspace_root = workspace.path().to_str().unwrap().to_string();
+    let session_root = TempDir::new()
+        .expect("tempdir for pi session-dir root")
+        .keep();
+    let managers = support::build_managers();
+    let repository = StdArc::new(support::MemoryRepository::default());
+    let ctx = SecurityContext::admin("test");
+
+    {
+        let runtime_a = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+            .expect("bridge must bind");
+        let app_a = support::application_with_runtime(
+            runtime_a,
+            managers.clone(),
+            repository.clone(),
+            workspace_root.clone(),
+        );
+        app_a
+            .open(&ctx, open_request())
+            .await
+            .expect("open must succeed against a real pi subprocess");
+    } // simulated restart: fake_pi killed, sandbox/ledger entry survives.
+
+    let record = repository
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("open() must have saved a SessionRecord");
+    let session_dir = record
+        .runtime
+        .state
+        .get("pi_session_dir")
+        .and_then(Value::as_str)
+        .expect("persisted state must carry pi_session_dir")
+        .to_string();
+    seed_compacted_session_file(&session_dir, "session.jsonl");
+
+    {
+        let mut guard = repository.0.lock().unwrap();
+        let mut running = guard.clone().unwrap();
+        running.status = SessionStatus::Running;
+        *guard = Some(running);
+    }
+
+    let runtime_b = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+        .expect("bridge must bind");
+    let app_b = support::application_with_runtime(
+        runtime_b,
+        managers.clone(),
+        repository.clone(),
+        workspace_root,
+    );
+
+    let submission = app_b
+        .submit_turn(&ctx, turn_request("hello-after-compaction"))
+        .await
+        .expect("submit_turn must restore a session whose file ends with a compaction record");
+    // The restore happens synchronously inside submit_turn; accepting the
+    // turn (and getting its event stream) is the assertion.
+    let _events = submission
+        .events
+        .expect("resumed turn carries an event stream");
+}
