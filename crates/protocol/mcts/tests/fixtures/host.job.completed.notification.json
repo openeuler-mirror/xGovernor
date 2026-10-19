@@ -1,0 +1,16 @@
+{
+  "jsonrpc": "2.0",
+  "method": "host.job.completed",
+  "params": {
+    "run_id": "mcts-run-42",
+    "job_id": "job-9",
+    "sequence": 3,
+    "output": "18 passed, 2 failed",
+    "usage": {
+      "input_tokens": 123,
+      "output_tokens": 17
+    },
+    "exit_code": 0,
+    "truncated": false
+  }
+}

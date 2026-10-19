@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "fixture-fork",
+  "method": "host.fork",
+  "params": {
+    "plugin_id": "mcts",
+    "run_id": "mcts-run-42",
+    "timeout_ms": 30000,
+    "parent_state_id": "state-001",
+    "idempotency_key": "fork-node-7"
+  }
+}

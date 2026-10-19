@@ -1,0 +1,49 @@
+{
+  "jsonrpc": "2.0",
+  "method": "plugin.completed",
+  "params": {
+    "plugin_id": "mcts",
+    "run_id": "mcts-run-42",
+    "sequence": 7,
+    "result": {
+      "status": "completed",
+      "summary": "搜索得到一个推荐修复方案，仍有两项测试未通过。",
+      "answer": "推荐修改 parser 的状态切换和空输入处理。候选通过 18/20 项测试，剩余两项失败及修改差异见证据。",
+      "stop_reason": "budget_exhausted",
+      "selected_candidate_id": "node-7",
+      "candidates": [
+        {
+          "candidate_id": "node-7",
+          "state_id": "state-007",
+          "score": 0.81,
+          "evaluation_version": "parser-checks-v1",
+          "summary": "修正状态切换和空输入处理",
+          "evidence_refs": [
+            "evidence-1",
+            "evidence-2"
+          ]
+        }
+      ],
+      "evidence": [
+        {
+          "evidence_id": "evidence-1",
+          "kind": "test_report",
+          "content": "18 passed, 2 failed"
+        },
+        {
+          "evidence_id": "evidence-2",
+          "kind": "diff",
+          "content": "diff --git a/parser.py b/parser.py"
+        }
+      ],
+      "limitations": [
+        "仍有 2 项测试未通过"
+      ],
+      "apply_plan": {
+        "kind": "continue_from_state",
+        "state_id": "state-007",
+        "base_state_id": "state-001"
+      }
+    }
+  }
+}

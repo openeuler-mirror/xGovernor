@@ -1,0 +1,30 @@
+{
+  "jsonrpc": "2.0",
+  "id": "fixture-start",
+  "method": "plugin.start",
+  "params": {
+    "plugin_id": "mcts",
+    "run_id": "mcts-run-42",
+    "session_id": "session-abc",
+    "turn_id": "turn-17",
+    "root_state_id": "state-001",
+    "goal": "解决当前错误并给出可应用的修改",
+    "content": "当前会话上下文：用户要求修复 parser；已复现空输入导致的异常；修改范围限于 parser 模块。",
+    "budget": {
+      "max_nodes": 16,
+      "max_time_ms": 1800000,
+      "max_tokens": 3000000
+    },
+    "granted_capabilities": [
+      "snapshot",
+      "fork",
+      "agent_turn",
+      "inspect",
+      "exec",
+      "file_read",
+      "file_write",
+      "diff",
+      "release"
+    ]
+  }
+}
