@@ -1,0 +1,21 @@
+[package]
+name = "mcts-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mcts-protocol = { path = "../protocol/mcts" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bin]]
+name = "stub-plugin"
+path = "src/bin/stub_plugin.rs"

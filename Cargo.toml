@@ -8,6 +8,7 @@ members = [
     "crates/protocol/operation",
     "crates/protocol/runtime",
     "crates/protocol/mcts",
+    "crates/mcts-plugin-host",
     "crates/backend",
     "crates/core",
     "crates/manager",

@@ -1,0 +1,61 @@
+{
+  "plugin_id": "mcts",
+  "resource_root": "testcases_union",
+  "modes": {
+    "zsoft": {
+      "task_plugin_root": "res/task_plugins/zsoft",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_author_step.txt"
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_solver_step.txt"
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_submission_selector.txt"
+        },
+        "trial-assessor": {
+          "role": "trial_assessor",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_trial_assessor.txt"
+        }
+      }
+    },
+    "sweverified": {
+      "task_plugin_root": "res/task_plugins/sweverified",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/sweverified/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/sweverified/prompts/prompt_author_step.txt"
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/sweverified/prompts/prompt_solver_step.txt"
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/sweverified/prompts/prompt_submission_selector.txt"
+        }
+      }
+    }
+  }
+}
