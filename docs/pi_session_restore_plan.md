@@ -12,7 +12,7 @@ provider 生命周期由 `SessionApplication` 和 `InstanceManager` 管理；Pi 
 
 Pi 通过 `RuntimeStateSnapshot` 保存版本化 opaque state，其中包含重新拉起 worker/Pi 所需的 runtime 私有信息，例如 session 目录、可执行文件配置和会话文件位置。core 不解析这些字段，只校验和路由 `runtime_kind`。
 
-每次 open 成功后，Application 调用 `export_state` 并保存到 `SessionRecord.runtime`。Pi session JSONL 存在 per-runtime 目录中；恢复前必须校验最新文件完整且最后一条消息是非 pending 的 assistant 终态。
+每次 open 成功后，Application 调用 `export_state` 并保存到 `SessionRecord.runtime`。Pi session JSONL 存在 per-runtime 目录中；恢复前必须校验最新文件完整且最后一条 `message` 记录是非 pending 的 assistant 终态。回合结束后 pi 追加的簿记记录（`compaction` / `model_change` / `thinking_level_change` 等）不参与该判定，向后扫描跳过；仅物理末行出现半行 JSON 视为截断。
 
 ## 惰性恢复
 
