@@ -8,6 +8,7 @@ license.workspace = true
 mcts-protocol = { path = "../protocol/mcts" }
 serde.workspace = true
 serde_json.workspace = true
+async-trait = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }

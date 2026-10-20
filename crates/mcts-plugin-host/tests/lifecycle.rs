@@ -1,6 +1,7 @@
 use mcts_plugin_host::{manifest::PLUGIN_ID, PluginManifest, PluginSession};
 use mcts_protocol::MethodName;
 use serde_json::json;
+use std::time::Duration;
 use tokio::process::Command;
 
 const MANIFEST_FIXTURE: &str = concat!(
@@ -80,4 +81,27 @@ async fn completes_initialize_start_wait_shutdown() {
         .unwrap();
 
     let _ = manifest;
+}
+
+#[tokio::test]
+async fn request_times_out_when_plugin_does_not_reply() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg("sleep 10");
+    let process = mcts_plugin_host::PluginProcess::spawn(command, &[]).await.unwrap();
+    let session = PluginSession::new(process);
+
+    let result = session
+        .request_with_timeout(
+            "timeout-test",
+            MethodName::PluginShutdown,
+            json!({"plugin_id": "mcts"}),
+            Duration::from_millis(50),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(mcts_plugin_host::PluginHostError::DeadlineExceeded)
+    ));
+
+    session.shutdown().await.unwrap();
 }

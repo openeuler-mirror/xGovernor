@@ -1,6 +1,7 @@
 use mcts_protocol::messages::JSONRPC_VERSION;
 use mcts_protocol::{MethodName, Request, Response, RpcEnvelope, RpcId};
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::error::PluginHostError;
 use crate::process::PluginProcess;
@@ -8,6 +9,8 @@ use crate::process::PluginProcess;
 pub struct PluginSession {
     process: PluginProcess,
 }
+
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl PluginSession {
     pub fn new(process: PluginProcess) -> Self {
@@ -24,6 +27,17 @@ impl PluginSession {
         method: MethodName,
         params: Value,
     ) -> Result<Response, PluginHostError> {
+        self.request_with_timeout(id, method, params, DEFAULT_REQUEST_TIMEOUT)
+            .await
+    }
+
+    pub async fn request_with_timeout(
+        &self,
+        id: &str,
+        method: MethodName,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Response, PluginHostError> {
         let request = RpcEnvelope::Request(Request {
             jsonrpc: JSONRPC_VERSION.to_string(),
             id: RpcId::String(id.to_string()),
@@ -32,6 +46,12 @@ impl PluginSession {
         });
         self.process.send(&request).await?;
 
+        tokio::time::timeout(timeout, self.wait_for_response(id))
+            .await
+            .map_err(|_| PluginHostError::DeadlineExceeded)?
+    }
+
+    async fn wait_for_response(&self, id: &str) -> Result<Response, PluginHostError> {
         loop {
             match self.process.next_message().await? {
                 RpcEnvelope::Response(response) => {

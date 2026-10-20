@@ -29,11 +29,14 @@ impl PluginRegistry {
         let mut inner = self.inner.write().map_err(|_| {
             PluginHostError::Manifest("plugin registry lock poisoned".to_string())
         })?;
-        if inner.insert(plugin_id.to_string(), PluginStatus::Spawning).is_some() {
-            return Err(PluginHostError::Manifest(format!(
-                "plugin already registered: {plugin_id}"
-            )));
+        if let Some(status) = inner.get(plugin_id) {
+            if *status != PluginStatus::Exited {
+                return Err(PluginHostError::Manifest(format!(
+                    "plugin already registered: {plugin_id}"
+                )));
+            }
         }
+        inner.insert(plugin_id.to_string(), PluginStatus::Spawning);
         Ok(())
     }
 
@@ -89,5 +92,39 @@ impl PluginManager {
                 Err(error)
             }
         }
+    }
+
+    pub async fn shutdown_named(
+        &self,
+        plugin_id: &str,
+        process: PluginProcess,
+    ) -> Result<(), PluginHostError> {
+        process.shutdown().await?;
+        self.registry.set_status(plugin_id, PluginStatus::Exited);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exited_plugin_can_be_registered_again() {
+        let manager = PluginManager::new();
+
+        let mut first = Command::new("sh");
+        first.arg("-c").arg("exit 0");
+        let first_process = manager.spawn_named("mcts", first, &[]).await.unwrap();
+        manager.shutdown_named("mcts", first_process).await.unwrap();
+        assert_eq!(
+            manager.registry().status("mcts"),
+            Some(PluginStatus::Exited)
+        );
+
+        let mut second = Command::new("sh");
+        second.arg("-c").arg("exit 0");
+        let second_process = manager.spawn_named("mcts", second, &[]).await.unwrap();
+        manager.shutdown_named("mcts", second_process).await.unwrap();
     }
 }

@@ -5,14 +5,24 @@
 //! JSON-RPC framing, lifecycle handshakes and process cleanup.
 
 pub mod error;
+pub mod capability_map;
+pub mod host_cap_service;
 pub mod lifecycle;
+pub mod llm_policy;
 pub mod manifest;
 pub mod process;
+pub mod profile_registry;
 pub mod registry;
+pub mod run_map;
 pub mod stdio;
 
+pub use capability_map::{HostCapability, ensure_capability_available, ensure_method_available, map_granted_capabilities};
 pub use error::PluginHostError;
+pub use host_cap_service::{FakeApplication, HostApplication, HostCapService};
 pub use lifecycle::PluginSession;
+pub use llm_policy::LlmPolicy;
 pub use manifest::{ModeManifest, PluginManifest, ProfileManifest, PLUGIN_ID};
 pub use process::PluginProcess;
+pub use profile_registry::ProfileRegistry;
 pub use registry::{PluginManager, PluginRegistry, PluginStatus};
+pub use run_map::{JobStatus, RunMap};
