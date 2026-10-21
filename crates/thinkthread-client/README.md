@@ -1,8 +1,8 @@
 # ThinkThread Management client
 
-This crate provides a Host-side client for the pinned alpha8 Management SDK
+This crate provides a Host-side client for the pinned alpha11 Management SDK
 (`2.2.0`, protocol v2, Git revision
-`378fd41df1773e00dc01e4ddb5b28ac1df987719`). It requires Rust 1.89 or newer.
+`881ff5d49395bfe53904c2da2f8d6403db1b42fd`). It requires Rust 1.89 or newer.
 The default server does not assemble it as an execution backend.
 
 Construct `ManagementConfig` with an explicit Management Host executable,
@@ -52,7 +52,7 @@ model and executable references must already be provisioned in an isolated
 matching deployment. Environment values are read only for the named
 `context.environmentKeys`; do not put credential values in the JSON.
 
-Use a matching alpha8 installation and the Linux 6.12+ validation baseline.
+Use a matching alpha11 installation and the Linux 6.12+ validation baseline.
 The probe does not install a Runtime, create profiles, select a fallback Host,
 or infer binary provenance from a filename. Keep the selected environment and
 model credential files protected.

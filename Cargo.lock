@@ -2464,7 +2464,7 @@ dependencies = [
 [[package]]
 name = "thinkthread-management"
 version = "2.2.0"
-source = "git+https://gitcode.com/aideveloper/capsule_public.git?rev=378fd41df1773e00dc01e4ddb5b28ac1df987719#378fd41df1773e00dc01e4ddb5b28ac1df987719"
+source = "git+https://gitcode.com/aideveloper/capsule_public.git?rev=881ff5d49395bfe53904c2da2f8d6403db1b42fd#881ff5d49395bfe53904c2da2f8d6403db1b42fd"
 dependencies = [
  "base64",
  "serde",

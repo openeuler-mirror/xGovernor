@@ -14,7 +14,7 @@ use std::time::Duration;
 use sdk::{ClientOptions, ManagementError, ThinkThreadClient};
 pub use thinkthread_management as sdk;
 
-/// The Management v2 contract paired with the pinned alpha8 SDK.
+/// The Management v2 contract paired with the pinned alpha11 SDK.
 pub const EXPECTED_CONTRACT_FINGERPRINT: &str =
     "8e65d3658ebc674bf3f263b93c813e630e991bf870bc2118535ab0f2313d9fb6";
 

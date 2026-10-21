@@ -12,7 +12,7 @@ session-protocol = { path = "../protocol/session" }
 xgovernor-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-thinkthread-management = { git = "https://gitcode.com/aideveloper/capsule_public.git", rev = "378fd41df1773e00dc01e4ddb5b28ac1df987719", version = "=2.2.0" }
+thinkthread-management = { git = "https://gitcode.com/aideveloper/capsule_public.git", rev = "881ff5d49395bfe53904c2da2f8d6403db1b42fd", version = "=2.2.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
