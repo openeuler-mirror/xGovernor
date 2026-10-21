@@ -1337,7 +1337,7 @@ async fn authenticated_http_rejects_forged_identity_and_preserves_original_queri
     }
     let before = f.snapshot();
     let trace = f.trace();
-    for path in ["/api/v1/sessions/close", "/api/v1/sessions/cancel"] {
+    for path in ["/api/v1/sessions/close"] {
         let (status, body) = call(
             &transport,
             "POST",
@@ -1355,7 +1355,40 @@ async fn authenticated_http_rejects_forged_identity_and_preserves_original_queri
     }
     assert_eq!(f.snapshot(), before);
     assert_eq!(f.trace(), trace);
+    let (status, body) = call(
+        &transport,
+        "POST",
+        "/api/v1/sessions/cancel",
+        Some("synthetic-admin-bearer"),
+        json!({"runtime_id":"existing"}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    assert_safe(&body);
+    let mut after = f.snapshot();
+    let mut expected = before;
+    after.as_object_mut().unwrap().remove("joint_turn_cancels");
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("joint_turn_cancels");
+    assert_eq!(after, expected);
+    assert_eq!(f.trace(), trace);
+    let pending = router
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(router
+        .repository()
+        .joint_cancel_control(pending.admission)
+        .await
+        .unwrap()
+        .is_some());
 }
+
 #[tokio::test]
 async fn public_receipt_and_terminal_keep_unknown_distinct_from_trusted_zero() {
     let f = Fixture::new();
@@ -2462,4 +2495,1197 @@ fn legacy_request(kind: &str, backend: &str) -> Value {
         json!({"backend_id":backend,"provider":"openai","model":"gpt-4.1-mini","api_key_env":"XG_PROFILE_TEST_MODEL_KEY"})
     };
     json!({"conversation_id":"conversation","sender_id":"sender","ext":{if kind=="pi" {"runtime_pi"} else {"xiaoo"}:extension}})
+}
+
+fn cancel_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    for config in f.configurations.values_mut() {
+        config
+            .base_environment
+            .insert("XG_TEST_SCENARIO".into(), "owner-cancel".into());
+    }
+    f
+}
+fn cancel_control(f: &Fixture, name: &str, value: Value) {
+    let path = f.root.path().join(name).join("state.json.control");
+    let temp = path.with_extension("next");
+    std::fs::write(&temp, serde_json::to_vec(&value).unwrap()).unwrap();
+    std::fs::rename(temp, path).unwrap();
+}
+async fn until_message(f: &Fixture, count: usize) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sent: Vec<_> = f
+                .trace()
+                .into_iter()
+                .filter(|v| v["method"] == "message.send")
+                .collect();
+            if sent.len() >= count
+                && f.trace()
+                    .iter()
+                    .filter(|v| v["method"] == "message.wait")
+                    .count()
+                    >= count
+            {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn cancel_events(mut submission: SessionSubmission) -> Vec<Value> {
+    let mut events = Vec::new();
+    if let Some(rx) = submission.events.as_mut() {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while let Some(event) = rx.recv().await {
+                events.push(serde_json::to_value(event).unwrap());
+            }
+        })
+        .await
+        .unwrap();
+    }
+    events
+}
+async fn cancel_submit(
+    app: &SessionApplication,
+    id: &str,
+    text: &str,
+    key: &str,
+) -> SessionSubmission {
+    app.submit_turn(
+        &SecurityContext::admin("operator"),
+        serde_json::from_value(json!({"runtime_id":id,"text":text,"client_request_id":key}))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+fn cancel_owner(f: &Fixture, name: &str) -> RootSessionOwner {
+    RootSessionOwner::new(f.configurations[name].clone(),serde_json::from_value(json!({"agent":{"kind":"profile","name":"fixture"},"fs":f.configurations[name].fs_root,"models":[],"allowSharedFs":false})).unwrap(),name.into(),0,0,4000).unwrap()
+}
+
+#[tokio::test]
+async fn ordinary_cancel_targets_the_original_turn_and_never_the_new_turn() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let ctx = SecurityContext::admin("operator");
+    let first = cancel_submit(&app, "existing", "old-input", "old-key").await;
+    let turn = first.receipt.turn_id.clone();
+    until_message(&f, 1).await;
+    for (security, id, target) in [
+        (
+            SecurityContext::tenant("other", "operator"),
+            "existing",
+            turn.as_str(),
+        ),
+        (ctx.clone(), "existing", "absent-turn"),
+    ] {
+        let before = f
+            .trace()
+            .iter()
+            .filter(|r| r["method"] == "message.cancel")
+            .count();
+        assert!(app.cancel(&security, id, Some(target)).await.is_err());
+        assert_eq!(
+            f.trace()
+                .iter()
+                .filter(|r| r["method"] == "message.cancel")
+                .count(),
+            before
+        );
+    }
+    app.cancel(&ctx, "existing", Some(&turn)).await.unwrap();
+    let events = cancel_events(first).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], "cancelled");
+    assert_eq!(events[0]["usage"], "unknown");
+    let old = router
+        .repository()
+        .get_joint_turn("existing".into(), "old-key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(old.terminal.as_ref().unwrap().cancelled);
+    app.cancel(&ctx, "existing", Some(&turn)).await.unwrap();
+    let next = cancel_submit(
+        &app,
+        "existing",
+        "return exactly fresh-natural.",
+        "next-key",
+    )
+    .await;
+    let fresh = cancel_events(next).await;
+    assert!(
+        fresh.iter().any(|e| e["delta"] == "fresh-natural"),
+        "{fresh:?}"
+    );
+    app.cancel(&ctx, "existing", Some(&turn)).await.unwrap();
+    assert_eq!(
+        router
+            .repository()
+            .get_joint_turn("existing".into(), "old-key".into())
+            .await
+            .unwrap()
+            .unwrap()
+            .terminal,
+        old.terminal
+    );
+    let trace = f.trace();
+    let cancels: Vec<_> = trace
+        .iter()
+        .filter(|r| r["method"] == "message.cancel")
+        .collect();
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(
+        cancels[0]["params"]["messageId"],
+        old.terminal.unwrap().message_id.unwrap()
+    );
+    assert_eq!(cancels[0]["params"]["recipientThinkthreadId"], "native-A");
+    assert!(trace.iter().all(|r| ![
+        "thinkthread.stop",
+        "thinkthread.remove",
+        "thinkthread.force_stop"
+    ]
+    .contains(&r["method"].as_str().unwrap())));
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|r| r["method"] == "thinkthread.create")
+            .count(),
+        1
+    );
+    assert!(router
+        .repository()
+        .joint_workspace_boundary(old.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+}
+
+#[tokio::test]
+async fn cancel_ack_retains_the_fence_until_authoritative_terminal_observation() {
+    for state in ["queued", "delivering", "awaiting_reply"] {
+        let f = cancel_fixture();
+        let router = f.stored().await;
+        let app = application(&f, &router);
+        let ctx = SecurityContext::admin("operator");
+        cancel_control(&f, "A", json!({"cancel_state":state}));
+        let submission = cancel_submit(&app, "existing", "active-input", "key").await;
+        until_message(&f, 1).await;
+        app.cancel(&ctx, "existing", None).await.unwrap();
+        let turn = router
+            .repository()
+            .get_joint_turn("existing".into(), "key".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(turn.terminal.is_none());
+        assert_eq!(
+            router
+                .repository()
+                .pending_joint_operations()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(app
+            .submit_turn(
+                &ctx,
+                serde_json::from_value(json!({"runtime_id":"existing","text":"conflicting"}))
+                    .unwrap()
+            )
+            .await
+            .is_err());
+        let control = router
+            .repository()
+            .joint_cancel_control(turn.admission.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.native.unwrap().params["messageId"], "message-1");
+        cancel_control(&f, "A", json!({"states":{"message-1":"cancelled"}}));
+        assert_eq!(cancel_events(submission).await[0]["outcome"], "cancelled");
+        assert!(router
+            .repository()
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn completed_turns_keep_their_original_reply_when_cancel_is_repeated() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let ctx = SecurityContext::admin("operator");
+    let submission = cancel_submit(&app, "existing", "return exactly natural-result.", "key").await;
+    let turn = submission.receipt.turn_id.clone();
+    let events = cancel_events(submission).await;
+    assert!(events.iter().any(|e| e["delta"] == "natural-result"));
+    let prior = router
+        .repository()
+        .get_joint_turn("existing".into(), "key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        app.cancel(&ctx, "existing", Some(&turn)).await.unwrap();
+    }
+    assert_eq!(
+        router
+            .repository()
+            .get_joint_turn("existing".into(), "key".into())
+            .await
+            .unwrap()
+            .unwrap(),
+        prior
+    );
+    assert!(!f.trace().iter().any(|r| r["method"] == "message.cancel"));
+    let mut cancelled = prior.terminal.unwrap();
+    cancelled.cancelled = true;
+    cancelled.reply = None;
+    assert!(router
+        .repository()
+        .finish_joint_turn(prior.admission, cancelled)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn lost_cancel_ack_is_recovered_by_the_original_uuid_without_resending() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let owner = cancel_owner(&f, "A");
+    let repository = router.repository();
+    let session = repository.get("existing").await.unwrap().unwrap();
+    let admitted = owner
+        .admit_message(
+            f.ctx("A", "turn", "existing"),
+            session.clone(),
+            serde_json::from_value(
+                json!({"runtime_id":"existing","text":"original","client_request_id":"key"}),
+            )
+            .unwrap(),
+            "exact-turn".into(),
+            repository.clone(),
+        )
+        .await
+        .unwrap();
+    let client = f.configurations["A"].connect().await.unwrap();
+    xgovernor_thinkthread_client::durable_operation::DurableManagementOperation::new(
+        &client,
+        repository.clone(),
+    )
+    .execute(admitted.admission.clone(), "message")
+    .await
+    .unwrap();
+    client.close().await.unwrap();
+    cancel_control(&f, "A", json!({"drop_cancel":true}));
+    assert!(router
+        .cancel_turn(
+            f.ctx("A", "cancel", "existing"),
+            session,
+            Some("exact-turn".into()),
+            repository.clone()
+        )
+        .await
+        .is_err());
+    let control = repository
+        .joint_cancel_control(admitted.admission.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        control.outcome.as_ref().unwrap().state,
+        NativeOperationState::Unknown
+    );
+    let reopened = Arc::new(
+        f.guard
+            .repository(budget())
+            .unwrap()
+            .with_joint_transactions(),
+    );
+    let pending = reopened
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let terminal = owner
+        .resume_message(pending, reopened.clone())
+        .await
+        .unwrap();
+    assert!(terminal.cancelled);
+    let after = reopened
+        .joint_cancel_control(admitted.admission.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.native, control.native);
+    assert_eq!(
+        after.outcome.unwrap().state,
+        NativeOperationState::Completed
+    );
+    let trace = f.trace();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|r| r["method"] == "message.cancel")
+            .count(),
+        1
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|r| r["method"] == "message.send")
+            .count(),
+        1
+    );
+    assert!(trace.iter().any(|r| r["method"] == "operation.get"
+        && r["params"]["operationId"] == control.native.as_ref().unwrap().operation_id));
+    assert!(reopened
+        .joint_workspace_boundary(admitted.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+}
+
+async fn admit_cancel_fixture(
+    f: &Fixture,
+    router: &Arc<ProfileRouter>,
+    key: &str,
+    text: &str,
+) -> JointTurnRecord {
+    let owner = cancel_owner(f, "A");
+    let repository = router.repository();
+    let session = repository.get("existing").await.unwrap().unwrap();
+    let mut context = f.ctx("A", "turn", "existing");
+    context.intent_id = format!("turn-{key}");
+    let turn = owner
+        .admit_message(
+            context,
+            session,
+            serde_json::from_value(
+                json!({"runtime_id":"existing","text":text,"client_request_id":key}),
+            )
+            .unwrap(),
+            format!("public-{key}"),
+            repository.clone(),
+        )
+        .await
+        .unwrap();
+    let client = f.configurations["A"].connect().await.unwrap();
+    xgovernor_thinkthread_client::durable_operation::DurableManagementOperation::new(
+        &client, repository,
+    )
+    .execute(turn.admission.clone(), "message")
+    .await
+    .unwrap();
+    client.close().await.unwrap();
+    turn
+}
+async fn resume_cancel_fixture(
+    f: &Fixture,
+    router: &Arc<ProfileRouter>,
+) -> Result<JointTurnTerminal, SessionDomainError> {
+    let pending = router
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    cancel_owner(f, "A")
+        .resume_message(pending, router.repository())
+        .await
+}
+async fn request_cancel_fixture(
+    f: &Fixture,
+    router: &Arc<ProfileRouter>,
+    turn: &JointTurnRecord,
+) -> Result<(), SessionDomainError> {
+    let repository = router.repository();
+    let session = repository.get("existing").await.unwrap().unwrap();
+    router
+        .cancel_turn(
+            f.ctx("A", "cancel", "existing"),
+            session,
+            Some(turn.identity.turn_id.clone()),
+            repository,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn cancellation_persistence_and_terminal_transaction_failures_preserve_protection() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let turn = admit_cancel_fixture(&f, &router, "first", "active").await;
+    let db = rusqlite::Connection::open(f.root.path().join("db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_cancel BEFORE INSERT ON joint_turn_cancels BEGIN SELECT RAISE(ABORT,'injected cancel persistence failure'); END;").unwrap();
+    assert!(request_cancel_fixture(&f, &router, &turn).await.is_err());
+    assert!(!f.trace().iter().any(|r| r["method"] == "message.cancel"));
+    assert!(router
+        .repository()
+        .joint_cancel_control(turn.admission.clone())
+        .await
+        .unwrap()
+        .is_none());
+    db.execute_batch("DROP TRIGGER fail_cancel;CREATE TRIGGER fail_cancel_boundary BEFORE INSERT ON joint_cancel_boundaries BEGIN SELECT RAISE(ABORT,'injected boundary failure'); END;").unwrap();
+    request_cancel_fixture(&f, &router, &turn).await.unwrap();
+    assert!(resume_cancel_fixture(&f, &router).await.is_err());
+    assert!(router
+        .repository()
+        .joint_turn_result(turn.admission.clone())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        router
+            .repository()
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    db.execute_batch("DROP TRIGGER fail_cancel_boundary;")
+        .unwrap();
+    let repo = Arc::new(
+        f.guard
+            .repository(budget())
+            .unwrap()
+            .with_joint_transactions(),
+    );
+    let pending = repo
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let terminal = cancel_owner(&f, "A")
+        .resume_message(pending, repo.clone())
+        .await
+        .unwrap();
+    assert!(terminal.cancelled);
+    assert!(repo
+        .joint_workspace_boundary(turn.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+    assert_eq!(
+        f.trace()
+            .iter()
+            .filter(|r| r["method"] == "message.cancel")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn cancellation_recovery_rejects_wrong_identity_and_missing_operation_evidence() {
+    for fault in [
+        "operationId",
+        "operationDigest",
+        "scope",
+        "method",
+        "not_found",
+        "messageId",
+        "recipientThinkthreadId",
+    ] {
+        let f = cancel_fixture();
+        let router = f.stored().await;
+        let turn = admit_cancel_fixture(&f, &router, "key", "active").await;
+        cancel_control(&f, "A", json!({"drop_cancel":true}));
+        assert!(request_cancel_fixture(&f, &router, &turn).await.is_err());
+        let mut control = json!({"fault":fault});
+        if fault == "not_found" {
+            control["operation_not_found"] = json!(true);
+            control["states"] = json!({"message-1":"awaiting_reply"});
+        }
+        if ["messageId", "recipientThinkthreadId"].contains(&fault) {
+            // These mismatches are tested on the authoritative Message observation.
+            control = json!({"wait_fault":fault});
+        }
+        cancel_control(&f, "A", control);
+        assert!(resume_cancel_fixture(&f, &router).await.is_err(), "{fault}");
+        assert!(router
+            .repository()
+            .joint_turn_result(turn.admission.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            router
+                .repository()
+                .pending_joint_operations()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        cancel_control(&f, "A", json!({}));
+        assert!(resume_cancel_fixture(&f, &router).await.unwrap().cancelled);
+        assert_eq!(
+            f.trace()
+                .iter()
+                .filter(|r| r["method"] == "message.cancel")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancellation_from_independent_connections_has_one_send_and_one_terminal() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let turn = admit_cancel_fixture(&f, &router, "key", "active").await;
+    let first = Arc::new(
+        f.guard
+            .repository(budget())
+            .unwrap()
+            .with_joint_transactions(),
+    );
+    let second = Arc::new(
+        f.guard
+            .repository(budget())
+            .unwrap()
+            .with_joint_transactions(),
+    );
+    let session = router.repository().get("existing").await.unwrap().unwrap();
+    let owner = cancel_owner(&f, "A");
+    let (a, b) = tokio::join!(
+        owner.cancel_turn(
+            f.ctx("A", "cancel", "existing"),
+            session.clone(),
+            Some(turn.identity.turn_id.clone()),
+            first.clone()
+        ),
+        owner.cancel_turn(
+            f.ctx("A", "cancel", "existing"),
+            session,
+            Some(turn.identity.turn_id.clone()),
+            second.clone()
+        )
+    );
+    assert!(a.is_ok() || b.is_ok());
+    let pa = first
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let pb = second
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (a, b) = tokio::join!(
+        owner.resume_message(pa, first.clone()),
+        owner.resume_message(pb, second.clone())
+    );
+    assert_eq!(a.unwrap(), b.unwrap());
+    assert!(first.pending_joint_operations().await.unwrap().is_empty());
+    assert_eq!(
+        f.trace()
+            .iter()
+            .filter(|r| r["method"] == "message.cancel")
+            .count(),
+        1
+    );
+    let boundary = second
+        .joint_workspace_boundary(turn.admission.binding)
+        .await
+        .unwrap();
+    assert_eq!(boundary.cancel_epoch, 1);
+}
+
+async fn checkpoint_observer(
+    f: &Fixture,
+    router: &Arc<ProfileRouter>,
+) -> JointCheckpointBoundaryObservation {
+    let owner = cancel_owner(f, "A");
+    let repo = router.repository();
+    let record = repo.get("existing").await.unwrap().unwrap();
+    let request = xgovernor_thinkthread_client::sdk::CheckpointCreateRequest {
+        runtime_thinkthread_id: "native-A".into(),
+        thinkthread_id: "native-A".into(),
+        label: Some("boundary".into()),
+    };
+    let ticket = owner
+        .prepare_checkpoint_boundary_observation(
+            &record,
+            request.clone(),
+            uuid::Uuid::new_v4().to_string(),
+            repo,
+        )
+        .await
+        .unwrap();
+    let client = f.configurations["A"].connect().await.unwrap();
+    client
+        .checkpoints()
+        .create_with_operation(ticket.native.operation_id.clone(), request)
+        .await
+        .unwrap();
+    client.close().await.unwrap();
+    ticket
+}
+#[tokio::test]
+async fn checkpoint_boundary_requires_original_success_and_does_not_clear_a_later_cancel() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let owner = cancel_owner(&f, "A");
+    let repo = router.repository();
+    let earlier = checkpoint_observer(&f, &router).await;
+    let first = admit_cancel_fixture(&f, &router, "one", "first active").await;
+    request_cancel_fixture(&f, &router, &first).await.unwrap();
+    assert!(resume_cancel_fixture(&f, &router).await.unwrap().cancelled);
+    let record = repo.get("existing").await.unwrap().unwrap();
+    assert!(!owner
+        .observe_checkpoint_boundary(&record, earlier, repo.clone())
+        .await
+        .unwrap());
+    assert!(repo
+        .joint_workspace_boundary(first.admission.binding.clone())
+        .await
+        .unwrap()
+        .unsettled());
+    let late = checkpoint_observer(&f, &router).await;
+    cancel_control(
+        &f,
+        "A",
+        json!({"checkpoint_error":"NotAtCheckpointBoundary"}),
+    );
+    let before = f.trace().len();
+    let failure = owner
+        .observe_checkpoint_boundary(&record, late.clone(), repo.clone())
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("NotAtCheckpointBoundary"));
+    assert_eq!(
+        f.trace()[before..]
+            .iter()
+            .filter(|r| r["method"] == "operation.get")
+            .count(),
+        1
+    );
+    assert!(!f.trace()[before..]
+        .iter()
+        .any(|r| r["method"] == "checkpoint.create"));
+    cancel_control(&f, "A", json!({"checkpoint_operation_state":"running"}));
+    assert!(owner
+        .observe_checkpoint_boundary(&record, late.clone(), repo.clone())
+        .await
+        .is_err());
+    assert!(repo
+        .joint_workspace_boundary(first.admission.binding.clone())
+        .await
+        .unwrap()
+        .unsettled());
+    cancel_control(&f, "A", json!({"checkpoint_source":"another-root"}));
+    assert!(owner
+        .observe_checkpoint_boundary(&record, late.clone(), repo.clone())
+        .await
+        .is_err());
+    cancel_control(&f, "A", json!({}));
+    let second = admit_cancel_fixture(&f, &router, "two", "second active").await;
+    request_cancel_fixture(&f, &router, &second).await.unwrap();
+    assert!(resume_cancel_fixture(&f, &router).await.unwrap().cancelled);
+    let record = repo.get("existing").await.unwrap().unwrap();
+    assert!(!owner
+        .observe_checkpoint_boundary(&record, late, repo.clone())
+        .await
+        .unwrap());
+    let good = checkpoint_observer(&f, &router).await;
+    assert!(owner
+        .observe_checkpoint_boundary(&record, good.clone(), repo.clone())
+        .await
+        .unwrap());
+    let reopen = f
+        .guard
+        .repository(budget())
+        .unwrap()
+        .with_joint_transactions();
+    assert!(!reopen
+        .joint_workspace_boundary(second.admission.binding.clone())
+        .await
+        .unwrap()
+        .unsettled());
+    let natural = admit_cancel_fixture(&f, &router, "three", "natural completion").await;
+    assert!(!resume_cancel_fixture(&f, &router).await.unwrap().cancelled);
+    assert!(!repo
+        .joint_workspace_boundary(natural.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+}
+
+#[tokio::test]
+async fn stopped_and_unknown_roots_keep_failure_or_unknown_without_waiting_for_ready() {
+    for state in ["stopped", "unknown"] {
+        let f = cancel_fixture();
+        let router = f.stored().await;
+        let first = admit_cancel_fixture(&f, &router, "one", "active").await;
+        request_cancel_fixture(&f, &router, &first).await.unwrap();
+        assert!(resume_cancel_fixture(&f, &router).await.unwrap().cancelled);
+        let later = admit_cancel_fixture(&f, &router, "two", "active next").await;
+        if state == "stopped" {
+            cancel_control(&f, "A", json!({"root_state":"Stopped"}));
+        } else {
+            cancel_control(&f, "A", json!({"root_get_drop":true}));
+        }
+        let start = std::time::Instant::now();
+        assert!(resume_cancel_fixture(&f, &router).await.is_err());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let stored = router.repository().get("existing").await.unwrap().unwrap();
+        if state == "stopped" {
+            assert_eq!(stored.status, SessionStatus::Failed);
+            assert_eq!(
+                stored.last_error.as_deref(),
+                Some("message_execution_invalidated")
+            );
+        }
+        assert!(router
+            .repository()
+            .joint_turn_result(later.admission.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            router
+                .repository()
+                .joint_turn_result(first.admission.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .cancelled
+        );
+        assert!(router
+            .repository()
+            .joint_workspace_boundary(first.admission.binding)
+            .await
+            .unwrap()
+            .unsettled());
+        assert_eq!(
+            f.trace()
+                .iter()
+                .filter(|r| r["method"] == "thinkthread.create")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_completion_observation_cannot_replace_the_committed_cancellation() {
+    use std::os::unix::net::UnixListener;
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let turn = admit_cancel_fixture(&f, &router, "old", "old-active").await;
+    let gate = f.root.path().join("wait.sock");
+    let listener = UnixListener::bind(&gate).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    cancel_control(
+        &f,
+        "A",
+        json!({"states":{"message-1":"completed"},"wait_gate":gate}),
+    );
+    let pending = router
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let owner = cancel_owner(&f, "A");
+    let repository = router.repository();
+    let stale = tokio::spawn(async move { owner.resume_message(pending, repository).await });
+    let mut connection = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok((stream, _)) = listener.accept() {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel_control(&f, "A", json!({}));
+    request_cancel_fixture(&f, &router, &turn).await.unwrap();
+    let cancelled = resume_cancel_fixture(&f, &router).await.unwrap();
+    assert!(cancelled.cancelled);
+    let app = application(&f, &router);
+    let next = cancel_submit(&app, "existing", "return exactly isolated-natural.", "next").await;
+    use std::io::Write;
+    connection.write_all(b"x").unwrap();
+    let old = stale.await.unwrap().unwrap();
+    assert_eq!(old, cancelled);
+    assert!(old.reply.is_none());
+    let events = cancel_events(next).await;
+    assert!(events.iter().any(|e| e["delta"] == "isolated-natural"));
+    assert!(!serde_json::to_string(&events)
+        .unwrap()
+        .contains("complete reply"));
+    app.cancel(
+        &SecurityContext::admin("operator"),
+        "existing",
+        Some(&turn.identity.turn_id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        router
+            .repository()
+            .joint_turn_result(turn.admission)
+            .await
+            .unwrap()
+            .unwrap(),
+        cancelled
+    );
+}
+
+#[tokio::test]
+async fn message_failure_after_cancel_is_explicit_and_retains_both_message_identities() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let ctx = SecurityContext::admin("operator");
+    let first = cancel_submit(&app, "existing", "first-active", "one").await;
+    until_message(&f, 1).await;
+    app.cancel(&ctx, "existing", Some(&first.receipt.turn_id))
+        .await
+        .unwrap();
+    assert_eq!(cancel_events(first).await[0]["outcome"], "cancelled");
+    cancel_control(&f, "A", json!({"failed_text":"later-fails"}));
+    let second = cancel_submit(&app, "existing", "later-fails", "two").await;
+    let events = cancel_events(second).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["error"]["code"], "message_failed");
+    let one = router
+        .repository()
+        .get_joint_turn("existing".into(), "one".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let two = router
+        .repository()
+        .get_joint_turn("existing".into(), "two".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(one.terminal.as_ref().unwrap().cancelled);
+    assert_eq!(
+        two.terminal.as_ref().unwrap().failure.as_deref(),
+        Some("message_failed")
+    );
+    assert_ne!(
+        one.terminal.unwrap().message_id,
+        two.terminal.unwrap().message_id
+    );
+    assert_eq!(
+        router
+            .repository()
+            .get("existing")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Failed
+    );
+    assert!(router
+        .repository()
+        .joint_workspace_boundary(one.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+    assert_eq!(
+        f.trace()
+            .iter()
+            .filter(|r| r["method"] == "thinkthread.create")
+            .count(),
+        1
+    );
+    let before = f.trace();
+    assert!(app
+        .submit_turn(
+            &ctx,
+            serde_json::from_value(json!({"runtime_id":"existing","text":"must not continue"}))
+                .unwrap()
+        )
+        .await
+        .is_err());
+    assert_eq!(f.trace(), before);
+}
+
+#[tokio::test]
+async fn ordinary_cancel_permission_is_checked_before_control_or_transport_side_effects() {
+    for missing in ["declaration", "permit"] {
+        let f = cancel_fixture();
+        let mut p = f.profile("A");
+        let mut manifest = f.manifest("A");
+        if missing == "declaration" {
+            p.declaration
+                .operation_subset
+                .remove(&Capability::OrdinaryCancel);
+            p.declaration
+                .evidence_refs
+                .remove(&Capability::OrdinaryCancel);
+            manifest.declaration = p.declaration.clone();
+            p.experiment_allowlist[0]
+                .capability_subset
+                .remove(&Capability::OrdinaryCancel);
+        } else {
+            p.experiment_allowlist[0]
+                .capability_subset
+                .remove(&Capability::OrdinaryCancel);
+        }
+        let revision = revision_with_manifest(&f, p, &manifest).unwrap();
+        let router = ProfileRouter::assemble(
+            f.guard.clone(),
+            budget(),
+            vec![revision],
+            "A".into(),
+            true,
+            f.clock.clone(),
+        )
+        .unwrap();
+        f.open(&router, "A", "existing").await.unwrap();
+        let turn = admit_cancel_fixture(&f, &router, "key", "active").await;
+        let before = f.trace();
+        assert!(request_cancel_fixture(&f, &router, &turn).await.is_err());
+        assert_eq!(f.trace(), before);
+        assert!(router
+            .repository()
+            .joint_cancel_control(turn.admission)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+#[tokio::test]
+async fn cancel_routes_by_original_revision_and_rejects_foreign_turns_without_a_lease() {
+    let f = cancel_fixture();
+    let old = f.stored().await;
+    let turn = admit_cancel_fixture(&f, &old, "key", "active").await;
+    let router = ProfileRouter::assemble(
+        f.guard.clone(),
+        budget(),
+        vec![
+            f.revision(f.profile("A")).unwrap(),
+            f.revision(f.profile("B")).unwrap(),
+        ],
+        "B".into(),
+        true,
+        f.clock.clone(),
+    )
+    .unwrap();
+    f.open(&router, "B", "other").await.unwrap();
+    let sibling = cancel_submit(
+        &application(&f, &router),
+        "other",
+        "sibling-active",
+        "sibling-key",
+    )
+    .await;
+    until_message(&f, 2).await;
+    let app = application(&f, &router).with_lease_table(Arc::new(SessionLeaseTable::new()));
+    let ctx = SecurityContext::admin("operator");
+    let before = f.trace();
+    assert!(app
+        .cancel(&ctx, "other", Some(&turn.identity.turn_id))
+        .await
+        .is_err());
+    assert!(app
+        .cancel(
+            &SecurityContext::tenant("tenant-A", "operator"),
+            "existing",
+            Some(&turn.identity.turn_id)
+        )
+        .await
+        .is_err());
+    assert_eq!(f.trace(), before);
+    app.cancel(&ctx, "existing", Some(&turn.identity.turn_id))
+        .await
+        .unwrap();
+    let trace = f.trace();
+    let cancels: Vec<_> = trace
+        .iter()
+        .filter(|r| r["method"] == "message.cancel")
+        .collect();
+    assert_eq!(cancels.len(), 1);
+    assert_eq!(cancels[0]["params"]["recipientThinkthreadId"], "native-A");
+    let sibling_turn = router
+        .repository()
+        .get_joint_turn("other".into(), "sibling-key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sibling_turn.terminal.is_none());
+    cancel_control(&f, "B", json!({"states":{"message-1":"completed"}}));
+    let _ = cancel_events(sibling).await;
+    let pending = router
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.admission == turn.admission)
+        .unwrap();
+    router
+        .reconcile(pending, router.repository())
+        .await
+        .unwrap();
+    let missing = ProfileRouter::assemble(
+        f.guard.clone(),
+        budget(),
+        vec![f.revision(f.profile("B")).unwrap()],
+        "B".into(),
+        true,
+        f.clock.clone(),
+    )
+    .unwrap();
+    let before = f.trace();
+    assert!(application(&f, &missing)
+        .cancel(&ctx, "existing", Some(&turn.identity.turn_id))
+        .await
+        .is_err());
+    assert_eq!(f.trace(), before);
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if !self.configurations.values().any(|c| {
+            c.base_environment
+                .get("XG_TEST_SCENARIO")
+                .is_some_and(|s| s == "owner-cancel")
+        }) {
+            return;
+        }
+        if let Ok(directory) = std::env::var("XGOVERNOR_TEST_EVIDENCE_DIR") {
+            let path = std::path::Path::new(&directory)
+                .join(format!("fixture-{}.json", uuid::Uuid::new_v4()));
+            let _ = std::fs::create_dir_all(&directory);
+            let db = rusqlite::Connection::open(self.root.path().join("db")).unwrap();
+            let tables:Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+            let mut snapshot = serde_json::Map::new();
+            for table in tables {
+                let mut stmt = db
+                    .prepare(&format!(
+                        "SELECT * FROM \"{}\" ORDER BY rowid",
+                        table.replace('"', "\"\"")
+                    ))
+                    .unwrap();
+                let columns = stmt.column_count();
+                let rows: Vec<Vec<Value>> = stmt
+                    .query_map([], |row| {
+                        Ok((0..columns)
+                            .map(|i| match row.get_ref(i).unwrap() {
+                                rusqlite::types::ValueRef::Null => Value::Null,
+                                rusqlite::types::ValueRef::Integer(v) => json!(v),
+                                rusqlite::types::ValueRef::Real(v) => json!(v),
+                                rusqlite::types::ValueRef::Text(v) => {
+                                    json!(String::from_utf8_lossy(v))
+                                }
+                                rusqlite::types::ValueRef::Blob(v) => json!(v),
+                            })
+                            .collect())
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                snapshot.insert(table, json!(rows));
+            }
+            let value = json!({"test":std::thread::current().name(),"trace":self.trace(),"database":snapshot});
+            let _ = std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn natural_message_before_local_terminal_commit_wins_over_cancel() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let turn =
+        admit_cancel_fixture(&f, &router, "key", "return exactly natural-before-commit.").await;
+    assert!(router
+        .repository()
+        .joint_turn_result(turn.admission.clone())
+        .await
+        .unwrap()
+        .is_none());
+    request_cancel_fixture(&f, &router, &turn).await.unwrap();
+    let terminal = resume_cancel_fixture(&f, &router).await.unwrap();
+    assert!(!terminal.cancelled);
+    assert_eq!(terminal.reply.as_deref(), Some("natural-before-commit"));
+    request_cancel_fixture(&f, &router, &turn).await.unwrap();
+    assert_eq!(
+        f.trace()
+            .iter()
+            .filter(|r| r["method"] == "message.cancel")
+            .count(),
+        1
+    );
+    assert!(!router
+        .repository()
+        .joint_workspace_boundary(turn.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+}
+#[tokio::test]
+async fn cancellation_settlement_outlives_its_public_event_subscriber() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let mut submission = cancel_submit(&app, "existing", "active", "key").await;
+    drop(submission.events.take());
+    until_message(&f, 1).await;
+    app.cancel(
+        &SecurityContext::admin("operator"),
+        "existing",
+        Some(&submission.receipt.turn_id),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let turn = router
+                .repository()
+                .get_joint_turn("existing".into(), "key".into())
+                .await
+                .unwrap()
+                .unwrap();
+            if let Some(terminal) = turn.terminal {
+                assert!(terminal.cancelled);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let reopened = f
+        .guard
+        .repository(budget())
+        .unwrap()
+        .with_joint_transactions();
+    let turn = reopened
+        .get_joint_turn("existing".into(), "key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(turn.terminal.unwrap().cancelled);
+    assert!(reopened
+        .joint_workspace_boundary(turn.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
 }

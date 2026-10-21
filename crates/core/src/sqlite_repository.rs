@@ -132,6 +132,7 @@ impl SqliteSessionRepository {
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if deployment_registered(&conn)? {
             crate::sqlite_host::validate_schema(&conn)?;
+            crate::sqlite_cancel::validate_schema(&conn)?;
             return Ok(());
         }
         conn.execute_batch(
@@ -383,6 +384,68 @@ impl SessionRepository for SqliteSessionRepository {
         terminal: crate::JointTurnTerminal,
     ) -> Result<(), SessionDomainError> {
         SqliteSessionRepository::finish_joint_turn(self, admission, terminal).await
+    }
+    async fn prepare_joint_cancel(
+        &self,
+        context: crate::JointOperationContext,
+        session: SessionRecord,
+        turn_id: Option<String>,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_cancel(self, context, session, turn_id).await
+    }
+    async fn joint_cancel_control(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointCancelControl>, SessionDomainError> {
+        SqliteSessionRepository::joint_cancel_control(self, admission).await
+    }
+    async fn prepare_joint_cancel_native(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCancelControl, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_cancel_native(self, admission, native).await
+    }
+    async fn claim_joint_cancel_send(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<bool, SessionDomainError> {
+        SqliteSessionRepository::claim_joint_cancel_send(self, admission).await
+    }
+    async fn record_joint_cancel_result(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+        outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::record_joint_cancel_result(self, admission, native, outcome).await
+    }
+    async fn joint_workspace_boundary(
+        &self,
+        binding: crate::JointBinding,
+    ) -> Result<crate::JointWorkspaceBoundary, SessionDomainError> {
+        SqliteSessionRepository::joint_workspace_boundary(self, binding).await
+    }
+    async fn prepare_joint_checkpoint_boundary(
+        &self,
+        binding: crate::JointBinding,
+        native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCheckpointBoundaryObservation, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_checkpoint_boundary(self, binding, native).await
+    }
+    async fn confirm_joint_checkpoint_boundary(
+        &self,
+        ticket: crate::JointCheckpointBoundaryObservation,
+        checkpoint_id: String,
+    ) -> Result<bool, SessionDomainError> {
+        SqliteSessionRepository::confirm_joint_checkpoint_boundary(self, ticket, checkpoint_id)
+            .await
+    }
+    async fn invalidate_joint_turn(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::invalidate_joint_turn(self, admission).await
     }
     async fn begin_joint_compensation(
         &self,

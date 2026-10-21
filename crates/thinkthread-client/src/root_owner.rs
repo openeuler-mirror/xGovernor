@@ -801,6 +801,16 @@ impl JointSessionLifecycle for RootSessionOwner {
             })),
         })
     }
+    async fn cancel_turn(
+        &self,
+        context: JointOperationContext,
+        session: SessionRecord,
+        turn_id: Option<String>,
+        repository: Arc<dyn SessionRepository>,
+    ) -> Result<(), SessionDomainError> {
+        self.request_cancel(context, session, turn_id, repository)
+            .await
+    }
     async fn reconcile(
         &self,
         pending: JointPendingOperation,

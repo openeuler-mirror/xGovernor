@@ -1302,6 +1302,12 @@ impl SessionApplication {
             let result = terminal.await;
             let runtime_id = record.runtime_id;
             let event = match result {
+                Ok(terminal) if terminal.cancelled => SessionEvent::TurnCompleted {
+                    runtime_id: runtime_id.clone(),
+                    turn_id: turn_id.clone(),
+                    outcome: session_protocol::SessionTurnOutcome::Cancelled,
+                    usage: session_protocol::SessionUsageReport::Unknown,
+                },
                 Ok(terminal) if terminal.failure.is_none() => {
                     if let Some(delta) = terminal.reply {
                         let _ = tokio::time::timeout(
@@ -1720,7 +1726,18 @@ impl SessionApplication {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let record = self.require_session(ctx, runtime_id).await?;
-        Self::reject_joint_resource(&record, "cancel_impl")?;
+        if let Some(binding) = record.execution_backing.joint() {
+            let owner = self.joint_owner(&record.runtime.runtime_kind, binding)?;
+            let context = self.joint_context(ctx, &record, "cancel", None, None);
+            return owner
+                .cancel_turn(
+                    context,
+                    record,
+                    turn_id.map(str::to_owned),
+                    self.records.clone(),
+                )
+                .await;
+        }
         if let Some(turn_id) = turn_id {
             let active = self
                 .turn_gate
@@ -3453,6 +3470,71 @@ pub trait SessionRepository: Send + Sync {
         _terminal: crate::JointTurnTerminal,
     ) -> Result<(), SessionDomainError> {
         Err(crate::unsupported_joint("finish_turn"))
+    }
+    async fn prepare_joint_cancel(
+        &self,
+        _context: crate::JointOperationContext,
+        _session: SessionRecord,
+        _turn_id: Option<String>,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        Err(crate::unsupported_joint("prepare_joint_cancel"))
+    }
+    async fn joint_cancel_control(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointCancelControl>, SessionDomainError> {
+        Err(crate::unsupported_joint("joint_cancel_control"))
+    }
+    async fn prepare_joint_cancel_native(
+        &self,
+        _admission: crate::JointAdmission,
+        _native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCancelControl, SessionDomainError> {
+        Err(crate::unsupported_joint("prepare_joint_cancel_native"))
+    }
+    async fn claim_joint_cancel_send(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<bool, SessionDomainError> {
+        Err(crate::unsupported_joint("claim_joint_cancel_send"))
+    }
+    async fn record_joint_cancel_result(
+        &self,
+        _admission: crate::JointAdmission,
+        _native: crate::JointNativeIntent,
+        _outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("record_joint_cancel_result"))
+    }
+    async fn joint_workspace_boundary(
+        &self,
+        _binding: crate::JointBinding,
+    ) -> Result<crate::JointWorkspaceBoundary, SessionDomainError> {
+        Err(crate::unsupported_joint("joint_workspace_boundary"))
+    }
+    async fn prepare_joint_checkpoint_boundary(
+        &self,
+        _binding: crate::JointBinding,
+        _native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCheckpointBoundaryObservation, SessionDomainError> {
+        Err(crate::unsupported_joint(
+            "prepare_joint_checkpoint_boundary",
+        ))
+    }
+    async fn confirm_joint_checkpoint_boundary(
+        &self,
+        _ticket: crate::JointCheckpointBoundaryObservation,
+        _checkpoint_id: String,
+    ) -> Result<bool, SessionDomainError> {
+        Err(crate::unsupported_joint(
+            "confirm_joint_checkpoint_boundary",
+        ))
+    }
+    async fn invalidate_joint_turn(
+        &self,
+        _admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        Err(crate::unsupported_joint("invalidate_joint_turn"))
     }
     async fn begin_joint_compensation(
         &self,

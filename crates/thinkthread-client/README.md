@@ -141,8 +141,8 @@ source fence for reconciliation. Client disconnection does not cancel execution.
 Terminal state and source-fence release commit together. The application emits
 one full reply delta and one terminal, with explicit unknown metering. Replaying
 an idempotency key returns the original receipt; changed input conflicts. These
-operations do not provide active cancellation, streaming, policy enforcement,
-checkpoints or public close.
+operations provide ordinary cancellation as described below; streaming, policy
+enforcement, public checkpoints and public close remain unsupported.
 
 ## Server-side execution profiles
 
@@ -209,8 +209,8 @@ readers. Missing original dependencies fail without selecting another revision.
 The Root adapter supports only its existing administrator Message subset and
 terminal-only unknown metering. The Host adapter supports only the existing
 private-candidate read, overwrite and exec mapping with its original limits.
-The ordinary-cancel declaration records the supplier evidence and checkpoint
-requirement; this router exposes no new public cancellation path. Candidate
+Ordinary cancel requires the supplier evidence, checkpoint requirement and
+matching caller permission before delegating to the original owner. Candidate
 capture/load and public close retain their existing unsupported behavior.
 No production backend registration is added.
 
@@ -224,3 +224,23 @@ ledger rows remain readable. Ordinary databases without deployment registration
 retain their legacy session and provider-ledger behavior. The default server
 uses one database file for session records and all provider ledgers. No separate
 provider-ledger file is selected by the explicit joint profile implementation.
+
+## Ordinary Message cancellation
+
+Explicit Root assembly supports public Session cancellation through the original
+joint owner. `ProfileRouter` additionally requires the original revision's
+`OrdinaryCancel` declaration, matching evidence and caller permission. The
+operation targets the durably associated Message, retains its original UUID
+across reconnects, and never uses force-stop or Root reconstruction. Cancel
+acknowledgement is separate from the authoritative Message terminal.
+
+Cancellation is projected using the existing cancelled outcome and unknown
+usage. It does not guarantee tool exit, workspace convergence or continued
+Session availability. A separate persistent boundary record blocks stable
+artifact publication until a matching later checkpoint success is verified.
+The internal `prepare_checkpoint_boundary_observation` and
+`observe_checkpoint_boundary` methods consume the caller's original typed SDK
+request and observations; they do not send checkpoint mutations or enable public
+save/load. A stale checkpoint observation cannot clear a newer cancellation.
+Post-cancellation Message failure or a stopped Root is explicit failure requiring
+recovery, without an automatic replacement resource.

@@ -777,6 +777,7 @@ fn settle_host(
         return Err(conflict("failed Host cannot publish success"));
     }
     if let Some((before, after)) = revisions {
+        crate::sqlite_cancel::require_stable_boundary(tx, &access.admission.binding.binding_id)?;
         if before.is_empty() || before != after || result.get("error").is_some() {
             return Err(conflict("artifact revision is not stable"));
         }

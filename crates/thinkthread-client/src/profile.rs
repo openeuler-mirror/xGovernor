@@ -741,6 +741,26 @@ impl JointSessionLifecycle for ProfileRouter {
             .submit_turn(context, session, request, turn_id, repository)
             .await
     }
+    async fn cancel_turn(
+        &self,
+        context: JointOperationContext,
+        session: SessionRecord,
+        turn_id: Option<String>,
+        repository: Arc<dyn SessionRepository>,
+    ) -> Result<(), SessionDomainError> {
+        self.check_repository(&repository)?;
+        let selected = self.record(&session)?;
+        selected.context(
+            &context,
+            self.clock.now_ms(),
+            false,
+            &Capability::OrdinaryCancel,
+        )?;
+        selected
+            .owner
+            .cancel_turn(context, session, turn_id, repository)
+            .await
+    }
     async fn prepare_host_operation(
         &self,
         context: JointOperationContext,

@@ -1103,3 +1103,143 @@ async fn paused_open_returns_the_exact_publication_committed_by_another_connecti
         );
     }
 }
+
+fn crash_cancel_config(path: &std::path::Path) -> ManagementConfig {
+    ManagementConfig {
+        host_executable: path.join("host"),
+        state_root: path.join("state"),
+        runtime_root: path.join("runtime"),
+        config_root: path.join("config"),
+        cache_root: path.join("cache"),
+        working_directory: path.join("work"),
+        fs_root: path.join("fs"),
+        home_directory: path.join("home"),
+        executable_search_path: vec![PathBuf::from("/usr/bin")],
+        base_environment: BTreeMap::from([
+            ("XG_TEST_SCENARIO".into(), "owner-cancel".into()),
+            (
+                "XG_TEST_FS".into(),
+                path.join("fs").to_string_lossy().into(),
+            ),
+            (
+                "XG_TEST_STATE".into(),
+                path.join("state.json").to_string_lossy().into(),
+            ),
+            (
+                "XG_TEST_TRACE".into(),
+                path.join("trace").to_string_lossy().into(),
+            ),
+        ]),
+        connect_timeout: Duration::from_secs(2),
+    }
+}
+#[tokio::test]
+async fn ordinary_cancel_crash_child() {
+    let Ok(root) = std::env::var("XGOVERNOR_CANCEL_CHILD_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let config = crash_cancel_config(&root);
+    let repo = Arc::new(repository(&root.join("owner.db")).with_joint_transactions());
+    let pending = repo
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut context = pending.request.context.clone();
+    context.operation = "cancel".into();
+    context.intent_id = "child-cancel".into();
+    let record = repo.get("public-session").await.unwrap().unwrap();
+    let owner=RootSessionOwner::new(config.clone(),serde_json::from_value(json!({"agent":{"kind":"profile","name":"fixture"},"fs":config.fs_root,"models":[],"allowSharedFs":false})).unwrap(),"fixed-revision".into(),0,0,3000).unwrap();
+    if std::env::var("XGOVERNOR_CANCEL_CHILD_PHASE").unwrap() == "prepared" {
+        repo.prepare_joint_cancel(context, record, None)
+            .await
+            .unwrap();
+    } else {
+        owner
+            .cancel_turn(context, record, None, repo)
+            .await
+            .unwrap();
+    }
+    // The parent owns all paths and checks recovery after this process exits.
+    std::process::exit(0);
+}
+#[tokio::test]
+async fn cancellation_survives_process_exit_before_send_and_after_acknowledgement() {
+    for phase in ["prepared", "ack"] {
+        let f = Fixture::new("owner-cancel");
+        let repo = Arc::new(repository(&f.root.path().join("owner.db")).with_joint_transactions());
+        let owner = f.owner();
+        let record = owner
+            .open(f.context(), f.input(), repo.clone())
+            .await
+            .unwrap();
+        let mut context = f.context();
+        context.operation = "turn".into();
+        context.intent_id = "original-turn".into();
+        context.source_runtime_id = Some(record.runtime_id.clone());
+        context.target_runtime_id = None;
+        let turn=owner.admit_message(context,record,serde_json::from_value(json!({"runtime_id":"public-session","text":"active","client_request_id":"key"})).unwrap(),"original-turn-id".into(),repo.clone()).await.unwrap();
+        let client = f.config.connect().await.unwrap();
+        xgovernor_thinkthread_client::durable_operation::DurableManagementOperation::new(
+            &client,
+            repo.clone(),
+        )
+        .execute(turn.admission.clone(), "message")
+        .await
+        .unwrap();
+        client.close().await.unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ordinary_cancel_crash_child", "--nocapture"])
+            .env("XGOVERNOR_CANCEL_CHILD_ROOT", f.root.path())
+            .env("XGOVERNOR_CANCEL_CHILD_PHASE", phase)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(repo
+            .joint_turn_result(turn.admission.clone())
+            .await
+            .unwrap()
+            .is_none());
+        let control = repo
+            .joint_cancel_control(turn.admission.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.native.is_none(), phase == "prepared");
+        drop(repo);
+        let reopened =
+            Arc::new(repository(&f.root.path().join("owner.db")).with_joint_transactions());
+        let pending = reopened
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let terminal = owner
+            .resume_message(pending, reopened.clone())
+            .await
+            .unwrap();
+        assert!(terminal.cancelled);
+        assert!(reopened
+            .joint_workspace_boundary(turn.admission.binding)
+            .await
+            .unwrap()
+            .unsettled());
+        assert_eq!(
+            f.trace()
+                .iter()
+                .filter(|r| r["method"] == "message.cancel")
+                .count(),
+            1
+        );
+        assert_eq!(
+            f.trace()
+                .iter()
+                .filter(|r| r["method"] == "message.send")
+                .count(),
+            1
+        );
+    }
+}

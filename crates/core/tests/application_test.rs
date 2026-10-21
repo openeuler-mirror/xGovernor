@@ -2961,6 +2961,8 @@ impl JointSessionLifecycle for JointProjectionOwner {
                     });
                 }
                 Ok(JointTurnTerminal {
+                    cancelled: false,
+                    execution_invalidated: false,
                     message_id: Some("private-message".into()),
                     reply: Some("full reply".into()),
                     failure: None,

@@ -3032,3 +3032,42 @@ mod execution_profiles {
         );
     }
 }
+
+#[tokio::test]
+async fn cancelled_workspace_cannot_publish_artifact_evidence_after_host_completion() {
+    let f = Fixture::new().await;
+    f.conn().execute("INSERT INTO joint_cancel_boundaries(binding_id,generation,cancel_epoch,checkpoint_epoch) VALUES(?1,?2,1,0)",rusqlite::params![f.target.live_binding.binding_id,f.target.binding_generation]).unwrap();
+    let write_access = f
+        .access("write-after-cancel", write(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    write_access
+        .backend
+        .write_host(write(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    let boundary = f
+        .repo
+        .joint_workspace_boundary(f.target.live_binding.clone())
+        .await
+        .unwrap();
+    assert!(boundary.unsettled());
+    let access = f.access("read-after-cancel", read()).await.unwrap();
+    assert!(access
+        .backend
+        .files()
+        .read_bytes(ReadBytesRequest {
+            path: BackendPath("/workspace/artifact".into())
+        })
+        .await
+        .is_err());
+    let intent = f.intent("read-after-cancel").await;
+    assert!(intent.artifact_evidence.is_none());
+    assert!(intent.result.is_none());
+    let reopened = repository(&f.root.path().join("db"));
+    assert!(reopened
+        .joint_workspace_boundary(f.target.live_binding.clone())
+        .await
+        .unwrap()
+        .unsettled());
+}

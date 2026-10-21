@@ -166,6 +166,15 @@ pub trait JointSessionLifecycle: Send + Sync {
     ) -> Result<JointTurnSubmission, SessionDomainError> {
         Err(unsupported_joint("submit_turn"))
     }
+    async fn cancel_turn(
+        &self,
+        _context: JointOperationContext,
+        _session: SessionRecord,
+        _turn_id: Option<String>,
+        _repository: Arc<dyn SessionRepository>,
+    ) -> Result<(), SessionDomainError> {
+        Err(unsupported_joint("cancel_turn"))
+    }
     async fn checkpoint(
         &self,
         _context: JointOperationContext,

@@ -145,11 +145,15 @@ pub struct JointTurnIdentity {
     pub input_digest: String,
 }
 
-/// A complete native terminal, observed together with a quiescent owned Session.
+/// A native terminal retained independently of workspace checkpoint convergence.
 /// Metering is intentionally absent; a Message reply does not establish token usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JointTurnTerminal {
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default)]
+    pub execution_invalidated: bool,
     pub message_id: Option<String>,
     pub reply: Option<String>,
     pub failure: Option<String>,

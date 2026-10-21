@@ -67,6 +67,14 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
           id TEXT PRIMARY KEY, request_json TEXT NOT NULL, admission_json TEXT NOT NULL,
           binding_id TEXT NOT NULL REFERENCES joint_bindings(id), tenant_key TEXT NOT NULL,
           stage TEXT NOT NULL, publication_json TEXT);
+        CREATE TABLE IF NOT EXISTS joint_turn_cancels (
+          intent_id TEXT PRIMARY KEY REFERENCES joint_operations(id), context_json TEXT NOT NULL,
+          native_json TEXT, outcome_json TEXT);
+        CREATE TABLE IF NOT EXISTS joint_cancel_boundaries (
+          binding_id TEXT PRIMARY KEY REFERENCES joint_bindings(id), generation INTEGER NOT NULL,
+          cancel_epoch INTEGER NOT NULL, checkpoint_epoch INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS joint_cancel_checkpoints (
+          operation_id TEXT PRIMARY KEY, body TEXT NOT NULL, checkpoint_id TEXT);
         CREATE TABLE IF NOT EXISTS joint_turns (
           runtime_id TEXT NOT NULL, turn_id TEXT NOT NULL, client_request_id TEXT,
           input_digest TEXT NOT NULL, intent_id TEXT NOT NULL UNIQUE REFERENCES joint_operations(id),
@@ -593,7 +601,9 @@ impl SqliteSessionRepository {
             let raw:String=tx.query_row("SELECT outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2 AND operation_id=?3 AND digest=?4",
                 params![admission.intent_id,native.step,native.operation_id,native.digest],|r|r.get(0))?;
             let outcome:JointNativeOutcome=decode(&raw)?;
-            if terminal.reply.is_some()==terminal.failure.is_some()
+            if (if terminal.cancelled {
+                    terminal.reply.is_some() || terminal.failure.is_some() || terminal.message_id.is_none()
+                } else { terminal.reply.is_some()==terminal.failure.is_some() })
                 || (terminal.message_id.is_some() && !outcome.resources.iter().any(|o|o.kind=="message" && Some(&o.id)==terminal.message_id.as_ref()))
                 || (terminal.message_id.is_none() && (outcome.state!=NativeOperationState::NotSent || terminal.failure.is_none())) {
                 return Err(conflict("terminal does not match native Message admission"));
@@ -601,12 +611,15 @@ impl SqliteSessionRepository {
             let body:String=tx.query_row("SELECT s.body FROM joint_sessions s JOIN joint_bindings b ON b.id=s.binding_id WHERE s.runtime_id=?1 AND s.binding_id=?2 AND b.generation=?3 AND b.state='active'",
                 params![request.source_id,admission.binding.binding_id,admission.generation],|r|r.get(0))?;
             let mut record:SessionRecord=decode(&body)?;
-            record.status=if terminal.failure.is_some(){SessionStatus::Failed}else{SessionStatus::Idle};
-            record.last_error=terminal.failure.clone();record.updated_at_ms=terminal.completed_at_ms;
+            record.status=if terminal.failure.is_some() || terminal.execution_invalidated {SessionStatus::Failed}else{SessionStatus::Idle};
+            record.last_error=if terminal.execution_invalidated { Some("message_execution_invalidated".into()) } else { terminal.failure.clone() };record.updated_at_ms=terminal.completed_at_ms;
             tx.execute("UPDATE joint_sessions SET status=?1,updated_at_ms=?2,body=?3 WHERE runtime_id=?4",
-                params![if terminal.failure.is_some(){"failed"}else{"idle"},record.updated_at_ms,encode(&record)?,request.source_id])?;
+                params![if record.status==SessionStatus::Failed {"failed"}else{"idle"},record.updated_at_ms,encode(&record)?,request.source_id])?;
             tx.execute("UPDATE joint_turns SET terminal_json=?1 WHERE intent_id=?2",params![encode(&terminal)?,admission.intent_id])?;
             tx.execute("UPDATE joint_operations SET stage='settled' WHERE id=?1",[&admission.intent_id])?;
+            if terminal.cancelled {
+                tx.execute("INSERT INTO joint_cancel_boundaries(binding_id,generation,cancel_epoch,checkpoint_epoch) VALUES(?1,?2,1,0) ON CONFLICT(binding_id) DO UPDATE SET cancel_epoch=cancel_epoch+1 WHERE generation=excluded.generation", params![admission.binding.binding_id,admission.generation])?;
+            }
             tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND active_intent=?1",params![admission.intent_id,admission.binding.binding_id])?;
             release_fences(tx,&admission.intent_id)?;
             Ok(())
@@ -852,6 +865,9 @@ impl SqliteSessionRepository {
                 return Err(conflict(
                     "Host operation requires its dedicated repository entry point",
                 ));
+            }
+            if let Some(parent) = &request.parent_binding {
+                crate::sqlite_cancel::require_stable_boundary(tx, &parent.binding_id)?;
             }
             let publication = JointPublication::Checkpoint {
                 record: record.clone(),

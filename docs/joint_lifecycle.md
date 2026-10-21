@@ -8,7 +8,7 @@ A joint owner returns records already committed by the supplied durable reposito
 
 Session routing is persisted as a versioned `SessionExecutionBacking`. Existing databases acquire the `split_v1` default without changing their records. Unknown variants fail decoding. Joint bindings name an owner, binding and configuration revision; they are internal and excluded from public projections.
 
-Open, capture, load, close, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction, cancel and fork fail before invoking a split runtime/provider. Host requests require an explicitly implemented request-bound Host access strategy and otherwise fail before invoking a split backend. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
+Open, capture, load, close, cancel, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction and fork fail before invoking a split runtime/provider. Host requests require an explicitly implemented request-bound Host access strategy and otherwise fail before invoking a split backend. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
 
 `SessionRepository::supports_joint_transactions` defaults to false. The SQLite repository requires an explicit `with_joint_transactions()` assembly opt-in for a verified joint owner; its default remains disabled. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
 
@@ -194,3 +194,34 @@ cleanup plan identity and stage to resume. Source close admission is rejected
 while its cleanup is suspended, keeping that binding available for resumption.
 Committing a sent Host result also records a pending owned cleanup item, so a
 lost commit acknowledgement cannot lose the result or permit a duplicate release.
+
+## Ordinary cancellation
+
+Joint cancellation routes through `cancel_turn` on the persisted owner and
+configuration revision. The default implementation refuses unsupported owners.
+Authorization remains in `SessionApplication`; cancellation does not require a
+write lease. The split runtime path retains its existing exact-turn checks.
+
+The Root owner records cancellation against the original turn admission before
+sending `message.cancel`. An omitted turn ID selects the outstanding turn once;
+recovery retains that target, Message ID and operation UUID. Acknowledgement
+alone does not settle a turn or release its source fence. Only an authoritative
+Message terminal determines completion, failure or cancellation. Exact retries
+preserve an already committed terminal, including a natural completion that won
+the race. Cancelled turns emit the existing `Cancelled` outcome with unknown
+usage and no reply.
+
+A cancelled Message does not establish workspace convergence or tool exit.
+SQLite retains a cancellation epoch separately from per-operation dirty state.
+Later turns and Host settlement cannot clear it, and stable artifact publication
+is refused while that epoch is outstanding. Internal checkpoint observation
+registers the original request before an externally issued SDK checkpoint,
+validates its operation, domain outcome and retained metadata, and clears only
+the same binding generation and cancellation epoch. A failed boundary is
+returned without mutation retry. This observer does not expose public candidate
+checkpoint or load capabilities. Existing enrolled databases missing these
+control tables fail opening rather than being migrated by an unbound reader.
+
+Post-cancellation execution failure retains the original Message records and an
+execution-invalidated error. Unknown observations retain their protection;
+verified failure does not create a replacement Root or restart the Session.

@@ -38,6 +38,9 @@ impl RootSessionOwner {
         {
             return Err(unsupported_joint("message_profile"));
         }
+        if session.last_error.as_deref() == Some("message_execution_invalidated") {
+            return Err(unavailable("Message execution requires recovery"));
+        }
         let root = self.bound_root(&session, repository.clone()).await?;
         let client = self.connect().await?;
         let params = serde_json::to_value(sdk::MessageSendRequest {
@@ -141,7 +144,18 @@ impl RootSessionOwner {
             .get(&pending.request.source_id)
             .await?
             .ok_or_else(|| unavailable("Message Session missing"))?;
-        let root = self.bound_root(&record, repository.clone()).await?;
+        let root = match self.bound_root(&record, repository.clone()).await {
+            Ok(root) => root,
+            Err(error) => {
+                if let Some(terminal) = repository
+                    .joint_turn_result(pending.admission.clone())
+                    .await?
+                {
+                    return Ok(terminal);
+                }
+                return Err(error);
+            }
+        };
         let (native, _) = &pending.native[0];
         let request: sdk::MessageSendRequest = serde_json::from_value(native.params.clone())
             .map_err(|_| unavailable("persisted Message invalid"))?;
@@ -162,6 +176,22 @@ impl RootSessionOwner {
                     })
                     .await
                     .map_err(|_| unavailable("Message readiness observation failed"))?;
+                if view.thinkthread_id != root
+                    || view.root_id != root
+                    || view.parent_id.is_some()
+                    || view.fs != self.config.fs_root
+                    || view.fs_branch_id.is_some()
+                {
+                    return Err(unavailable("Message Root observation identity changed"));
+                }
+                if view.thinkthread_id == root
+                    && view.root_id == root
+                    && (view.state.eq_ignore_ascii_case("stopped") || view.needs_recovery)
+                {
+                    repository
+                        .invalidate_joint_turn(pending.admission.clone())
+                        .await?;
+                }
                 self.validate_view(&root, &view, true)?;
             }
             let bridge = DurableManagementOperation::new(&client, repository.clone());
@@ -194,6 +224,8 @@ impl RootSessionOwner {
                             .await
                             .map_err(|_| unavailable("Management close failed"))?;
                         return Ok(JointTurnTerminal {
+                            cancelled: false,
+                            execution_invalidated: false,
                             message_id: None,
                             reply: None,
                             failure: Some("message_admission_failed".into()),
@@ -210,6 +242,22 @@ impl RootSessionOwner {
                 .map(|o| o.id.clone())
                 .ok_or_else(|| unavailable("admitted Message identity missing"))?;
             loop {
+                if let Some(terminal) = repository
+                    .joint_turn_result(pending.admission.clone())
+                    .await?
+                {
+                    return Ok(terminal);
+                }
+                if let Err(error) = self
+                    .resume_cancel(&client, &pending, &id, repository.clone())
+                    .await
+                {
+                    if !matches!(error, SessionDomainError::Unavailable { .. }) {
+                        return Err(error);
+                    }
+                    // An unknown cancel operation does not determine the turn.
+                    // Continue observing only the original Message's authoritative state.
+                }
                 let message = client
                     .messages()
                     .wait(sdk::MessageWaitRequest {
@@ -226,17 +274,6 @@ impl RootSessionOwner {
                 {
                     return Err(unavailable("Message terminal identity changed"));
                 }
-                match message.state {
-                    sdk::MessageState::Queued
-                    | sdk::MessageState::Delivering
-                    | sdk::MessageState::AwaitingReply => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        continue;
-                    }
-                    sdk::MessageState::Completed
-                    | sdk::MessageState::Failed
-                    | sdk::MessageState::Cancelled => {}
-                }
                 let view = client
                     .thinkthreads()
                     .get(sdk::ThinkThreadTargetRequest {
@@ -244,24 +281,70 @@ impl RootSessionOwner {
                     })
                     .await
                     .map_err(|_| unavailable("terminal Session readiness unavailable"))?;
-                if self.validate_view(&root, &view, true).is_err() {
+                if view.thinkthread_id != root
+                    || view.root_id != root
+                    || view.parent_id.is_some()
+                    || view.fs != self.config.fs_root
+                    || view.fs_branch_id.is_some()
+                {
+                    return Err(unavailable("Message Root observation identity changed"));
+                }
+                if self
+                    .validate_view(&root, &view, message.state == sdk::MessageState::Completed)
+                    .is_err()
+                    && view.state.eq_ignore_ascii_case("running")
+                    && !view.needs_recovery
+                {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
-                let failure = if admitted.state == NativeOperationState::Failed {
+                match message.state {
+                    sdk::MessageState::Queued
+                    | sdk::MessageState::Delivering
+                    | sdk::MessageState::AwaitingReply => {
+                        if !view.state.eq_ignore_ascii_case("running") || view.needs_recovery {
+                            repository
+                                .invalidate_joint_turn(pending.admission.clone())
+                                .await?;
+                            return Err(unavailable(
+                                "Message execution invalidated; protection retained",
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    sdk::MessageState::Completed
+                    | sdk::MessageState::Failed
+                    | sdk::MessageState::Cancelled => {}
+                }
+                let failure = if message.state == sdk::MessageState::Cancelled {
+                    None
+                } else if !view.state.eq_ignore_ascii_case("running") || view.needs_recovery {
+                    Some("message_execution_invalidated")
+                } else if admitted.state == NativeOperationState::Failed {
                     Some("message_admission_failed")
                 } else if message.reply_truncated {
                     Some("message_reply_truncated")
-                } else if message.state != sdk::MessageState::Completed {
+                } else if message.state == sdk::MessageState::Failed {
                     Some("message_failed")
-                } else if message.reply_text.is_none() {
+                } else if message.state == sdk::MessageState::Completed
+                    && message.reply_text.is_none()
+                {
                     Some("message_reply_missing")
                 } else {
                     None
                 };
+                let cancelled_workspace = repository
+                    .joint_workspace_boundary(pending.admission.binding.clone())
+                    .await?
+                    .unsettled();
                 let terminal = JointTurnTerminal {
+                    cancelled: message.state == sdk::MessageState::Cancelled,
+                    execution_invalidated: !view.state.eq_ignore_ascii_case("running")
+                        || view.needs_recovery
+                        || (message.state == sdk::MessageState::Failed && cancelled_workspace),
                     message_id: Some(id),
-                    reply: if failure.is_none() {
+                    reply: if failure.is_none() && message.state == sdk::MessageState::Completed {
                         message.reply_text
                     } else {
                         None
@@ -285,9 +368,18 @@ impl RootSessionOwner {
             return Ok(terminal);
         }
         let observed = observed?;
-        repository
+        if let Err(error) = repository
             .finish_joint_turn(pending.admission.clone(), observed)
-            .await?;
+            .await
+        {
+            if let Some(terminal) = repository
+                .joint_turn_result(pending.admission.clone())
+                .await?
+            {
+                return Ok(terminal);
+            }
+            return Err(error);
+        }
         repository
             .joint_turn_result(pending.admission)
             .await?
