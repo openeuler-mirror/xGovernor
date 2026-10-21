@@ -2592,3 +2592,348 @@ async fn stale_read_failure_cannot_release_a_replaced_writer_fence() {
     assert!(f.repo.fail_stale_host_read(a.access).await.is_err());
     assert_eq!(before, f.snapshot());
 }
+
+mod execution_profiles {
+    use super::*;
+    use xgovernor_thinkthread_client::profile::*;
+    const SECRET: &str = "synthetic-host-private-value";
+    struct Clock;
+    impl xgovernor_core::Clock for Clock {
+        fn now_ms(&self) -> u64 {
+            100
+        }
+    }
+    fn budgets(slots: u32) -> JointBudgetPolicy {
+        [
+            ("session", 4, 1),
+            ("root", 4, 1),
+            ("operation", slots, 1),
+            ("record_bytes", 32_000_000, 1_000_000),
+        ]
+        .into_iter()
+        .map(|(k, total, recovery_reserve)| {
+            (
+                k.into(),
+                JointResourceBudget {
+                    total,
+                    recovery_reserve,
+                },
+            )
+        })
+        .collect()
+    }
+    fn profile(f: &Fixture, slots: u32) -> Arc<ProfileRouter> {
+        for path in [
+            &f.config.state_root,
+            &f.config.runtime_root,
+            &f.config.config_root,
+            &f.config.cache_root,
+            &f.config.working_directory,
+            &f.config.fs_root,
+            &f.config.home_directory,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let namespace = f.root.path().join("profile-locks");
+        std::fs::create_dir_all(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = DeploymentGuard::acquire(
+            &f.root.path().join("db"),
+            "fixture",
+            &namespace,
+            &[f.root.path().to_path_buf()],
+            &budgets(slots),
+        )
+        .unwrap();
+        guard.protect_values([SECRET.into()]).unwrap();
+        let operations = json!([
+            "message",
+            "host_read",
+            "host_write",
+            "host_exec",
+            "ordinary_cancel"
+        ]);
+        let p:ExecutionProfile=serde_json::from_value(json!({
+            "profile_id":"host-research","revision":"fixed","owner_kind":"candidate-fixture","runtime_kind":"fixture","backing_schema":"joint_v1","deployment_id":"fixture","context_ref":"context/fixed","context_digest":management_config_digest(&f.config),"tt_profile_ref":"builtin-profile/fixed","model_refs":["model/fixed"],"secret_version_refs":{},"release_ref":"alpha11",
+            "release":{"public_sdk_commit":SDK_COMMIT,"release_version":"alpha11/0.1.0-25","architecture":"aarch64-unknown-linux-gnu","rpm_sha256":RPM_SHA256,"management_fingerprint":sdk::MANAGEMENT_CONTRACT_FINGERPRINT,"builtin_extension_version_ref":"builtin-xiaoo/v7","endside_version_ref":"deployment/endside","session_format_ref":"deployment/session-format","compatibility_evidence_ref":"alpha11/compatible"},
+            "declaration":{"declaration_id":"alpha11/public-mappings","schema_version":1,"release_ref":"alpha11","public_contract_refs":["management/v2"],"operation_subset":operations,"usage_mode":"unknown","policy_subset":"empty","cancel_mode":"ordinary_checkpoint_required","observation_mode":"terminal_only","evidence_refs":{"message":"alpha11/message","host_read":"alpha11/host-read","host_write":"alpha11/host-write","host_exec":"alpha11/host-exec","ordinary_cancel":"alpha11/cancel"}},
+            "workload":"research","role":"research","policy":{},"required_capabilities":["host_read"],"research_limits":{"token_fuse_enabled":false,"wall_timeout_ms":1000,"expansion_bound":10},"enabled":true,"admission_mode":"experiment",
+            "experiment_allowlist":[{"approval_ref":"research/approval","principal":"fixture","tenant_key":"tenant/a","profile_revision":"fixed","release_ref":"alpha11","workload":"research","capability_subset":operations,"expires_at_ms":1000}]
+        })).unwrap();
+        let manifest = DeploymentManifest {
+            host_sha256: host_bytes_digest(&std::fs::read(&f.config.host_executable).unwrap()),
+            owner_kind: p.owner_kind.clone(),
+            runtime_kind: p.runtime_kind.clone(),
+            backing_schema: p.backing_schema.clone(),
+            deployment_id: p.deployment_id.clone(),
+            context_ref: p.context_ref.clone(),
+            context_digest: p.context_digest.clone(),
+            tt_profile_ref: p.tt_profile_ref.clone(),
+            model_refs: p.model_refs.clone(),
+            secret_version_refs: p.secret_version_refs.clone(),
+            release_ref: p.release_ref.clone(),
+            release: p.release.clone(),
+            declaration: p.declaration.clone(),
+        };
+        let revision = ProfileRevision::host(p, &manifest, f.config.clone(), 800).unwrap();
+        ProfileRouter::assemble(
+            guard,
+            budgets(slots),
+            vec![revision],
+            "fixed".into(),
+            true,
+            Arc::new(Clock),
+        )
+        .unwrap()
+    }
+    async fn access(
+        f: &Fixture,
+        p: &Arc<ProfileRouter>,
+        id: &str,
+        request: JointHostRequest,
+    ) -> Result<JointHostAccess, SessionDomainError> {
+        let mut context = f.context(id);
+        context.actor_role = Role::Admin;
+        p.prepare_host_operation(context, f.record.clone(), request, p.repository())
+            .await
+    }
+    fn safe_database(f: &Fixture) {
+        for name in ["db", "db-wal"] {
+            let path = f.root.path().join(name);
+            if path.exists() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()));
+                let encoded = STANDARD.encode(SECRET);
+                assert!(!bytes
+                    .windows(encoded.len())
+                    .any(|w| w == encoded.as_bytes()));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn profile_preserves_host_parameters_capabilities_and_strict_limits() {
+        let f = Fixture::new().await;
+        let p = profile(&f, 8);
+        let request = write(vec![0, 255, 1, 2]);
+        let a = access(&f, &p, "profile-write", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(a.backend.write_host(request).await.unwrap(), 4);
+        drop(a);
+        let a = access(&f, &p, "profile-read", read()).await.unwrap();
+        let caps = a.backend.capabilities();
+        assert!(
+            !caps.supports_atomic_write
+                && !caps.supports_grep
+                && !caps.supports_export_file
+                && !caps.supports_lsp
+        );
+        assert_eq!(
+            a.backend
+                .files()
+                .read_bytes(ReadBytesRequest {
+                    path: BackendPath("artifact".into())
+                })
+                .await
+                .unwrap(),
+            vec![0, 255, 1, 2]
+        );
+        drop(a);
+        let mut command = exec();
+        command.timeout_ms = Some(300000);
+        let a = access(&f, &p, "profile-exec", execute(command.clone()))
+            .await
+            .unwrap();
+        let result = a.backend.exec().exec(command.clone()).await.unwrap();
+        assert_eq!(result.stdout, b"out");
+        drop(a);
+        let sent = f
+            .trace()
+            .into_iter()
+            .find(|v| v["method"] == "thinkthread.exec")
+            .unwrap();
+        assert_eq!(sent["params"]["argv"][1], command.args[0]);
+        assert_eq!(sent["params"]["timeoutMs"], "300000");
+        let mut requests = vec![
+            JointHostRequest::Write {
+                path: "artifact".into(),
+                content: vec![],
+                mode: WriteMode::AtomicOverwrite,
+                create_parents: false,
+            },
+            JointHostRequest::Write {
+                path: "artifact".into(),
+                content: vec![],
+                mode: WriteMode::Create,
+                create_parents: false,
+            },
+            JointHostRequest::Export {
+                path: "artifact".into(),
+                preferred_name: None,
+            },
+        ];
+        let mut command = exec();
+        command.env = Some(vec![("KEY".into(), "value".into())]);
+        requests.push(execute(command));
+        let mut command = exec();
+        command.timeout_ms = Some(300001);
+        requests.push(execute(command));
+        requests.push(JointHostRequest::Exec {
+            request: exec(),
+            required_output_bytes: Some(65537),
+        });
+        let mut command = exec();
+        command.extra = Some(json!({"nested":{"policy":"unsupported"}}));
+        requests.push(execute(command));
+        for (index, request) in requests.into_iter().enumerate() {
+            let before = f.snapshot();
+            let trace = f.trace();
+            assert!(access(&f, &p, &format!("rejected-{index}"), request)
+                .await
+                .is_err());
+            assert_eq!(f.snapshot(), before);
+            assert_eq!(f.trace(), trace);
+        }
+        safe_database(&f);
+    }
+    #[tokio::test]
+    async fn profile_denies_sensitive_write_payload_before_admission_and_transport() {
+        let f = Fixture::new().await;
+        let p = profile(&f, 8);
+        let before = f.snapshot();
+        let trace = f.trace();
+        assert!(
+            access(&f, &p, "secret-write", write(SECRET.as_bytes().to_vec()))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.snapshot(), before);
+        assert_eq!(f.trace(), trace);
+        safe_database(&f);
+    }
+    #[tokio::test]
+    async fn sensitive_host_read_never_publishes_bytes_or_artifact() {
+        let f = Fixture::new().await;
+        f.state(json!({"files":{"work/artifact":STANDARD.encode(SECRET)}}));
+        let p = profile(&f, 8);
+        let a = access(&f, &p, "secret-read", read()).await.unwrap();
+        let error = a
+            .backend
+            .files()
+            .read_bytes(ReadBytesRequest {
+                path: BackendPath("artifact".into()),
+            })
+            .await
+            .err()
+            .unwrap();
+        assert!(!error.to_string().contains(SECRET));
+        drop(a);
+        let repository = p.repository();
+        let intent = repository
+            .host_repository()
+            .unwrap()
+            .host_intent("secret-read".into())
+            .await
+            .unwrap();
+        assert!(intent.result.is_none());
+        assert!(intent.artifact_evidence.is_none());
+        safe_database(&f);
+    }
+    #[tokio::test]
+    async fn sensitive_host_failure_retains_original_uuid_without_persisting_error_values() {
+        let f = Fixture::new().await;
+        f.state(json!({"scenario":"accepted-error","error_code":SECRET,"delivery":"accepted"}));
+        let p = profile(&f, 8);
+        let a = access(&f, &p, "secret-error", execute(exec()))
+            .await
+            .unwrap();
+        let uuid = p
+            .repository()
+            .host_repository()
+            .unwrap()
+            .host_intent("secret-error".into())
+            .await
+            .unwrap()
+            .prepared
+            .native[0]
+            .operation_id
+            .clone();
+        let error = a.backend.exec().exec(exec()).await.err().unwrap();
+        assert!(!error.to_string().contains(SECRET));
+        drop(a);
+        let repository = p.repository();
+        let intent = repository
+            .host_repository()
+            .unwrap()
+            .host_intent("secret-error".into())
+            .await
+            .unwrap();
+        assert_eq!(intent.prepared.native[0].operation_id, uuid);
+        assert!(intent.result.is_none());
+        assert_eq!(f.count("thinkthread.exec"), 1);
+        safe_database(&f);
+    }
+    #[tokio::test]
+    async fn cleanup_pending_stays_charged_after_a_consistent_budget_reduction() {
+        let f = Fixture::new().await;
+        let p = profile(&f, 8);
+        let a = access(&f, &p, "retained-read", read()).await.unwrap();
+        a.backend
+            .files()
+            .read_bytes(ReadBytesRequest {
+                path: BackendPath("artifact".into()),
+            })
+            .await
+            .unwrap();
+        drop(a);
+        let repository = p.repository();
+        let original = repository
+            .host_repository()
+            .unwrap()
+            .host_intent("retained-read".into())
+            .await
+            .unwrap();
+        assert_eq!(original.cleanup_state, "pending");
+        drop(repository);
+        drop(p);
+        let p = profile(&f, 2);
+        let before = f.snapshot();
+        let mutations = f
+            .trace()
+            .into_iter()
+            .filter(|v| {
+                matches!(
+                    v["method"].as_str(),
+                    Some("thinkthread.exec" | "thinkthread.write")
+                )
+            })
+            .collect::<Vec<_>>();
+        let error = access(&f, &p, "capacity-denied", read())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("capacity"), "{error}");
+        assert_eq!(f.snapshot(), before);
+        let retained = p
+            .repository()
+            .host_repository()
+            .unwrap()
+            .host_intent("retained-read".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        assert_eq!(
+            f.trace()
+                .into_iter()
+                .filter(|v| matches!(
+                    v["method"].as_str(),
+                    Some("thinkthread.exec" | "thinkthread.write")
+                ))
+                .collect::<Vec<_>>(),
+            mutations
+        );
+    }
+}

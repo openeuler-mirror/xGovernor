@@ -3486,7 +3486,9 @@ name = "xgovernor-thinkthread-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
+ "http-body-util",
  "operation-protocol",
  "rusqlite",
  "serde",
@@ -3496,8 +3498,12 @@ dependencies = [
  "thinkthread-management",
  "thiserror 1.0.69",
  "tokio",
+ "tower",
  "uuid",
  "xgovernor-core",
+ "xgovernor-runtime-pi",
+ "xgovernor-runtime-xiaoo",
+ "xgovernor-server",
 ]
 
 [[package]]

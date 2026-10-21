@@ -356,10 +356,23 @@ impl SqliteSessionRepository {
         F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
     {
         let connection = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
+        #[cfg(unix)]
+        let budget = self.joint_budget_policy.clone();
         tokio::task::spawn_blocking(move || {
             let mut connection = connection
                 .lock()
                 .map_err(|_| conflict("joint database mutex poisoned"))?;
+            #[cfg(unix)]
+            {
+                let guarded: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deployment')",
+                    [], |row| row.get(0),
+                )?;
+                if let Some(holder) = &deployment { holder.check_policy(&budget)?; }
+                else if guarded { return Err(conflict("local deployment writer guard is required")); }
+            }
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let result = action(&tx)?;
             tx.commit()?;

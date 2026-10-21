@@ -23,6 +23,10 @@ use xgovernor_server::{
     TokenTable,
 };
 
+#[cfg(unix)]
+static LOCAL_DEPLOYMENT_GUARD: std::sync::OnceLock<Arc<xgovernor_core::DeploymentGuard>> =
+    std::sync::OnceLock::new();
+
 const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DEFAULT_MAX_SANDBOXES_PER_OWNER: usize = 20;
@@ -485,6 +489,46 @@ async fn main() {
         );
         std::process::exit(1);
     });
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let data_directory = db_path.parent().expect("database has a parent");
+        let namespace = data_directory.join("deployment-locks");
+        if !namespace.exists() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&namespace)
+                .unwrap_or_else(|_| {
+                    eprintln!("refusing to start: local deployment lock directory unavailable");
+                    std::process::exit(1);
+                });
+        }
+        let guard = xgovernor_core::DeploymentGuard::acquire_local(
+            &db_path,
+            &namespace,
+            &[data_directory.to_path_buf()],
+            &Default::default(),
+        )
+        .unwrap_or_else(|_| {
+            eprintln!("refusing to start: local deployment ownership unavailable");
+            std::process::exit(1);
+        });
+        LOCAL_DEPLOYMENT_GUARD.set(guard).unwrap_or_else(|_| {
+            eprintln!("refusing to start: local deployment owner already initialized");
+            std::process::exit(1);
+        });
+    }
+
+    #[cfg(unix)]
+    let session_repository = LOCAL_DEPLOYMENT_GUARD
+        .get()
+        .expect("local deployment acquired")
+        .bind_split_repository(session_repository)
+        .unwrap_or_else(|_| {
+            eprintln!("refusing to start: session repository ownership unavailable");
+            std::process::exit(1);
+        });
 
     let local_manager = build_instance_manager(&db_path, "local");
     let _local_retry_loop = reconcile_and_spawn_retry_loop("local", &local_manager).await;

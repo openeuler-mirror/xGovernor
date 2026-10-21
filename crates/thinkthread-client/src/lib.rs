@@ -4,6 +4,8 @@
 
 pub mod durable_operation;
 pub mod message;
+#[cfg(unix)]
+pub mod profile;
 pub mod root_owner;
 
 use std::collections::BTreeMap;

@@ -3,7 +3,11 @@
 //! Nothing in this crate is serialized by the HTTP transport directly.
 
 pub mod application;
+#[cfg(unix)]
+pub mod deployment;
 pub mod domain;
+#[cfg(unix)]
+pub use deployment::{DeploymentBudgetConfiguration, DeploymentGuard};
 pub mod joint_host;
 pub mod joint_lifecycle;
 pub mod joint_store;

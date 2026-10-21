@@ -46,6 +46,8 @@ use std::sync::{Arc, Mutex};
 pub struct SqliteSessionRepository {
     pub(crate) conn: Arc<Mutex<Connection>>,
     joint_transactions: bool,
+    #[cfg(unix)]
+    pub(crate) deployment: Option<Arc<crate::DeploymentGuard>>,
     pub(crate) joint_budget_policy: crate::JointBudgetPolicy,
 }
 
@@ -62,6 +64,8 @@ impl SqliteSessionRepository {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
+            #[cfg(unix)]
+            deployment: None,
             joint_budget_policy: Default::default(),
         })
     }
@@ -74,6 +78,8 @@ impl SqliteSessionRepository {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
+            #[cfg(unix)]
+            deployment: None,
             joint_budget_policy: Default::default(),
         })
     }
@@ -91,12 +97,26 @@ impl SqliteSessionRepository {
         policy: crate::JointBudgetPolicy,
     ) -> Result<Self, SessionDomainError> {
         if policy.iter().any(|(kind, budget)| {
-            !["session", "root", "replica", "checkpoint", "repair", "disk"].contains(&kind.as_str())
+            ![
+                "session",
+                "root",
+                "replica",
+                "checkpoint",
+                "repair",
+                "disk",
+                "operation",
+                "record_bytes",
+            ]
+            .contains(&kind.as_str())
                 || budget.recovery_reserve > budget.total
         }) {
             return Err(SessionDomainError::InvalidRequest {
                 message: "invalid joint resource budget".into(),
             });
+        }
+        #[cfg(unix)]
+        if let Some(deployment) = &self.deployment {
+            deployment.check_policy(&policy)?;
         }
         self.joint_budget_policy = policy;
         Ok(self)

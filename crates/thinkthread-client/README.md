@@ -143,3 +143,60 @@ one full reply delta and one terminal, with explicit unknown metering. Replaying
 an idempotency key returns the original receipt; changed input conflicts. These
 operations do not provide active cancellation, streaming, policy enforcement,
 checkpoints or public close.
+
+## Server-side execution profiles
+
+On Linux, `profile` provides an explicit research assembly around the existing
+joint lifecycle. Parse `ExecutionProfile` strictly, verify it against an
+independently trusted `DeploymentManifest`, then construct frozen `ProfileRevision`
+adapters. The manifest binds the pinned SDK, ARM RPM, exact Management contract,
+built-in xiaoO extension, endside/session-format evidence, Host executable digest,
+Context, model and secret-version references. Provision those inputs separately
+from Session requests. Changing an immutable revision requires a new revision.
+
+Acquire a core `DeploymentGuard` before assembling a `ProfileRouter`. Provision
+its private lock namespace and managed directories first. The guard holds OS
+object locks on the database, managed roots and their ancestors for its lifetime;
+consistent database copies retain the same identity and lock namespace. It accepts
+only supported local Linux filesystems and rejects changed object identities.
+Keep the guard alive until daemon exit. Locks establish local writer ownership;
+they provide no evidence that a previous backend operation stopped.
+
+Supply a `DeploymentBudgetConfiguration` with a stable policy reference, finite
+resource totals and recovery reserves. Missing capacities are zero. Every joint
+connection must use the holder's exact policy. `operation` bounds retained pending
+operations, including Host cleanup-pending; `record_bytes` counts the serialized
+column bytes of owned SQLite records. It bounds logical record content, excluding
+SQLite page/index/WAL overhead and the fixed deployment identity row. Neither unit
+measures backend storage. Reducing budgets preserves existing records and refuses
+growth beyond available ordinary capacity. Recovery reserves are not ordinary
+capacity and do not introduce a new recovery allocation protocol.
+
+Register server bearer/database/operations secrets with
+`guard.protect_server_values` before assembly. They are prohibited from selected
+Host environments as well as stored content. Management/model secret values stay
+in the explicitly selected Host environment; the profile records only environment
+keys and secret-version references. The guard rejects known protected values in
+request content and SQLite writes, including nested JSON and encoded binary
+results. It fails closed on excessive nesting. It does not sanitize arbitrary
+third-party logs or make unknown secrets safe to forward.
+
+Both profile enablement and joint transactions require explicit opt-in.
+`disabled` is the default admission mode. `experiment` requires a nonexpired
+allowlist entry for the authenticated principal, tenant, revision, release,
+workload and capability subset. Administrator status alone grants no exception.
+Research configuration must explicitly disable token fuse and retain finite wall
+and expansion bounds. Default MCTS workloads and `production_candidate` are
+refused. Required usage, hard policies, isolation, images, complete event streams
+and backend storage guarantees remain unsupported.
+
+The router preserves the original revision for existing Sessions and pending
+intents. A changed default affects new opens; disabling a revision preserves its
+readers. Missing original dependencies fail without selecting another revision.
+The Root adapter supports only its existing administrator Message subset and
+terminal-only unknown metering. The Host adapter supports only the existing
+private-candidate read, overwrite and exec mapping with its original limits.
+The ordinary-cancel declaration records the supplier evidence and checkpoint
+requirement; this router exposes no new public cancellation path. Candidate
+capture/load and public close retain their existing unsupported behavior.
+No production backend registration is added.

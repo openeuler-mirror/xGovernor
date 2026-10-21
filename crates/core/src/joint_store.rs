@@ -63,9 +63,11 @@ pub struct JointResourceReservation {
 }
 
 /// Per-owner resource capacity. Ordinary operations cannot consume the recovery reserve.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JointResourceBudget {
     pub total: u32,
+    #[serde(default)]
     pub recovery_reserve: u32,
 }
 
