@@ -131,6 +131,7 @@ impl SqliteSessionRepository {
         let conn =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if deployment_registered(&conn)? {
+            crate::sqlite_host::validate_schema(&conn)?;
             return Ok(());
         }
         conn.execute_batch(

@@ -1950,6 +1950,96 @@ mod guarded_writes {
         assert_eq!(capacity_tests::business_snapshot(&f.database), before);
     }
 
+    #[tokio::test]
+    async fn enrolled_host_schema_is_checked_on_bound_and_unbound_open_without_migration() {
+        fn snapshot(path: &Path) -> (i64, Vec<Vec<String>>, Vec<(String, Vec<Vec<String>>)>) {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let read_rows = |sql: &str| {
+                let mut q = conn.prepare(sql).unwrap();
+                let columns = q.column_count();
+                q.query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            let version = conn
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap();
+            let schema = read_rows(
+                "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name",
+            );
+            let mut rows = capacity_tests::business_snapshot(path);
+            rows.push((
+                "local_deployment".into(),
+                read_rows("SELECT * FROM local_deployment ORDER BY singleton"),
+            ));
+            (version, schema, rows)
+        }
+        for case in [
+            "valid", "checksum", "version", "multiple", "empty", "missing",
+        ] {
+            let f = Fixture::new();
+            let guard = f.guard();
+            let conn = rusqlite::Connection::open(&f.database).unwrap();
+            match case {
+                "valid" => {}
+                "checksum" => {
+                    conn.execute("UPDATE joint_host_schema SET checksum='other'", [])
+                        .unwrap();
+                }
+                "version" => {
+                    conn.execute("UPDATE joint_host_schema SET version=2", [])
+                        .unwrap();
+                }
+                "multiple" => {
+                    conn.execute("INSERT INTO joint_host_schema SELECT 2,checksum FROM joint_host_schema WHERE version=1",[]).unwrap();
+                }
+                "empty" => {
+                    conn.execute("DELETE FROM joint_host_schema", []).unwrap();
+                }
+                "missing" => {
+                    conn.execute_batch("DROP TABLE joint_host_schema").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            drop(conn);
+            let before = snapshot(&f.database);
+            for path in ["bound", "unbound"] {
+                let opened = if path == "bound" {
+                    guard
+                        .repository(tests::budget(4))
+                        .map_err(|e| e.to_string())
+                } else {
+                    SqliteSessionRepository::open(&f.database).map_err(|e| e.to_string())
+                };
+                assert_eq!(opened.is_ok(), case == "valid", "schema={case}/open={path}");
+                if let Ok(repo) = opened {
+                    let changes: i64 = repo
+                        .conn
+                        .lock()
+                        .unwrap()
+                        .query_row("SELECT total_changes()", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(changes, 0, "schema={case}/open={path}");
+                    assert!(repo.get("existing-session").await.unwrap().is_some());
+                    if path == "unbound" {
+                        assert!(repo
+                            .save_operation_intent("unbound", serde_json::json!({}))
+                            .await
+                            .is_err());
+                    }
+                }
+                assert_eq!(snapshot(&f.database), before, "schema={case}/open={path}");
+                assert!(guard.validate().is_ok());
+                eprintln!("sample enrolled Host schema/case={case}/open={path}/accepted={}/schema+rows=unchanged",case=="valid");
+            }
+        }
+    }
+
     #[test]
     fn explicit_deployments_reject_wide_namespaces_and_unsupported_resource_filesystems() {
         use std::os::unix::fs::PermissionsExt;

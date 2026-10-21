@@ -8,7 +8,7 @@ use crate::{
     *,
 };
 use async_trait::async_trait;
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
 const SCHEMA: &str = "
@@ -20,27 +20,48 @@ CREATE TABLE IF NOT EXISTS joint_host_workspace(binding_id TEXT PRIMARY KEY REFE
 CREATE TABLE IF NOT EXISTS joint_host_cleanup(parent_id TEXT PRIMARY KEY REFERENCES joint_operations(id), child_id TEXT UNIQUE REFERENCES joint_operations(id), state TEXT NOT NULL, delegated INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS joint_host_dependencies(parent_id TEXT NOT NULL REFERENCES joint_operations(id), dependency TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(parent_id,dependency));
 ";
-pub(crate) fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS joint_host_schema(version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)")?;
-    let versions: u32 = tx.query_row("SELECT count(*) FROM joint_host_schema", [], |r| r.get(0))?;
+fn schema_registration(conn: &Connection) -> rusqlite::Result<Option<(u32, String)>> {
+    let versions: u32 =
+        conn.query_row("SELECT count(*) FROM joint_host_schema", [], |r| r.get(0))?;
     if versions > 1 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let checksum = host_bytes_digest(SCHEMA.as_bytes());
-    let old: Option<(u32, String)> = tx
+    let old: Option<(u32, String)> = conn
         .query_row("SELECT version,checksum FROM joint_host_schema", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .optional()?;
-    if old.as_ref().is_some_and(|v| v != &(1, checksum.clone())) {
+    if old
+        .as_ref()
+        .is_some_and(|v| v != &(1, host_bytes_digest(SCHEMA.as_bytes())))
+    {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    tx.execute_batch(SCHEMA)?;
-    if old.is_none() {
-        tx.execute("INSERT INTO joint_host_schema VALUES(1,?1)", [&checksum])?;
+    Ok(old)
+}
+
+/// An enrolled database must already have the supported schema registration.
+/// Validation never creates, repairs, or migrates persistent state.
+pub(crate) fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
+    if schema_registration(conn)?.is_none() {
+        return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
 }
+
+pub(crate) fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS joint_host_schema(version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)")?;
+    let old = schema_registration(tx)?;
+    tx.execute_batch(SCHEMA)?;
+    if old.is_none() {
+        tx.execute(
+            "INSERT INTO joint_host_schema VALUES(1,?1)",
+            [host_bytes_digest(SCHEMA.as_bytes())],
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_target(
     tx: &Transaction<'_>,
     t: &HostTargetV1,
