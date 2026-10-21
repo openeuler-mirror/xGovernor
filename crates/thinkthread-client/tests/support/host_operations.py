@@ -54,15 +54,21 @@ while True:
     elif method == 'context.bind':
         reply(req, {'bound': True})
     elif method == 'thinkthread.get':
+        if current.get('postcondition_read_seen') and current.get('postcondition_get_rejected'):
+            reject(req, 'NotReady', 'not_sent'); continue
         if scenario == 'get-rejected':
             reject(req, 'NotReady'); continue
         if scenario == 'get-hang': time.sleep(20); sys.exit(0)
         reply(req, {'thinkthreadId': params['thinkthreadId'], 'rootId': 'native-root', 'parentId': 'native-root',
                     'state': 'Running', 'sessionState': 'Ready', 'agent': 'fixture', 'fs': os.environ['XG_TEST_FS'],
-                    'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' else 'private-branch', 'contentRevision': str(current.get('revision', '1')), 'needsRecovery': False})
+                    'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' or (current.get('postcondition_read_seen') and current.get('postcondition_wrong_branch')) else 'private-branch',
+                    'fsBranchState': current.get('postcondition_branch_state', 'attached') if current.get('postcondition_read_seen') else 'attached',
+                    'contentRevision': str(current.get('revision', '1')), 'needsRecovery': bool(current.get('postcondition_read_seen') and current.get('postcondition_needs_recovery'))})
     elif method == 'thinkthread.read':
         if current.get('postcondition_read_error'):
-            reply(req,error={'code':current['postcondition_read_error'],'message':current.get('postcondition_read_message','unavailable'),'retryable':False,'delivery':'not_sent'});continue
+            current['postcondition_read_seen'] = True
+            with open(state_path, 'w') as f: json.dump(current, f)
+            reply(req,error={'code':current['postcondition_read_error'],'message':current.get('postcondition_read_message','unavailable'),'retryable':False,'delivery':'not_sent','details':current.get('postcondition_read_details')});continue
         data = base64.b64decode(current.get('files', {}).get(params['path'], '')) if params['path'] in current.get('files', {}) else bytes(range(256)) * 513 + b'\x00\xfftail'
         if scenario == 'empty':
             data = b''

@@ -2334,6 +2334,18 @@ async fn accepted_mutation_rejections_query_only_original_identity_and_require_p
             "failed-directory",
             "failed-missing-file",
             "failed-read-error",
+            "failed-branch-metadata",
+            "failed-same-suffix",
+            "failed-old-wording",
+            "failed-read-details-child",
+            "failed-read-details-path",
+            "failed-directory-recovery",
+            "failed-directory-branch-recovery",
+            "failed-missing-branch-recovery",
+            "failed-directory-get-error",
+            "failed-directory-wrong-branch",
+            "failed-directory-missing-branch-state",
+            "failed-directory-unpinned",
             "needs_recovery",
             "in_progress",
             "accepted",
@@ -2345,23 +2357,56 @@ async fn accepted_mutation_rejections_query_only_original_identity_and_require_p
             "missing-completed",
         ] {
             let f = Fixture::new().await;
+            if case != "failed-directory-unpinned" {
+                f.conn().execute("UPDATE joint_host_targets SET policy_json=json_set(policy_json,'$.backend_release_ref','alpha11/0.1.0-25')",[]).unwrap();
+            }
             let bytes = vec![0, 255, 7];
             let state = match case {
                 "in_progress" => "running",
                 "needs_recovery" | "accepted" | "not-found" => case,
                 _ => "failed",
             };
-            let mut patch = json!({"scenario":"accepted-error","error_code":"FileOperationFailed","delivery":"accepted","query_state":state,"files":{"work/artifact":STANDARD.encode(if case=="failed-new" {bytes.clone()}else{vec![2]})}});
-            if case == "failed-directory" {
+            let mut patch = json!({"scenario":"accepted-error","error_code":"FileOperationFailed","delivery":"accepted","query_state":state,"files":{"work/artifact":STANDARD.encode(if matches!(case,"failed-new"|"failed-branch-metadata"|"failed-same-suffix") {bytes.clone()}else{vec![2]})}});
+            if case.starts_with("failed-directory") || case == "failed-old-wording" {
                 patch["postcondition_read_error"] = json!("FileOperationFailed");
                 patch["postcondition_read_message"] = json!(
-                    "filesystem branch: invalid execution policy: target is not a regular file"
+                    "filesystem branch: invalid execution policy: only regular file reads are supported"
                 );
             }
-            if case == "failed-missing-file" {
+            if case.starts_with("failed-missing") || case.starts_with("failed-read-details") {
                 patch["postcondition_read_error"] = json!("FileOperationFailed");
                 patch["postcondition_read_message"] =
-                    json!("filesystem branch: read failed: No such file or directory (os error 2)");
+                    json!("filesystem branch: fs snapshot: No such file or directory (os error 2)");
+            }
+            for (name, message) in [
+                ("failed-branch-metadata", "filesystem branch: opening branch metadata: No such file or directory (os error 2)"),
+                ("failed-same-suffix", "filesystem branch: unrelated dependency: No such file or directory (os error 2)"),
+                ("failed-old-wording", "filesystem branch: invalid execution policy: target is not a regular file"),
+            ] {
+                if case == name {
+                    patch["postcondition_read_error"] = json!("FileOperationFailed");
+                    patch["postcondition_read_message"] = json!(message);
+                }
+            }
+            match case {
+                "failed-read-details-child" => {
+                    patch["postcondition_read_details"] = json!({"thinkthreadId":"other-child"})
+                }
+                "failed-read-details-path" => {
+                    patch["postcondition_read_details"] = json!({"path":"other-file"})
+                }
+                "failed-directory-recovery" => patch["postcondition_needs_recovery"] = json!(true),
+                "failed-directory-branch-recovery" | "failed-missing-branch-recovery" => {
+                    patch["postcondition_branch_state"] = json!("needs_recovery")
+                }
+                "failed-directory-get-error" => patch["postcondition_get_rejected"] = json!(true),
+                "failed-directory-wrong-branch" => {
+                    patch["postcondition_wrong_branch"] = json!(true)
+                }
+                "failed-directory-missing-branch-state" => {
+                    patch["postcondition_branch_state"] = Value::Null
+                }
+                _ => {}
             }
             if case == "failed-read-error" {
                 patch["postcondition_read_error"] = json!("ThinkThreadNotFound");
@@ -2434,6 +2479,21 @@ async fn accepted_mutation_rejections_query_only_original_identity_and_require_p
             let hold:u32=f.conn().query_row("SELECT count(*) FROM joint_refs WHERE kind='host_hold' AND public_id='accepted'",[],|r|r.get(0)).unwrap();
             assert_eq!(hold, u32::from(!settled));
             if settled {
+                if case != "failed-old" {
+                    let post = h
+                        .recovery_evidence
+                        .iter()
+                        .find(|e| e["kind"] == "failed_write_postcondition")
+                        .unwrap();
+                    assert_eq!(
+                        post["observation"]["branch"]["view"]["fsBranchState"],
+                        "attached"
+                    );
+                    assert_eq!(
+                        post["observation"]["branch"]["view"]["needsRecovery"],
+                        false
+                    );
+                }
                 assert_eq!(h.cleanup_state, "done");
                 assert!(h.blocker_id.is_none());
                 let before = f.snapshot();

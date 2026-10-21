@@ -136,8 +136,21 @@ Rejected mutations initially settle only with `delivery=not_sent`; `NeedsRecover
 and `OperationInProgress` retain the blocker even with that delivery value.
 Other accepted rejections query the original operation UUID and verify its handle,
 digest and target. A terminal failed write also requires a public read confirming
-that the requested bytes were not published, or a recognized nonregular/missing
-file rejection. Only then do failure, dirty-state clearing, fence release and
+that the requested bytes were not published. Read rejections are recognized only
+for `backend_release_ref=alpha11/0.1.0-25` (Management SDK `881ff5d`), with
+`FileOperationFailed`, `delivery=not_sent`, no `details`, and one of these exact
+messages observed for target-level failures in that fixed release:
+
+- `filesystem branch: invalid execution policy: only regular file reads are supported`
+- `filesystem branch: fs snapshot: No such file or directory (os error 2)`
+
+The adapter then queries the exact Child under the same source fence and requires
+the expected Root, parent, branch and filesystem, Running/Ready, `needsRecovery=false`
+and `fsBranchState=attached`. Both the read error and branch observation remain in
+the journal. Other messages (including ENOENT from branch metadata), supplied
+details, unpinned releases, missing views and recovery states stay unknown. The
+text fallback does not interpret an undeclared structured error contract.
+Only then do failure, dirty-state clearing, fence release and
 owned allocation release commit together. Missing or inconsistent evidence stays
 unknown; a failed exec record alone provides no declared business postcondition.
 The original rejection, query and postcondition observations remain in the journal.

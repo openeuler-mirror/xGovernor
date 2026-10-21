@@ -659,12 +659,39 @@ impl CandidateHostBackend {
                         )
                     }
                     Err(error) => {
-                        let confirmed = matches!(&error,sdk::ManagementError::Rejected(body) if body.code=="FileOperationFailed" && (body.message=="filesystem branch: invalid execution policy: target is not a regular file" || body.message=="filesystem branch: invalid execution policy: only regular file reads are supported" || (body.message.starts_with("filesystem branch: ") && body.message.ends_with("No such file or directory (os error 2)"))));
+                        let recognized = matches!(&error, sdk::ManagementError::Rejected(body)
+                            if self.prepared.policy.backend_release_ref == "alpha11/0.1.0-25"
+                                && body.code == "FileOperationFailed"
+                                && body.delivery == sdk::Delivery::NotSent
+                                && body.details.is_none()
+                                && matches!(body.message.as_str(),
+                                    "filesystem branch: invalid execution policy: only regular file reads are supported"
+                                    | "filesystem branch: fs snapshot: No such file or directory (os error 2)"));
+                        let (healthy, branch) = if recognized {
+                            match client
+                                .thinkthreads()
+                                .get(sdk::ThinkThreadTargetRequest {
+                                    thinkthread_id: self.prepared.target.native_child_id.clone(),
+                                })
+                                .await
+                            {
+                                Ok(view) => (
+                                    self.verify_view(&view).is_ok()
+                                        && view.fs_branch_state.as_deref() == Some("attached"),
+                                    json!({"view":view}),
+                                ),
+                                Err(error) => (false, json!({"error":error.to_string()})),
+                            }
+                        } else {
+                            (false, Value::Null)
+                        };
                         let raw = match &error {
-                            sdk::ManagementError::Rejected(body) => json!({"error":body}),
+                            sdk::ManagementError::Rejected(body) => {
+                                json!({"error":body,"branch":branch})
+                            }
                             _ => json!({"error":error.to_string()}),
                         };
-                        (confirmed, raw)
+                        (recognized && healthy, raw)
                     }
                 }
             }
