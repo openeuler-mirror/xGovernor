@@ -244,3 +244,11 @@ request and observations; they do not send checkpoint mutations or enable public
 save/load. A stale checkpoint observation cannot clear a newer cancellation.
 Post-cancellation Message failure or a stopped Root is explicit failure requiring
 recovery, without an automatic replacement resource.
+
+## Profile environment
+
+`ManagementConfig` forwards only `base_environment`; `home_directory` does not
+add a `HOME` environment variable. Assemblies using the built-in xiaoO profile
+must explicitly include `HOME` with the selected caller home so that profile
+`${HOME}` templates can resolve. Keep this value in the frozen profile Context
+across preflight, execution and recovery connections.

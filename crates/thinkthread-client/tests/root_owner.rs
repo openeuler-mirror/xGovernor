@@ -53,6 +53,10 @@ impl Fixture {
             home_directory: root.path().join("home"),
             executable_search_path: vec![PathBuf::from("/usr/bin")],
             base_environment: BTreeMap::from([
+                (
+                    "HOME".into(),
+                    root.path().join("home").to_string_lossy().into(),
+                ),
                 ("XG_TEST_SCENARIO".into(), scenario.into()),
                 (
                     "XG_TEST_FS".into(),
@@ -1116,6 +1120,7 @@ fn crash_cancel_config(path: &std::path::Path) -> ManagementConfig {
         home_directory: path.join("home"),
         executable_search_path: vec![PathBuf::from("/usr/bin")],
         base_environment: BTreeMap::from([
+            ("HOME".into(), path.join("home").to_string_lossy().into()),
             ("XG_TEST_SCENARIO".into(), "owner-cancel".into()),
             (
                 "XG_TEST_FS".into(),
@@ -1242,4 +1247,38 @@ async fn cancellation_survives_process_exit_before_send_and_after_acknowledgemen
             1
         );
     }
+}
+
+#[tokio::test]
+async fn profile_home_is_explicit_and_preserved_across_owner_connections() {
+    let f = Fixture::new("owner-explicit-home");
+    let repo = Arc::new(repository(&f.root.path().join("owner.db")).with_joint_transactions());
+    let owner = f.owner();
+    let record = owner
+        .open(f.context(), f.input(), repo.clone())
+        .await
+        .unwrap();
+    owner.ensure_attached(&record, repo).await.unwrap();
+    let trace = f.trace();
+    let bindings: Vec<_> = trace
+        .iter()
+        .filter(|r| r["method"] == "context.bind")
+        .collect();
+    assert!(bindings.len() >= 3);
+    for binding in bindings {
+        assert_eq!(
+            binding["host_home"],
+            f.config.home_directory.to_string_lossy().as_ref()
+        );
+        assert_eq!(binding["params"]["homeDirectory"], binding["host_home"]);
+        let keys = binding["params"]["environmentKeys"].as_array().unwrap();
+        assert!(keys.contains(&json!("HOME")));
+    }
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|r| r["method"] == "thinkthread.create")
+            .count(),
+        1
+    );
 }

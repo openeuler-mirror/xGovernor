@@ -56,7 +56,9 @@ while True:
 
     if scenario == "owner-concurrent" and state_file and os.path.exists(state_file):
         with open(state_file) as source: state = json.load(source)["state"]
-    with open(trace, "a") as out: out.write(json.dumps({"method": method, "params": params, "connection":os.getpid(), "at":time.time()}) + "\n")
+    entry = {"method": method, "params": params, "connection":os.getpid(), "at":time.time()}
+    if scenario == "owner-explicit-home": entry["host_home"] = os.environ.get("HOME")
+    with open(trace, "a") as out: out.write(json.dumps(entry) + "\n")
     gate = os.environ.get("XG_TEST_OPERATION_GATE")
     if gate and os.path.exists(gate) and method in ("thinkthread.create", "operation.get"):
         with socket.socket(socket.AF_UNIX) as connection:
