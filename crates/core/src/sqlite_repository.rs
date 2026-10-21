@@ -152,7 +152,8 @@ impl SqliteSessionRepository {
         if !has_execution {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{\"kind\":\"split_v1\"}';")?;
         }
-        crate::sqlite_joint::init(conn)
+        crate::sqlite_joint::init(conn)?;
+        crate::sqlite_host::init(conn)
     }
 }
 
@@ -285,6 +286,9 @@ fn read_session(conn: &Connection, id: &str) -> Result<Option<SessionRecord>, St
 
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
+    fn host_repository(&self) -> Option<&dyn crate::HostRepository> {
+        Some(self)
+    }
     fn supports_joint_transactions(&self) -> bool {
         self.joint_transactions
     }

@@ -8,7 +8,7 @@ A joint owner returns records already committed by the supplied durable reposito
 
 Session routing is persisted as a versioned `SessionExecutionBacking`. Existing databases acquire the `split_v1` default without changing their records. Unknown variants fail decoding. Joint bindings name an owner, binding and configuration revision; they are internal and excluded from public projections.
 
-Open, capture, load, close, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction, cancel, fork and Host operations fail before invoking a split runtime/provider. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
+Open, capture, load, close, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction, cancel and fork fail before invoking a split runtime/provider. Host requests require an explicitly implemented request-bound Host access strategy and otherwise fail before invoking a split backend. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
 
 `SessionRepository::supports_joint_transactions` defaults to false. The SQLite repository requires an explicit `with_joint_transactions()` assembly opt-in for a verified joint owner; its default remains disabled. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
 
@@ -116,3 +116,41 @@ Repeated terminal observations first retain the previously known resource
 identities, then compare the normalized result. The same state and payload with
 no new resource identity is idempotent, including an empty incoming resource list.
 A changed terminal state, payload or added resource identity remains a conflict.
+
+## Request-bound Host access
+
+An optional `prepare_host_operation` strategy admits one complete exec/read/write
+request against a registered active private Child and branch. It preserves the
+application's authorization, lease, workspace and capability checks. The
+administrator-only Root/direct owner does not implement this strategy; there is
+no production server registration for the candidate Host owner.
+
+The Host repository stores canonical input and policy digests, local generation
+checks, original mutation UUIDs, a source fence, resource reservations and
+results in the Session database. Reads have local observation steps without a
+native mutation UUID. Mutation claims set the local workspace dirty before
+sending; EOF, an observation timeout, a missing operation or `needs_recovery`
+retains ownership and the fence. Recovery queries the original UUID and checks
+the SDK digest and exact target without sending a replacement mutation.
+
+The pinned SDK owns raw file framing. Read lengths and hashes are local
+observations; expected write lengths/hashes describe the original input.
+Incomplete or rejected transfers fail, and connections are discarded. Exec
+retains native reason/code separately from ordinary exit codes. An explicitly
+assembled settlement guarantee is required to release execution fences; a local
+timeout or a cancellation cannot establish settlement.
+
+Public overwrite uses `JointHostBackend::write_host` and returns only path and
+byte count. The filesystem `write_bytes` trait, atomic writes, export, metadata,
+search and directory helpers remain unsupported. Parent creation can be
+preflighted and journaled as separate exec/write steps, but its execution remains
+unsupported. No filesystem durability or process cleanup helper is supplied.
+
+Owned cleanup dependencies can suspend an already settled parent and its child
+record atomically. Suspension removes the execution fence and delegation while
+retaining ownership, resource accounting and the Root hold. Resume requires
+released dependencies and valid ownership/configuration, obtains a fresh epoch,
+and atomically restores the parent and child. Legacy journal/publication/release
+entry points reject these records. Committing a Host result also records a
+pending owned cleanup item, so a lost commit acknowledgement cannot lose the
+result or permit a duplicate release.

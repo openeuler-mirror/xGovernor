@@ -130,6 +130,16 @@ pub trait JointSessionLifecycle: Send + Sync {
     fn owner_kind(&self) -> &str;
     fn configuration_revision(&self) -> &str;
 
+    async fn prepare_host_operation(
+        &self,
+        _context: JointOperationContext,
+        _session: SessionRecord,
+        _request: crate::JointHostRequest,
+        _repository: Arc<dyn SessionRepository>,
+    ) -> Result<crate::JointHostAccess, SessionDomainError> {
+        Err(unsupported_joint("host_operation"))
+    }
+
     /// Reconcile the original durable operation. Unknown mutations are queried, never recreated.
     async fn reconcile(
         &self,

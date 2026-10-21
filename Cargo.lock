@@ -3368,11 +3368,13 @@ dependencies = [
  "serde",
  "serde_json",
  "session-protocol",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "xgovernor-manager",
 ]
 
@@ -3484,6 +3486,8 @@ name = "xgovernor-thinkthread-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "operation-protocol",
  "rusqlite",
  "serde",
  "serde_json",

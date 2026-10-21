@@ -1788,6 +1788,56 @@ impl SessionApplication {
         })
     }
 
+    async fn joint_host_access(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+        lease: &SessionLeaseClaim,
+        capability: crate::SandboxCapability,
+        request: crate::JointHostRequest,
+    ) -> Result<(crate::JointHostAccess, SessionOperationGuard), SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        self.check_lease_holder(runtime_id, lease).await?;
+        if !record.capabilities.sandbox.contains(&capability) {
+            return Err(SessionDomainError::UnsupportedCapability {
+                family: crate::CapabilityFamily::Sandbox,
+                capability: format!("{capability:?}"),
+            });
+        }
+        if matches!(
+            capability,
+            crate::SandboxCapability::Exec | crate::SandboxCapability::FileWrite
+        ) && record.workspace.access != crate::WorkspaceAccess::ReadWrite
+        {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "workspace is read-only".into(),
+            });
+        }
+        if let crate::JointHostRequest::Exec { request, .. } = &request {
+            if request.timeout_ms.is_some_and(|v| v == 0 || v > 3_600_000) {
+                return Err(crate::host_invalid(
+                    "timeout_ms must be between 1 and 3600000",
+                ));
+            }
+            if request.command.trim().is_empty() {
+                return Err(crate::host_invalid(
+                    "command must contain a nonempty executable",
+                ));
+            }
+        }
+        let binding = record
+            .execution_backing
+            .joint()
+            .ok_or_else(|| crate::unsupported_joint("host_route"))?;
+        let owner = self.joint_owner(&record.runtime.runtime_kind, binding)?;
+        let guard = self.claim_operation(runtime_id)?;
+        let context = self.joint_context(ctx, &record, "host", None, None);
+        let access = owner
+            .prepare_host_operation(context, record, request, self.records.clone())
+            .await?;
+        Ok((access, guard))
+    }
+
     async fn operation_backend(
         &self,
         ctx: &SecurityContext,
@@ -1839,6 +1889,46 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionExecRequest,
     ) -> Result<SessionExecResult, SessionDomainError> {
+        if self
+            .require_session(ctx, &request.runtime_id)
+            .await?
+            .execution_backing
+            .joint()
+            .is_some()
+        {
+            let exec = ExecRequest {
+                command: request.command.first().cloned().unwrap_or_default(),
+                args: request.command.iter().skip(1).cloned().collect(),
+                cwd: request.cwd.map(operation_protocol::BackendPath),
+                env: Some(request.env.into_iter().collect()),
+                timeout_ms: Some(request.timeout_ms.unwrap_or(30_000)),
+                ..Default::default()
+            };
+            let (host, _guard) = self
+                .joint_host_access(
+                    ctx,
+                    &request.runtime_id,
+                    &request.lease,
+                    crate::SandboxCapability::Exec,
+                    crate::JointHostRequest::Exec {
+                        request: exec.clone(),
+                        required_output_bytes: None,
+                    },
+                )
+                .await?;
+            let result = host
+                .backend
+                .exec()
+                .exec(exec)
+                .await
+                .map_err(map_operation_error)?;
+            return Ok(SessionExecResult {
+                stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+            });
+        }
         let (backend, _guard) = self
             .operation_backend(
                 ctx,
@@ -1910,6 +2000,45 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionFileReadRequest,
     ) -> Result<SessionFileReadResult, SessionDomainError> {
+        if self
+            .require_session(ctx, &request.runtime_id)
+            .await?
+            .execution_backing
+            .joint()
+            .is_some()
+        {
+            let (host, _guard) = self
+                .joint_host_access(
+                    ctx,
+                    &request.runtime_id,
+                    &request.lease,
+                    crate::SandboxCapability::FileRead,
+                    crate::JointHostRequest::Read {
+                        path: request.path.clone(),
+                    },
+                )
+                .await?;
+            let path = host
+                .backend
+                .paths()
+                .resolve_path(ResolvePathRequest {
+                    raw_path: request.path,
+                    base: ResolveBase::WorkspaceRoot,
+                })
+                .await
+                .map_err(map_operation_error)?;
+            let bytes = host
+                .backend
+                .files()
+                .read_bytes(ReadBytesRequest { path: path.clone() })
+                .await
+                .map_err(map_operation_error)?;
+            return Ok(SessionFileReadResult {
+                path: path.0,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                media_type: None,
+            });
+        }
         let (backend, _guard) = self
             .operation_backend(
                 ctx,
@@ -1953,6 +2082,46 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionFileWriteRequest,
     ) -> Result<SessionFileWriteResult, SessionDomainError> {
+        if self
+            .require_session(ctx, &request.runtime_id)
+            .await?
+            .execution_backing
+            .joint()
+            .is_some()
+        {
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(request.content_base64)
+                .map_err(|_| crate::host_invalid("content_base64 is not valid base64"))?;
+            let host_request = crate::JointHostRequest::Write {
+                path: request.path.clone(),
+                content,
+                mode: WriteMode::Overwrite,
+                create_parents: request.create_parents,
+            };
+            let (host, _guard) = self
+                .joint_host_access(
+                    ctx,
+                    &request.runtime_id,
+                    &request.lease,
+                    crate::SandboxCapability::FileWrite,
+                    host_request.clone(),
+                )
+                .await?;
+            let path = host
+                .backend
+                .paths()
+                .resolve_path(ResolvePathRequest {
+                    raw_path: request.path,
+                    base: ResolveBase::WorkspaceRoot,
+                })
+                .await
+                .map_err(map_operation_error)?;
+            let bytes_written = host.backend.write_host(host_request).await?;
+            return Ok(SessionFileWriteResult {
+                path: path.0,
+                bytes_written,
+            });
+        }
         let (backend, _guard) = self
             .operation_backend(
                 ctx,
@@ -3240,6 +3409,9 @@ pub struct CheckpointListEntry {
 
 #[async_trait::async_trait]
 pub trait SessionRepository: Send + Sync {
+    fn host_repository(&self) -> Option<&dyn crate::HostRepository> {
+        None
+    }
     fn supports_joint_transactions(&self) -> bool {
         false
     }

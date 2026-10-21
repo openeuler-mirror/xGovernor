@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Debug, thiserror::Error)]
-enum Error {
+pub(crate) enum Error {
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -16,20 +16,20 @@ enum Error {
     #[error(transparent)]
     Domain(#[from] SessionDomainError),
 }
-type Result<T> = std::result::Result<T, Error>;
-fn conflict(message: &str) -> Error {
+pub(crate) type Result<T> = std::result::Result<T, Error>;
+pub(crate) fn conflict(message: &str) -> Error {
     SessionDomainError::Conflict {
         message: message.into(),
     }
     .into()
 }
-fn encode<T: Serialize>(value: &T) -> Result<String> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
-fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
+pub(crate) fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
     Ok(serde_json::from_str(value)?)
 }
-fn tenant_key(tenant: Option<&str>) -> String {
+pub(crate) fn tenant_key(tenant: Option<&str>) -> String {
     tenant
         .map(|v| format!("tenant/{v}"))
         .unwrap_or_else(|| "admin".into())
@@ -249,7 +249,7 @@ fn validate_request(request: &JointPrepareRequest) -> Result<()> {
     }
     Ok(())
 }
-fn validate_native(native: &JointNativeIntent) -> Result<()> {
+pub(crate) fn validate_native(native: &JointNativeIntent) -> Result<()> {
     if ![&native.step, &native.operation_id, &native.method]
         .iter()
         .all(|v| nonempty(v))
@@ -270,7 +270,7 @@ fn validate_native(native: &JointNativeIntent) -> Result<()> {
     Ok(())
 }
 
-fn check_fences(
+pub(crate) fn check_fences(
     tx: &Transaction<'_>,
     request: &JointPrepareRequest,
     admission: &JointAdmission,
@@ -306,7 +306,7 @@ fn check_fences(
     }
     Ok(())
 }
-fn operation(
+pub(crate) fn operation(
     tx: &Transaction<'_>,
     admission: &JointAdmission,
 ) -> Result<(JointPrepareRequest, String, Option<String>)> {
@@ -318,7 +318,7 @@ fn operation(
     }
     Ok((decode(&request)?, stage, publication))
 }
-fn release_fences(tx: &Transaction<'_>, id: &str) -> Result<()> {
+pub(crate) fn release_fences(tx: &Transaction<'_>, id: &str) -> Result<()> {
     tx.execute("UPDATE joint_fences SET holder=NULL WHERE holder=?1", [id])?;
     Ok(())
 }
@@ -348,7 +348,7 @@ fn settled_native(tx: &Transaction<'_>, id: &str) -> Result<()> {
 }
 
 impl SqliteSessionRepository {
-    async fn joint_transaction<T: Send + 'static, F>(
+    pub(crate) async fn joint_transaction<T: Send + 'static, F>(
         &self,
         action: F,
     ) -> std::result::Result<T, SessionDomainError>
@@ -533,6 +533,11 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<Option<JointTurnTerminal>, SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request, stage, _) = operation(tx, &admission)?;
+            if request.context.operation.starts_with("host_") {
+                return Err(conflict(
+                    "Host operation requires its dedicated repository entry point",
+                ));
+            }
             if request.context.operation != "turn" {
                 return Err(conflict("not a turn"));
             }
@@ -557,6 +562,7 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<(), SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }
             if request.context.operation!="turn" || request.turn.is_none() {
                 return Err(conflict("operation is not a turn"));
             }
@@ -586,6 +592,7 @@ impl SqliteSessionRepository {
                 params![if terminal.failure.is_some(){"failed"}else{"idle"},record.updated_at_ms,encode(&record)?,request.source_id])?;
             tx.execute("UPDATE joint_turns SET terminal_json=?1 WHERE intent_id=?2",params![encode(&terminal)?,admission.intent_id])?;
             tx.execute("UPDATE joint_operations SET stage='settled' WHERE id=?1",[&admission.intent_id])?;
+            tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND active_intent=?1",params![admission.intent_id,admission.binding.binding_id])?;
             release_fences(tx,&admission.intent_id)?;
             Ok(())
         }).await
@@ -597,7 +604,8 @@ impl SqliteSessionRepository {
         admission: JointAdmission,
     ) -> std::result::Result<(), SessionDomainError> {
         self.joint_transaction(move |tx| {
-            let (request,stage,_)=operation(tx,&admission)?;check_fences(tx,&request,&admission)?;
+            let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }check_fences(tx,&request,&admission)?;
             if stage=="compensating" {return Ok(());}
             if !["prepared","accepted","unknown"].contains(&stage.as_str()) {return Err(conflict("operation cannot enter compensation"));}
             let unsettled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_native_steps WHERE intent_id=?1 AND coalesce(json_extract(intent_json,'$.compensation'),0)=0 AND (outcome_json IS NULL OR json_extract(outcome_json,'$.state') NOT IN ('completed','failed','not_sent')))",[&admission.intent_id],|r|r.get(0))?;
@@ -618,6 +626,7 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<Option<JointNativeIntent>, SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }
             check_fences(tx,&request,&admission)?;
             if !["prepared","accepted","unknown","compensating"].contains(&stage.as_str()) {return Err(conflict("joint operation no longer permits sending"));}
             let (intent,outcome):(String,Option<String>)=tx.query_row("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2",
@@ -629,6 +638,9 @@ impl SqliteSessionRepository {
             let changed=tx.execute("UPDATE joint_native_steps SET outcome_json=?1 WHERE intent_id=?2 AND step=?3 AND outcome_json IS NULL",
                 params![encode(&unknown)?,admission.intent_id,step])?;
             if changed!=1 {return Err(conflict("joint send claim changed"));}
+            if request.context.operation=="turn" {
+                tx.execute("UPDATE joint_host_workspace SET epoch=epoch+1,dirty=1,active_intent=?1 WHERE binding_id=?2 AND generation=?3",params![admission.intent_id,admission.binding.binding_id,admission.generation])?;
+            }
             tx.execute("UPDATE joint_operations SET stage=CASE WHEN stage='compensating' THEN stage ELSE 'unknown' END WHERE id=?1",[&admission.intent_id])?;
             Ok(Some(decode(&intent)?))
         }).await
@@ -644,6 +656,11 @@ impl SqliteSessionRepository {
         })?;
         self.joint_transaction(move |tx| {
             let (request, stage, _) = operation(tx, &admission)?;
+            if request.context.operation.starts_with("host_") {
+                return Err(conflict(
+                    "Host operation requires its dedicated repository entry point",
+                ));
+            }
             check_fences(tx, &request, &admission)?;
             if ![
                 "prepared",
@@ -701,7 +718,8 @@ impl SqliteSessionRepository {
             });
         }
         self.joint_transaction(move |tx| {
-            let (request,stage,_)=operation(tx,&admission)?;check_fences(tx,&request,&admission)?;
+            let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }check_fences(tx,&request,&admission)?;
             if !["prepared","accepted","unknown","releasing","compensating"].contains(&stage.as_str()) {return Err(conflict("joint result belongs to a settled operation"));}
             let (native,old):(String,Option<String>)=tx.query_row("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 AND step=?2",
                 params![admission.intent_id,step],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -753,6 +771,7 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<SessionRecord, SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request, stage, old) = operation(tx, &admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }
             let publication = JointPublication::Session {
                 record: record.clone(),
             };
@@ -814,6 +833,11 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<JointCheckpointRecord, SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request, stage, old) = operation(tx, &admission)?;
+            if request.context.operation.starts_with("host_") {
+                return Err(conflict(
+                    "Host operation requires its dedicated repository entry point",
+                ));
+            }
             let publication = JointPublication::Checkpoint {
                 record: record.clone(),
             };
@@ -870,6 +894,7 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<(), SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }
             let expected=match (reference_kind.as_str(),request.context.operation.as_str()) {
                 ("session","close") => request.context.source_runtime_id.as_deref(),
                 ("checkpoint","delete_checkpoint") => request.context.checkpoint_id.as_deref(),
@@ -908,6 +933,7 @@ impl SqliteSessionRepository {
     ) -> std::result::Result<(), SessionDomainError> {
         self.joint_transaction(move |tx| {
             let (request,stage,_)=operation(tx,&admission)?;
+            if request.context.operation.starts_with("host_") { return Err(conflict("Host operation requires its dedicated repository entry point")); }
             if stage=="compensated" {return Ok(());}
             check_fences(tx,&request,&admission)?;
             let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_bindings WHERE id=?1 AND state IN ('prepared','compensating') AND creation_intent=?2)",
@@ -969,7 +995,7 @@ impl SqliteSessionRepository {
         &self,
     ) -> std::result::Result<Vec<JointPendingOperation>, SessionDomainError> {
         self.joint_transaction(|tx| {
-            let rows=tx.prepare("SELECT id,request_json,admission_json,stage FROM joint_operations WHERE stage NOT IN ('published','released','compensated','settled') ORDER BY id")?
+            let rows=tx.prepare("SELECT id,request_json,admission_json,stage FROM joint_operations WHERE stage NOT IN ('published','released','compensated','settled') OR id IN (SELECT intent_id FROM joint_host_intents WHERE json_extract(body,'$.cleanup_state')='pending') ORDER BY id")?
                 .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter().map(|(id,request,admission,stage)| {
                 let native=tx.prepare("SELECT intent_json,outcome_json FROM joint_native_steps WHERE intent_id=?1 ORDER BY step")?

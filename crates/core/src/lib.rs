@@ -4,6 +4,7 @@
 
 pub mod application;
 pub mod domain;
+pub mod joint_host;
 pub mod joint_lifecycle;
 pub mod joint_store;
 pub mod orphan_reaper;
@@ -12,6 +13,7 @@ pub mod prompt_utils;
 pub mod reclaim_sweeper;
 pub mod security;
 pub mod session_lease;
+mod sqlite_host;
 mod sqlite_joint;
 pub mod sqlite_repository;
 pub mod turn_cancellation;
@@ -25,6 +27,7 @@ pub use application::{
     TurnIdGenerator,
 };
 pub use domain::*;
+pub use joint_host::*;
 pub use joint_lifecycle::*;
 pub use joint_store::*;
 pub use orphan_reaper::{spawn_orphan_reaper, spawn_orphan_reaper_with_config, OrphanReaperConfig};
