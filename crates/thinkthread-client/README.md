@@ -146,6 +146,10 @@ checkpoints or public close.
 
 ## Server-side execution profiles
 
+The default pi/xiaoo daemon does not acquire a deployment guard or inspect a
+`deployment-locks` directory. Deployment locks apply to explicit ThinkThread
+profile assembly.
+
 On Linux, `profile` provides an explicit research assembly around the existing
 joint lifecycle. Parse `ExecutionProfile` strictly, verify it against an
 independently trusted `DeploymentManifest`, then construct frozen `ProfileRevision`
@@ -159,7 +163,11 @@ its private lock namespace and managed directories first. The guard holds OS
 object locks on the database, managed roots and their ancestors for its lifetime;
 consistent database copies retain the same identity and lock namespace. It accepts
 only supported local Linux filesystems and rejects changed object identities.
-Keep the guard alive until daemon exit. Locks establish local writer ownership;
+Shared ancestor locks prevent nested resource claims and detect parent replacement;
+the filesystem allowlist applies to exclusively protected objects. A bound
+repository checks identity before joint and split writes, including snapshot
+intents and checkpoints. Detected identity changes permanently invalidate that
+holder. Keep the guard alive until daemon exit. Locks establish local writer ownership;
 they provide no evidence that a previous backend operation stopped.
 
 Supply a `DeploymentBudgetConfiguration` with a stable policy reference, finite
@@ -174,7 +182,9 @@ capacity and do not introduce a new recovery allocation protocol.
 
 Register server bearer/database/operations secrets with
 `guard.protect_server_values` before assembly. They are prohibited from selected
-Host environments as well as stored content. Management/model secret values stay
+Host environments as well as stored content. Public error projections and audit
+fields redact registered values even when Session lookup fails before profile
+admission. Registrations expire with their owning deployment value sets. Management/model secret values stay
 in the explicitly selected Host environment; the profile records only environment
 keys and secret-version references. The guard rejects known protected values in
 request content and SQLite writes, including nested JSON and encoded binary
@@ -185,6 +195,9 @@ Both profile enablement and joint transactions require explicit opt-in.
 `disabled` is the default admission mode. `experiment` requires a nonexpired
 allowlist entry for the authenticated principal, tenant, revision, release,
 workload and capability subset. Administrator status alone grants no exception.
+Each Message open/turn and Host operation must itself appear in both the fixed
+declaration and its matching permit, even when workload requirements are empty.
+Evidence references must identify the fixed alpha11 release.
 Research configuration must explicitly disable token fuse and retain finite wall
 and expansion bounds. Default MCTS workloads and `production_candidate` are
 refused. Required usage, hard policies, isolation, images, complete event streams

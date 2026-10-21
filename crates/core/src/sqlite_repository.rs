@@ -449,6 +449,8 @@ impl SessionRepository for SqliteSessionRepository {
             return Err(crate::unsupported_joint("publication"));
         }
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let workspace_json = json_encode(&record.workspace)?;
             let isolation_json = json_encode(&record.isolation)?;
@@ -462,6 +464,10 @@ impl SessionRepository for SqliteSessionRepository {
             let conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.validate().map_err(|e| e.to_string())?;
+            }
             let changed = conn
                 .execute(
                     "INSERT INTO sessions (
@@ -525,8 +531,15 @@ impl SessionRepository for SqliteSessionRepository {
         body: serde_json::Value,
     ) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || { conn.lock().unwrap().execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map(|_|()).map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
+        tokio::task::spawn_blocking(move || { let conn = conn.lock().unwrap();
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.validate()?;
+            }
+            conn.execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map(|_|()).map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
     }
     async fn operation_intents(
         &self,
@@ -554,11 +567,16 @@ impl SessionRepository for SqliteSessionRepository {
     }
     async fn delete_operation_intent(&self, id: &str) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            conn.lock()
-                .unwrap()
-                .execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
+            let conn = conn.lock().unwrap();
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.validate()?;
+            }
+            conn.execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
                 .map(|_| ())
                 .map_err(|e| internal_error(e.to_string()))
         })
@@ -570,9 +588,15 @@ impl SessionRepository for SqliteSessionRepository {
         record: crate::CheckpointRecord,
     ) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let runtime_json = json_encode(&record.runtime_state)?; let workspace_json = json_encode(&record.workspace)?; let isolation_json = json_encode(&record.isolation)?; let capabilities_json = json_encode(&record.capabilities)?;
             let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.validate().map_err(|e| e.to_string())?;
+            }
             conn.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; Ok(())
         }).await.map_err(|e| internal_error(format!("sqlite checkpoint save task panicked: {e}")))?;
         result.map_err(|e| internal_error(format!("sqlite checkpoint save failed: {e}")))
@@ -597,11 +621,17 @@ impl SessionRepository for SqliteSessionRepository {
 
     async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<bool, SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let checkpoint_id = checkpoint_id.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
             let conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.validate().map_err(|e| e.to_string())?;
+            }
             conn.execute(
                 "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
                 params![checkpoint_id],

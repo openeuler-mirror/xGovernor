@@ -268,7 +268,7 @@ impl ExecutionProfile {
             || !safe_ref(&self.deployment_id)
             || !safe_ref(&self.context_ref)
             || !safe_ref(&self.tt_profile_ref)
-            || !safe_ref(&self.release_ref)
+            || self.release_ref != "alpha11"
             || !safe_ref(&declaration.declaration_id)
             || declaration.public_contract_refs.is_empty()
             || !declaration.public_contract_refs.iter().all(|v| safe_ref(v))
@@ -291,7 +291,10 @@ impl ExecutionProfile {
                 .any(|cap| !cap.supported())
             || declaration.evidence_refs.keys().collect::<BTreeSet<_>>()
                 != declaration.operation_subset.iter().collect::<BTreeSet<_>>()
-            || declaration.evidence_refs.values().any(|v| !safe_ref(v))
+            || declaration
+                .evidence_refs
+                .values()
+                .any(|v| !safe_ref(v) || !v.starts_with("alpha11/"))
         {
             return Err(denied());
         }
@@ -303,16 +306,22 @@ impl ExecutionProfile {
         tenant: &str,
         now_ms: u64,
         new_open: bool,
+        operation: &Capability,
     ) -> Result<(), SessionDomainError> {
+        if self.workload == Workload::DefaultMcts {
+            return Err(unsupported_joint(
+                "default_workload_requires_trusted_usage_and_hard_policy",
+            ));
+        }
         if new_open && !self.enabled
             || self.admission_mode != AdmissionMode::Experiment
-            || self.workload != Workload::Research
             || self.policy != RolePolicy::default()
             || self.research_limits.token_fuse_enabled
             || self.research_limits.wall_timeout_ms == 0
             || self.research_limits.wall_timeout_ms > 300_000
             || self.research_limits.expansion_bound == 0
             || self.research_limits.expansion_bound > u32::MAX as u64
+            || !self.declaration.operation_subset.contains(operation)
             || !self
                 .required_capabilities
                 .is_subset(&self.declaration.operation_subset)
@@ -320,7 +329,8 @@ impl ExecutionProfile {
             return Err(denied());
         }
         if !self.experiment_allowlist.iter().any(|permit| {
-            safe_ref(&permit.approval_ref)
+            permit.capability_subset.contains(operation)
+                && safe_ref(&permit.approval_ref)
                 && permit.principal == principal
                 && permit.tenant_key == tenant
                 && permit.profile_revision == self.revision
@@ -436,6 +446,7 @@ impl ProfileRevision {
         context: &JointOperationContext,
         now_ms: u64,
         new_open: bool,
+        operation: &Capability,
     ) -> Result<(), SessionDomainError> {
         if context.configuration_revision != self.profile.revision
             || context.owner_ref
@@ -449,8 +460,13 @@ impl ProfileRevision {
         {
             return Err(denied());
         }
-        self.profile
-            .admit(&context.principal, &context.owner_ref, now_ms, new_open)
+        self.profile.admit(
+            &context.principal,
+            &context.owner_ref,
+            now_ms,
+            new_open,
+            operation,
+        )
     }
 }
 /// Explicit test/research assembly. It does not register a production backend.
@@ -617,6 +633,7 @@ impl SessionEnvironmentNormalizer for ProfileRouter {
             &context.owner_ref(),
             self.clock.now_ms(),
             true,
+            &Capability::Message,
         )?;
         self.guard
             .validate_bytes(&serde_json::to_vec(request).map_err(|_| denied())?)?;
@@ -680,7 +697,7 @@ impl JointSessionLifecycle for ProfileRouter {
             &selected.profile.revision,
             &selected.digest,
         )?;
-        selected.context(&context, self.clock.now_ms(), true)?;
+        selected.context(&context, self.clock.now_ms(), true, &Capability::Message)?;
         self.guard
             .validate_bytes(&serde_json::to_vec(&input.request).map_err(|_| denied())?)?;
         selected.profile.normalize_request(&input.request)?;
@@ -704,7 +721,7 @@ impl JointSessionLifecycle for ProfileRouter {
     ) -> Result<JointTurnSubmission, SessionDomainError> {
         self.check_repository(&repository)?;
         let selected = self.record(&session)?;
-        selected.context(&context, self.clock.now_ms(), false)?;
+        selected.context(&context, self.clock.now_ms(), false, &Capability::Message)?;
         if request.llm.is_some()
             || request.reasoning_effort.is_some()
             || !request.ext.is_empty()
@@ -733,7 +750,13 @@ impl JointSessionLifecycle for ProfileRouter {
     ) -> Result<JointHostAccess, SessionDomainError> {
         self.check_repository(&repository)?;
         let selected = self.record(&session)?;
-        selected.context(&context, self.clock.now_ms(), false)?;
+        let capability = match &request {
+            JointHostRequest::Exec { .. } => Capability::HostExec,
+            JointHostRequest::Read { .. } => Capability::HostRead,
+            JointHostRequest::Write { .. } => Capability::HostWrite,
+            JointHostRequest::Export { .. } => return Err(denied()),
+        };
+        selected.context(&context, self.clock.now_ms(), false, &capability)?;
         match &request {
             JointHostRequest::Write { content, path, .. } => {
                 self.guard.validate_bytes(content)?;
@@ -761,36 +784,6 @@ impl JointSessionLifecycle for ProfileRouter {
                         .validate_bytes(&serde_json::to_vec(extra).map_err(|_| denied())?)?;
                 }
             }
-        }
-        let capability = match &request {
-            JointHostRequest::Exec { .. } => Capability::HostExec,
-            JointHostRequest::Read { .. } => Capability::HostRead,
-            JointHostRequest::Write { .. } => Capability::HostWrite,
-            JointHostRequest::Export { .. } => return Err(denied()),
-        };
-        if !selected
-            .profile
-            .declaration
-            .operation_subset
-            .contains(&capability)
-            || !selected.profile.experiment_allowlist.iter().any(|p| {
-                p.principal == context.principal
-                    && p.tenant_key == context.owner_ref
-                    && p.profile_revision == selected.profile.revision
-                    && p.release_ref == selected.profile.release_ref
-                    && p.workload == selected.profile.workload
-                    && safe_ref(&p.approval_ref)
-                    && self.clock.now_ms() < p.expires_at_ms
-                    && p.capability_subset.contains(&capability)
-                    && p.capability_subset
-                        .is_subset(&selected.profile.declaration.operation_subset)
-                    && selected
-                        .profile
-                        .required_capabilities
-                        .is_subset(&p.capability_subset)
-            })
-        {
-            return Err(denied());
         }
         selected
             .owner

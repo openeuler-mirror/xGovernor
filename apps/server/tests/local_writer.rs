@@ -44,35 +44,8 @@ fn wait_listening(daemon: &mut Daemon, address: &str) {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
-fn wait_rejected(daemon: &mut Daemon) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = daemon.0.try_wait().unwrap() {
-            assert!(!status.success());
-            use std::io::Read;
-            let mut error = String::new();
-            daemon
-                .0
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut error)
-                .unwrap();
-            assert!(
-                error.contains("local deployment ownership unavailable"),
-                "{error}"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "duplicate daemon was not rejected"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
 #[tokio::test]
-async fn daemon_assembly_excludes_duplicate_writers_and_preserves_existing_sessions() {
+async fn legacy_daemon_ignores_deployment_lock_layout_without_a_profile() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");
     let database = data.join("xgovernor.db");
@@ -122,8 +95,26 @@ async fn daemon_assembly_excludes_duplicate_writers_and_preserves_existing_sessi
     drop(listener);
     let mut first = spawn(&data, &address);
     wait_listening(&mut first, &address);
-    let mut duplicate = spawn(&data, "127.0.0.1:0");
-    wait_rejected(&mut duplicate);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let duplicate_address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let mut duplicate = spawn(&data, &duplicate_address);
+    wait_listening(&mut duplicate, &duplicate_address);
+    drop(duplicate);
+    assert!(!data.join("deployment-locks").exists());
+    drop(first);
+    use std::os::unix::fs::PermissionsExt;
+    let namespace = data.join("deployment-locks");
+    std::fs::create_dir(&namespace).unwrap();
+    std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut first = spawn(&data, &address);
+    wait_listening(&mut first, &address);
+    drop(first);
+    std::fs::remove_dir(&namespace).unwrap();
+    // A procfs-backed would-be namespace is an unlisted-filesystem substitute.
+    std::os::unix::fs::symlink("/proc/self", &namespace).unwrap();
+    let mut first = spawn(&data, &address);
+    wait_listening(&mut first, &address);
     let repo = SqliteSessionRepository::open(&database).unwrap();
     assert_eq!(
         repo.get("preserved-session").await.unwrap(),

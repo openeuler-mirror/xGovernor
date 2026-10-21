@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 
 fn unavailable() -> SessionDomainError {
@@ -70,9 +73,10 @@ impl LockedObject {
             use std::os::fd::AsRawFd;
             let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
             // Limit object identity and advisory-lock assumptions to local filesystems.
-            if unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0
-                || ![0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630]
-                    .contains(&filesystem.f_type)
+            if exclusive
+                && (unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0
+                    || ![0xef53, 0x58465342, 0x9123683e, 0x01021994, 0x794c7630]
+                        .contains(&filesystem.f_type))
             {
                 return Err(unavailable());
             }
@@ -116,6 +120,7 @@ impl LockedObject {
 /// Held by assembly until the daemon exits, independently of repository connections.
 /// Resource directories must already exist and must never be replaced while serving.
 pub struct DeploymentGuard {
+    valid: AtomicBool,
     objects: Vec<LockedObject>,
     database_path: PathBuf,
     database_identity: String,
@@ -167,6 +172,8 @@ impl DeploymentGuard {
             if root != &database_path && !canonical.is_dir() {
                 return Err(unavailable());
             }
+            // Shared ancestor locks exclude nested managed roots and detect replaced parents.
+            // Only the exclusively protected objects require the local-filesystem allowlist.
             for (index, path) in canonical.ancestors().enumerate() {
                 let metadata = std::fs::metadata(path).map_err(|_| unavailable())?;
                 let entry = requested
@@ -234,6 +241,7 @@ impl DeploymentGuard {
             .map_err(|_| unavailable())?;
         tx.commit().map_err(|_| unavailable())?;
         let result = Arc::new(Self {
+            valid: AtomicBool::new(true),
             objects,
             database_path,
             database_identity,
@@ -283,8 +291,14 @@ impl DeploymentGuard {
         &self.deployment_id
     }
     pub fn validate(&self) -> Result<(), SessionDomainError> {
+        if !self.valid.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
         for object in &self.objects {
-            object.validate()?;
+            if object.validate().is_err() {
+                self.valid.store(false, Ordering::Release);
+                return Err(unavailable());
+            }
         }
         Ok(())
     }
@@ -378,6 +392,14 @@ impl DeploymentGuard {
         &self,
         values: impl IntoIterator<Item = String>,
     ) -> Result<(), SessionDomainError> {
+        let mut registry = output_registry().lock().map_err(|_| unavailable())?;
+        registry.retain(|entry| entry.strong_count() > 0);
+        if !registry
+            .iter()
+            .any(|entry| entry.ptr_eq(&Arc::downgrade(&self.protected_values)))
+        {
+            registry.push(Arc::downgrade(&self.protected_values));
+        }
         let mut protected = self.protected_values.lock().map_err(|_| unavailable())?;
         protected.extend(values.into_iter().filter(|s| !s.is_empty()));
         Ok(())
@@ -710,6 +732,27 @@ fn contains_protected(bytes: &[u8], values: &BTreeSet<String>, depth: usize) -> 
     }
     false
 }
+type ProtectedValues = Mutex<BTreeSet<String>>;
+fn output_registry() -> &'static Mutex<Vec<Weak<ProtectedValues>>> {
+    static VALUES: OnceLock<Mutex<Vec<Weak<ProtectedValues>>>> = OnceLock::new();
+    VALUES.get_or_init(|| Mutex::new(Vec::new()))
+}
+/// Error and audit paths can run before a particular profile has been selected.
+pub(crate) fn safe_diagnostic(value: &str) -> String {
+    let Ok(mut registry) = output_registry().lock() else {
+        return "[redacted]".into();
+    };
+    registry.retain(|entry| entry.strong_count() > 0);
+    for entry in registry.iter().filter_map(Weak::upgrade) {
+        let Ok(values) = entry.lock() else {
+            return "[redacted]".into();
+        };
+        if contains_protected(value.as_bytes(), &values, 0) {
+            return "[redacted]".into();
+        }
+    }
+    value.into()
+}
 fn budget_hash(reference: &str, budget: &JointBudgetPolicy) -> String {
     crate::host_digest(&serde_json::json!({"policy_ref":reference,"resources":budget}))
 }
@@ -759,7 +802,7 @@ mod tests {
             )
             .unwrap()
         }
-        fn child(&self, database: &Path, resource: &Path, expected: &str) -> Child {
+        pub(super) fn child(&self, database: &Path, resource: &Path, expected: &str) -> Child {
             Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "deployment::tests::writer_child", "--nocapture"])
                 .env("WRITER_TEST_DB", database)
@@ -987,7 +1030,7 @@ mod tests {
         );
         p
     }
-    fn budget(total: u32) -> JointBudgetPolicy {
+    pub(super) fn budget(total: u32) -> JointBudgetPolicy {
         JointBudgetPolicy::from([(
             "session".into(),
             JointResourceBudget {
@@ -996,7 +1039,7 @@ mod tests {
             },
         )])
     }
-    fn wait(child: &mut Child) {
+    pub(super) fn wait(child: &mut Child) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -1146,12 +1189,19 @@ mod tests {
     fn file_directory_and_hardlink_aliases_share_object_locks() {
         let f = Fixture::new();
         let _guard = f.guard();
+        let separate = f.root.path().join("separate");
+        std::fs::create_dir(&separate).unwrap();
+        let before = super::capacity_tests::business_snapshot(&f.database);
         let link = f.root.path().join("db-link");
         std::os::unix::fs::symlink(&f.database, &link).unwrap();
-        wait(&mut f.child(&link, &f.resources[0], "denied"));
+        wait(&mut f.child(&link, &separate, "denied"));
         std::fs::remove_file(&link).unwrap();
         std::fs::hard_link(&f.database, &link).unwrap();
-        wait(&mut f.child(&link, &f.resources[0], "denied"));
+        wait(&mut f.child(&link, &separate, "denied"));
+        assert_eq!(
+            super::capacity_tests::business_snapshot(&f.database),
+            before
+        );
         let other = f.root.path().join("other-db");
         drop(SqliteSessionRepository::open(&other).unwrap());
         let alias = f.root.path().join("resource-link");
@@ -1421,7 +1471,7 @@ mod capacity_tests {
             2
         );
     }
-    fn business_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
+    pub(super) fn business_snapshot(path: &Path) -> Vec<(String, Vec<Vec<String>>)> {
         let connection = rusqlite::Connection::open(path).unwrap();
         let tables:Vec<String>=connection.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name!='local_deployment' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         tables
@@ -1551,5 +1601,120 @@ mod capacity_tests {
         std::fs::rename(&path, f.namespace.join("old-lock")).unwrap();
         std::fs::write(&path, b"").unwrap();
         assert!(guard.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod guarded_writes {
+    use super::tests::{wait, Fixture};
+    use super::*;
+    use crate::SessionRepository;
+    #[tokio::test]
+    async fn replaced_identity_stops_split_and_joint_writes_while_a_copy_competes() {
+        let f = Fixture::new();
+        let guard = f.guard();
+        let repo = guard
+            .bind_split_repository(
+                SqliteSessionRepository::open(&f.database)
+                    .unwrap()
+                    .with_joint_budget_policy(tests::budget(4))
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut record = repo.get("existing-session").await.unwrap().unwrap();
+        record.execution_backing = crate::SessionExecutionBacking::SplitV1;
+        record.runtime_id = "split-original".into();
+        repo.save(record.clone()).await.unwrap();
+        repo.save_operation_intent("kept", serde_json::json!({"original":"input"}))
+            .await
+            .unwrap();
+        let checkpoint = crate::CheckpointRecord {
+            checkpoint_id: "kept-checkpoint".into(),
+            source_runtime_id: record.runtime_id.clone(),
+            provider_snapshot_id: "provider/fixed".into(),
+            runtime_state: record.runtime.clone(),
+            workspace: record.workspace.clone(),
+            isolation: record.isolation.clone(),
+            capabilities: record.capabilities.clone(),
+            owner_ref: crate::ADMIN_OWNER_REF.into(),
+            tenant_id: None,
+            created_by: Some("operator".into()),
+            created_at_ms: 1,
+        };
+        repo.save_checkpoint(checkpoint.clone()).await.unwrap();
+        let copy = f.root.path().join("copy");
+        rusqlite::Connection::open(&f.database)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+        let separate = f.root.path().join("separate");
+        std::fs::create_dir(&separate).unwrap();
+        wait(&mut f.child(&copy, &separate, "denied"));
+        let lock = f
+            .namespace
+            .join(format!("{}.lock", guard.database_identity()));
+        let previous = lock.with_extension("previous");
+        std::fs::rename(&lock, &previous).unwrap();
+        std::fs::write(&lock, []).unwrap();
+        let before = capacity_tests::business_snapshot(&f.database);
+        let copy_before = capacity_tests::business_snapshot(&copy);
+        let mut child = f.child(&copy, &separate, "hold");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !f.root.path().join("signal").exists() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("copy contender did not acquire");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        record.updated_at_ms = 3;
+        assert!(repo.save(record).await.is_err());
+        assert!(repo
+            .save_operation_intent("new", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(repo.delete_operation_intent("kept").await.is_err());
+        let mut changed = checkpoint.clone();
+        changed.checkpoint_id = "new-checkpoint".into();
+        assert!(repo.save_checkpoint(changed).await.is_err());
+        assert!(repo
+            .delete_checkpoint(&checkpoint.checkpoint_id)
+            .await
+            .is_err());
+        assert!(repo.joint_transaction(|_| Ok(())).await.is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+        assert_eq!(capacity_tests::business_snapshot(&copy), copy_before);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::rename(previous, lock).unwrap();
+        assert!(guard.validate().is_err());
+        eprintln!("sample replaced identity/split save+intent+checkpoint+delete/joint/copy contender: original rows and fences retained");
+    }
+    #[test]
+    fn explicit_deployments_reject_wide_namespaces_and_unsupported_resource_filesystems() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let before = capacity_tests::business_snapshot(&f.database);
+        std::fs::set_permissions(&f.namespace, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(DeploymentGuard::acquire(
+            &f.database,
+            "deployment",
+            &f.namespace,
+            &f.resources,
+            &tests::budget(4)
+        )
+        .is_err());
+        std::fs::set_permissions(&f.namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(DeploymentGuard::acquire(
+            &f.database,
+            "deployment",
+            &f.namespace,
+            &[PathBuf::from("/proc/self")],
+            &tests::budget(4)
+        )
+        .is_err());
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
     }
 }

@@ -20,6 +20,9 @@ use xgovernor_thinkthread_client::{
     sdk, ManagementConfig,
 };
 
+#[path = "support/owned_snapshot.rs"]
+mod owned_snapshot;
+
 struct Fixture {
     root: TempDir,
     config: ManagementConfig,
@@ -276,42 +279,26 @@ impl Fixture {
         Connection::open(self.root.path().join("db")).unwrap()
     }
     fn snapshot(&self) -> Vec<(String, Vec<Vec<String>>)> {
-        let c = self.conn();
-        [
-            "joint_fences",
-            "joint_host_allocations",
-            "joint_host_workspace",
-            "joint_refs",
-            "joint_operations",
-            "joint_host_cleanup",
-            "joint_host_dependencies",
-            "joint_reservations",
-            "joint_native_steps",
-            "joint_host_intents",
-            "joint_host_targets",
-            "joint_host_roots",
-            "joint_bindings",
-            "joint_sessions",
-            "joint_objects",
-        ]
-        .iter()
-        .map(|name| {
-            let mut st = c
-                .prepare(&format!("SELECT * FROM {name} ORDER BY 1"))
-                .unwrap();
-            let n = st.column_count();
-            let rows = st
-                .query_map([], |r| {
-                    Ok((0..n)
-                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
-                        .collect())
-                })
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            (name.to_string(), rows)
-        })
-        .collect()
+        let mut snapshot: Vec<_> = owned_snapshot::database(&self.root.path().join("db"))
+            .into_iter()
+            .map(|(name, rows)| (name, serde_json::from_value(rows).unwrap()))
+            .collect();
+        snapshot.push((
+            "directory-tree".into(),
+            vec![vec![serde_json::to_string(&owned_snapshot::tree(
+                self.root.path(),
+                &[
+                    "db",
+                    "db-wal",
+                    "db-shm",
+                    "trace",
+                    "state.json",
+                    "profile-locks",
+                ],
+            ))
+            .unwrap()]],
+        ));
+        snapshot
     }
     async fn intent(&self, id: &str) -> HostIntentV1 {
         self.repo.host_intent(id.into()).await.unwrap()
@@ -574,14 +561,24 @@ async fn read_bytes_framing_records_observed_hash_and_discards_failed_connection
         f.repo.finish_host_cleanup(a.access).await.unwrap();
         f.scenario("ok");
         let a = f.access(&format!("next-{scenario}"), read()).await.unwrap();
-        assert!(a
+        let started = std::time::Instant::now();
+        let next_result = a
             .backend
             .files()
             .read_bytes(ReadBytesRequest {
-                path: BackendPath("artifact".into())
+                path: BackendPath("artifact".into()),
             })
-            .await
-            .is_ok());
+            .await;
+        assert!(
+            next_result.is_ok(),
+            "read follow-up/scenario={scenario}/elapsed={:?}/error={:?}",
+            started.elapsed(),
+            next_result.as_ref().err()
+        );
+        eprintln!(
+            "sample binary framing/scenario={scenario}/follow-up=ok/elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         f.repo.finish_host_cleanup(a.access).await.unwrap();
     }
     let trace: Vec<_> = f

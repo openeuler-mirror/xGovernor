@@ -3772,26 +3772,33 @@ fn audit_log<T>(
     runtime_id: Option<&str>,
     result: &Result<T, SessionDomainError>,
 ) {
+    #[cfg(unix)]
+    let safe = crate::deployment::safe_diagnostic;
+    #[cfg(not(unix))]
+    let safe = |value: &str| value.to_owned();
+    let principal = safe(&ctx.principal);
+    let tenant = safe(ctx.tenant_id().unwrap_or("-"));
+    let runtime_id = safe(runtime_id.unwrap_or("-"));
     match result {
         Ok(_) => {
             tracing::info!(
                 target: "audit",
-                principal = %ctx.principal,
-                tenant = ctx.tenant_id().unwrap_or("-"),
+                principal = %principal,
+                tenant = %tenant,
                 operation,
-                runtime_id = runtime_id.unwrap_or("-"),
+                runtime_id = %runtime_id,
                 result = "ok",
             );
         }
         Err(error) => {
             tracing::info!(
                 target: "audit",
-                principal = %ctx.principal,
-                tenant = ctx.tenant_id().unwrap_or("-"),
+                principal = %principal,
+                tenant = %tenant,
                 operation,
-                runtime_id = runtime_id.unwrap_or("-"),
+                runtime_id = %runtime_id,
                 result = "error",
-                error = %error,
+                error = %safe(&error.to_string()),
             );
         }
     }
