@@ -77,7 +77,7 @@ impl CandidateHostOwner {
             return Err(host_unavailable("persisted Host owner changed"));
         }
         if let Some(result) = h.result {
-            return Ok(result);
+            return result_value(result);
         }
         CandidateHostBackend::new(
             self.config.clone(),
@@ -309,15 +309,14 @@ impl CandidateHostBackend {
             && matches!(self.prepared.request, HostCanonicalRequestV1::Write { .. })
             && h.observations[0].is_none()
         {
-            return Err(host_unavailable(
-                "unclaimed write has no retained payload; no send attempted",
-            ));
+            return self
+                .fail_before_claim("unclaimed write has no retained payload; no send attempted")
+                .await;
         }
-        let client = self
-            .config
-            .connect()
-            .await
-            .map_err(|_| host_unavailable("Host connection failed"))?;
+        let client = match self.config.connect().await {
+            Ok(client) => client,
+            Err(_) => return self.fail_before_claim("Host connection failed").await,
+        };
         let result =
             tokio::time::timeout(self.observation_timeout, self.observe(&client, content)).await;
         let _ = client.close().await;
@@ -327,6 +326,9 @@ impl CandidateHostBackend {
                 let current = store(&self.repository)?
                     .host_intent(self.access.admission.intent_id.clone())
                     .await?;
+                if current.observations.iter().all(Option::is_none) {
+                    return self.fail_before_claim(&error.to_string()).await;
+                }
                 if current.state != "unknown"
                     && current.observations[0].as_ref().is_some_and(|o| !o.settled)
                 {
@@ -335,11 +337,30 @@ impl CandidateHostBackend {
                 Err(error)
             }
             Err(_) => {
-                // The durable send claim already says unknown if observation was interrupted.
-                self.unknown("Host observation timed out; original intent retained")
-                    .await
+                let current = repository
+                    .host_intent(self.access.admission.intent_id.clone())
+                    .await?;
+                if current.observations.iter().all(Option::is_none) {
+                    self.fail_before_claim("Host target observation timed out before send")
+                        .await
+                } else {
+                    self.unknown("Host observation timed out; original intent retained")
+                        .await
+                }
             }
         }
+    }
+    async fn fail_before_claim(&self, message: &str) -> Result<Value, SessionDomainError> {
+        let repository = store(&self.repository)?;
+        let current = repository
+            .host_intent(self.access.admission.intent_id.clone())
+            .await?;
+        if current.observations.iter().all(Option::is_none) {
+            repository
+                .finish_host(self.access.clone(), json!({"error":message}))
+                .await?;
+        }
+        Err(host_unavailable(message))
     }
     async fn observe(
         &self,
@@ -478,16 +499,13 @@ impl CandidateHostBackend {
         Err(host_unavailable(message))
     }
     fn error_observation(&self, e: sdk::ManagementError, read: bool) -> HostObservationV1 {
-        let settled = read
-            || matches!(
-                &e,
-                sdk::ManagementError::Rejected(_)
-                    | sdk::ManagementError::Configuration(_)
-                    | sdk::ManagementError::Transport {
-                        delivery: sdk::Delivery::NotSent,
-                        ..
-                    }
-            );
+        let recovery_required = matches!(&e, sdk::ManagementError::Rejected(body)
+            if body.code == "NeedsRecovery" || body.code == "OperationInProgress");
+        let settled = read || (!recovery_required && e.delivery() == Some(sdk::Delivery::NotSent));
+        let native_outcome = match &e {
+            sdk::ManagementError::Rejected(body) => Some(json!({"error":body})),
+            _ => None,
+        };
         HostObservationV1 {
             state: if settled {
                 NativeOperationState::Failed
@@ -499,7 +517,7 @@ impl CandidateHostBackend {
             transfer: self.transfer(if settled { "failed" } else { "unknown" }, None),
             exec: None,
             error: Some(e.to_string()),
-            native_outcome: None,
+            native_outcome,
         }
     }
     fn validate_handle(&self, handle: &sdk::OperationHandle) -> Result<(), SessionDomainError> {

@@ -22,8 +22,8 @@ def reply(req, result=None, error=None):
     sys.stdout.buffer.write(struct.pack('>I', len(data)) + data)
     sys.stdout.buffer.flush()
 
-def reject(req, code):
-    reply(req, error={'code': code, 'message': code, 'retryable': False, 'delivery': 'accepted'})
+def reject(req, code, delivery="accepted"):
+    reply(req, error={'code': code, 'message': code, 'retryable': False, 'delivery': delivery})
 
 def handle(params):
     return {'scope': 'thinkthread', 'operationId': params['operationId'], 'operationDigest': params['operationDigest']}
@@ -53,9 +53,12 @@ while True:
     elif method == 'context.bind':
         reply(req, {'bound': True})
     elif method == 'thinkthread.get':
+        if scenario == 'get-rejected':
+            reject(req, 'NotReady'); continue
+        if scenario == 'get-hang': time.sleep(20); sys.exit(0)
         reply(req, {'thinkthreadId': params['thinkthreadId'], 'rootId': 'native-root', 'parentId': 'native-root',
                     'state': 'Running', 'sessionState': 'Ready', 'agent': 'fixture', 'fs': os.environ['XG_TEST_FS'],
-                    'fsBranchId': 'private-branch', 'contentRevision': '1', 'needsRecovery': False})
+                    'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' else 'private-branch', 'contentRevision': '1', 'needsRecovery': False})
     elif method == 'thinkthread.read':
         data = base64.b64decode(current.get('files', {}).get(params['path'], '')) if params['path'] in current.get('files', {}) else bytes(range(256)) * 513 + b'\x00\xfftail'
         if scenario == 'empty':
@@ -84,7 +87,9 @@ while True:
                 break
             data.extend(sys.stdin.buffer.read(n))
         if scenario in ('checksum-reject', 'length-reject', 'rejected-write'):
-            reject(req, {'checksum-reject': 'ChecksumMismatch', 'length-reject': 'LengthMismatch', 'rejected-write': 'FileWriteRejected'}[scenario]); continue
+            reject(req, {'checksum-reject': 'ChecksumMismatch', 'length-reject': 'LengthMismatch', 'rejected-write': 'FileWriteRejected'}[scenario], 'not_sent'); continue
+        if scenario == 'mutation-rejected':
+            reject(req, current['error_code'], current['delivery']); continue
         assert len(data) == params['byteLength']
         assert hashlib.sha256(data).hexdigest() == params['sha256']
         current.setdefault('files', {})[params['path']] = base64.b64encode(data).decode()
@@ -96,6 +101,8 @@ while True:
         if scenario == 'wrong-handle': result['operation']['operationId'] = 'wrong'
         reply(req, result)
     elif method == 'thinkthread.exec':
+        if scenario == 'mutation-rejected':
+            reject(req, current['error_code'], current['delivery']); continue
         if scenario == 'drop': sys.exit(0)
         if scenario == 'hang': time.sleep(20); sys.exit(0)
         reply(req, exec_result(params, current))

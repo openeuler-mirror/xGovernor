@@ -132,6 +132,11 @@ native mutation UUID. Mutation claims set the local workspace dirty before
 sending; EOF, an observation timeout, a missing operation or `needs_recovery`
 retains ownership and the fence. Recovery queries the original UUID and checks
 the SDK digest and exact target without sending a replacement mutation.
+Rejected mutations settle only with `delivery=not_sent`; `NeedsRecovery` and
+`OperationInProgress` retain the blocker even with that delivery value. Failures
+before the first durable claim finish without sending and release their local
+reservation and Root hold. Replaying a committed failure preserves its error
+classification.
 
 The pinned SDK owns raw file framing. Read lengths and hashes are local
 observations; expected write lengths/hashes describe the original input.
@@ -151,6 +156,8 @@ record atomically. Suspension removes the execution fence and delegation while
 retaining ownership, resource accounting and the Root hold. Resume requires
 released dependencies and valid ownership/configuration, obtains a fresh epoch,
 and atomically restores the parent and child. Legacy journal/publication/release
-entry points reject these records. Committing a Host result also records a
-pending owned cleanup item, so a lost commit acknowledgement cannot lose the
-result or permit a duplicate release.
+entry points reject these records. The intent stores the blocker, suspended
+cleanup plan identity and stage to resume. Source close admission is rejected
+while its cleanup is suspended, keeping that binding available for resumption.
+Committing a sent Host result also records a pending owned cleanup item, so a
+lost commit acknowledgement cannot lose the result or permit a duplicate release.

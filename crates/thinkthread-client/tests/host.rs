@@ -278,6 +278,15 @@ impl Fixture {
             "joint_refs",
             "joint_operations",
             "joint_host_cleanup",
+            "joint_host_dependencies",
+            "joint_reservations",
+            "joint_native_steps",
+            "joint_host_intents",
+            "joint_host_targets",
+            "joint_host_roots",
+            "joint_bindings",
+            "joint_sessions",
+            "joint_objects",
         ]
         .iter()
         .map(|name| {
@@ -345,6 +354,14 @@ async fn exact_target_and_public_write_avoid_created_and_local_fallback() {
     assert!(a.target.source_checkpoint_id.is_none() && a.target.source_pair_ref.is_none());
     let h = f.intent("write").await;
     assert_eq!(h.state, "completed");
+    assert!(h.prepared.target.source_checkpoint_id.is_none());
+    assert!(h.prepared.target.source_pair_ref.is_none());
+    let persisted: HostIntentV1 = repository(&f.root.path().join("db"))
+        .host_intent("write".into())
+        .await
+        .unwrap();
+    assert!(persisted.prepared.target.source_checkpoint_id.is_none());
+    assert!(persisted.prepared.target.source_pair_ref.is_none());
     assert!(h.result.unwrap().get("created").is_none());
     assert!(matches!(
         a.backend
@@ -391,6 +408,7 @@ async fn identity_configuration_and_generation_rejections_are_side_effect_free()
         let f=Fixture::new().await;f.conn().execute(sql,[]).unwrap();let before=f.snapshot();assert!(f.access("wrong",read()).await.is_err(),"{sql}");assert_eq!(before,f.snapshot());assert_eq!(f.count("thinkthread.read"),0);
     }
     let f = Fixture::new().await;
+    let before = f.snapshot();
     let mut c = f.context("cross");
     c.tenant_id = Some("b".into());
     c.owner_ref = "tenant/b".into();
@@ -399,6 +417,19 @@ async fn identity_configuration_and_generation_rejections_are_side_effect_free()
         .prepare_host_operation(c, f.record.clone(), read(), f.repo.clone())
         .await
         .is_err());
+    assert_eq!(before, f.snapshot());
+    assert_eq!(
+        f.count("thinkthread.read") + f.count("thinkthread.write") + f.count("thinkthread.exec"),
+        0
+    );
+    let f = Fixture::new().await;
+    f.conn().execute("INSERT INTO joint_bindings VALUES('other-binding','candidate-fixture','fixed','fixture','tenant/a','native-root',1,'active','other-open','root-binding')",[]).unwrap();
+    f.conn().execute("INSERT INTO joint_objects VALUES('other-binding',1,'native-root','branch','valid-other-branch',0)",[]).unwrap();
+    f.conn().execute("UPDATE joint_host_targets SET target_json=json_set(target_json,'$.branch_id','valid-other-branch')",[]).unwrap();
+    let before = f.snapshot();
+    assert!(f.access("other-branch", write(vec![1])).await.is_err());
+    assert_eq!(before, f.snapshot());
+    assert_eq!(f.count("thinkthread.write"), 0);
 }
 #[tokio::test]
 async fn complete_preflight_denies_paths_modes_env_extra_and_limits_without_mutation() {
@@ -565,7 +596,10 @@ async fn write_rejections_preserve_expected_hash_and_reconnect() {
         let id = format!("write-{scenario}");
         let r = write(vec![0, 255, 42]);
         let a = f.access(&id, r.clone()).await.unwrap();
-        assert!(a.backend.write_host(r).await.is_err());
+        assert!(matches!(
+            a.backend.write_host(r).await,
+            Err(SessionDomainError::Unavailable { .. })
+        ));
         let h = f.intent(&id).await;
         assert_eq!(h.state, "failed");
         let t = h.observations[0]
@@ -624,8 +658,33 @@ async fn exec_preserves_argv_cwd_timeout_and_native_reason_code() {
         let o = h.observations[0].as_ref().unwrap().exec.as_ref().unwrap();
         assert_eq!(o.reason, reason);
         assert_eq!(o.code, code);
+        assert_eq!(o.stdout_len, if reason == "output_limit" { 7 } else { 3 });
+        assert_eq!(o.stderr_len, 3);
+        assert_eq!(o.timed_out, reason == "timeout");
+        let snapshot = f.snapshot();
+        let persisted = repository(&f.root.path().join("db"))
+            .host_intent("exec".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&h).unwrap(),
+            serde_json::to_value(persisted).unwrap()
+        );
+        assert_eq!(snapshot, f.snapshot());
+        if reason == "cancelled" {
+            let raw = h.observations[0]
+                .as_ref()
+                .unwrap()
+                .native_outcome
+                .as_ref()
+                .unwrap();
+            assert_eq!(raw["reason"], "cancelled");
+            assert!(!o.timed_out);
+            assert!(h.result.is_none());
+        }
         if !success {
             assert_eq!(h.state, "unknown");
+            assert!(h.blocker_id.is_some());
             assert!(f.access("blocked", write(vec![])).await.is_err());
             assert!(f.repo.finish_host(a.access, json!({})).await.is_err());
         }
@@ -661,6 +720,17 @@ async fn unknown_mutations_query_only_original_uuid_and_retain_fences_until_evid
     assert!(a.backend.write_host(r).await.is_err());
     let h = f.intent("lost").await;
     assert_eq!(h.state, "unknown");
+    assert_eq!(
+        f.conn()
+            .query_row(
+                "SELECT dirty FROM joint_host_workspace WHERE binding_id='live-binding'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert!(h.blocker_id.is_some());
     let token = a.access.clone();
     let before = f.snapshot();
     drop(a);
@@ -690,7 +760,35 @@ async fn unknown_mutations_query_only_original_uuid_and_retain_fences_until_evid
         assert!(f.access("new", write(vec![])).await.is_err());
     }
     assert_eq!(f.count("thinkthread.write"), 1);
-    assert_eq!(before, f.snapshot());
+    let after = f.snapshot();
+    // Recovery may append evidence and replace the original step observation only.
+    for ((name, old), (after_name, new)) in before.iter().zip(&after) {
+        assert_eq!(name, after_name);
+        if name == "joint_host_intents" {
+            continue;
+        }
+        if name == "joint_native_steps" {
+            assert_eq!(old.len(), 1);
+            assert_eq!(new.len(), 1);
+            assert_eq!(
+                old.iter().map(|r| &r[..5]).collect::<Vec<_>>(),
+                new.iter().map(|r| &r[..5]).collect::<Vec<_>>()
+            );
+        } else {
+            assert_eq!(old, new, "{name}");
+        }
+    }
+    let recovered = f.intent("lost").await;
+    assert!(recovered
+        .recovery_evidence
+        .starts_with(&h.recovery_evidence));
+    let mut original = serde_json::to_value(h).unwrap();
+    let mut recovered = serde_json::to_value(recovered).unwrap();
+    for value in [&mut original, &mut recovered] {
+        value.as_object_mut().unwrap().remove("recovery_evidence");
+        value.as_object_mut().unwrap().remove("observations");
+    }
+    assert_eq!(original, recovered);
     f.scenario("ok");
     assert_eq!(
         f.owner()
@@ -738,8 +836,21 @@ async fn observation_timeout_is_unknown_and_has_no_retry_or_cleanup() {
         let f = Fixture::new().await;
         f.scenario(scenario);
         let a = f.access("interrupted", execute(exec())).await.unwrap();
-        assert!(a.backend.exec().exec(exec()).await.is_err());
+        assert!(matches!(
+            a.backend.exec().exec(exec()).await,
+            Err(OperationError::Transport { .. })
+        ));
         let h = f.intent("interrupted").await;
+        assert_eq!(h.state, "unknown");
+        assert!(h
+            .blocker_id
+            .as_deref()
+            .is_some_and(|id| id.contains("interrupted")));
+        let reopened = repository(&f.root.path().join("db"))
+            .host_intent("interrupted".into())
+            .await
+            .unwrap();
+        assert_eq!(reopened.blocker_id, h.blocker_id);
         assert!(h.result.is_none());
         assert!(!h.observations[0].as_ref().unwrap().settled);
         assert!(f.repo.finish_host(a.access, json!({})).await.is_err());
@@ -816,6 +927,23 @@ async fn create_parents_preflights_both_steps_without_executing_helpers() {
         mode: WriteMode::Overwrite,
         create_parents: true,
     };
+    let single = f.access("single", write(vec![1])).await.unwrap();
+    let h = f.intent("single").await;
+    assert_eq!(h.steps.len(), 1);
+    assert_eq!(h.prepared.native.len(), 1);
+    assert_eq!(h.steps[0].method, "thinkthread.write");
+    assert_eq!(
+        f.conn()
+            .query_row(
+                "SELECT count(*) FROM joint_native_steps WHERE intent_id='single'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        1
+    );
+    single.backend.write_host(write(vec![1])).await.unwrap();
+    let writes_before = f.count("thinkthread.write");
     let a = f.access("parents", r.clone()).await.unwrap();
     let h = f.intent("parents").await;
     assert_eq!(h.prepared.native.len(), 2);
@@ -832,6 +960,13 @@ async fn create_parents_preflights_both_steps_without_executing_helpers() {
         a.backend.write_host(r.clone()).await,
         Err(SessionDomainError::UnsupportedCapability { .. })
     ));
+    let snapshot = f.snapshot();
+    let reopened = repository(&f.root.path().join("db"));
+    assert!(matches!(
+        f.owner().recover_host("parents".into(), reopened).await,
+        Err(SessionDomainError::UnsupportedCapability { .. })
+    ));
+    assert_eq!(snapshot, f.snapshot());
     let mut timeout = f.policy.clone();
     timeout.mkdir_timeout_ms = 300001;
     let mut items = f.policy.clone();
@@ -867,7 +1002,7 @@ async fn create_parents_preflights_both_steps_without_executing_helpers() {
         .iter()
         .all(|s| s.original_uuid.is_some() && s.target_digest == a.access.target_digest));
     assert_eq!(f.count("thinkthread.exec"), 0);
-    assert_eq!(f.count("thinkthread.write"), 0);
+    assert_eq!(f.count("thinkthread.write"), writes_before);
 }
 
 fn settled_write() -> HostObservationV1 {
@@ -887,6 +1022,16 @@ async fn cleanup_suspension_is_atomic_persistent_and_rejects_direct_legacy_entri
     let a = f.access("parent", write(vec![1])).await.unwrap();
     let token = a.access;
     assert!(f.repo.claim_host_step(token.clone(), 0).await.unwrap());
+    assert_eq!(
+        f.conn()
+            .query_row(
+                "SELECT dirty FROM joint_host_workspace WHERE binding_id='live-binding'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        1
+    );
     f.repo
         .record_host_step(token.clone(), 0, settled_write())
         .await
@@ -904,7 +1049,56 @@ async fn cleanup_suspension_is_atomic_persistent_and_rejects_direct_legacy_entri
     assert!(f.repo.suspend_host_cleanup(token.clone()).await.is_err());
     assert_eq!(snapshot, f.snapshot());
     f.conn().execute_batch("DROP TRIGGER fail_suspend").unwrap();
+    // These Host entries are valid before suspension; their rejection below is stage-specific.
+    assert!(!f.repo.claim_host_step(token.clone(), 0).await.unwrap());
+    f.repo
+        .record_host_step(token.clone(), 0, settled_write())
+        .await
+        .unwrap();
     f.repo.suspend_host_cleanup(token.clone()).await.unwrap();
+    let observer = f.conn();
+    observer.execute_batch("BEGIN").unwrap();
+    let stages: Vec<String> = observer
+        .prepare("SELECT stage FROM joint_operations WHERE id IN ('parent','child') ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stages, vec!["suspended_waiting_dependency"; 2]);
+    let plan: (String, u32) = observer
+        .query_row(
+            "SELECT state,delegated FROM joint_host_cleanup WHERE parent_id='parent'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(plan, ("waiting_dependency".into(), 0));
+    assert_eq!(
+        observer
+            .query_row(
+                "SELECT holder FROM joint_fences WHERE kind='source' AND id='live'",
+                [],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .unwrap(),
+        None
+    );
+    let body: String = observer
+        .query_row(
+            "SELECT body FROM joint_host_intents WHERE intent_id='parent'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let suspended: HostIntentV1 = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        suspended.suspended_cleanup_plan_id.as_deref(),
+        Some("child")
+    );
+    assert_eq!(suspended.resume_joint_stage.as_deref(), Some("accepted"));
+    assert!(suspended.blocker_id.is_some());
+    observer.execute_batch("COMMIT").unwrap();
     let snapshot = f.snapshot();
     let repo = repository(&f.root.path().join("db"));
     assert_eq!(
@@ -959,17 +1153,34 @@ async fn cleanup_suspension_is_atomic_persistent_and_rejects_direct_legacy_entri
             Err(SessionDomainError::Conflict { .. })
         ));
     }
-    assert!(repo.claim_host_step(token.clone(), 0).await.is_err());
-    assert!(repo
+    let error = repo.claim_host_step(token.clone(), 0).await.unwrap_err();
+    assert!(
+        error.to_string().contains("Host operation is not active"),
+        "{error}"
+    );
+    let error = repo
         .record_host_step(token.clone(), 0, settled_write())
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Host operation is not active"),
+        "{error}"
+    );
     assert!(repo
         .finish_host(token.clone(), json!({"bytes_written":1}))
         .await
         .is_err());
     assert!(repo.finish_host_cleanup(token.clone()).await.is_err());
     assert!(repo.resume_host_cleanup(token.clone()).await.is_err());
+    let close = close_request(&f, "close");
+    let error = repo
+        .prepare_joint_operation(close.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("suspended Host cleanup"),
+        "{error}"
+    );
     assert_eq!(snapshot, f.snapshot());
     repo.release_host_dependency(token.clone(), "bytes-reference".into())
         .await
@@ -1018,6 +1229,27 @@ async fn cleanup_suspension_is_atomic_persistent_and_rejects_direct_legacy_entri
     let done = f.snapshot();
     repo.finish_host_cleanup(new).await.unwrap();
     assert_eq!(done, f.snapshot());
+    assert_eq!(
+        f.conn()
+            .query_row(
+                "SELECT count(*) FROM joint_host_allocations WHERE state!='released'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.conn()
+            .query_row(
+                "SELECT count(*) FROM joint_refs WHERE kind='host_hold'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+        0
+    );
+    repo.prepare_joint_operation(close).await.unwrap();
 }
 #[tokio::test]
 async fn unknown_and_capacity_cannot_be_released_or_suspended() {
@@ -1564,4 +1796,306 @@ async fn committed_result_and_cleanup_survive_exit_before_acknowledgement() {
     repo.finish_host_cleanup(token).await.unwrap();
     assert_eq!(released, f.snapshot());
     assert_eq!(f.count("thinkthread.write"), 0);
+}
+
+fn close_request(f: &Fixture, id: &str) -> JointPrepareRequest {
+    let mut context = f.context(id);
+    context.operation = "close".into();
+    JointPrepareRequest {
+        context,
+        binding: f.target.live_binding.clone(),
+        root_id: f.target.root_id.clone(),
+        source_id: f.record.runtime_id.clone(),
+        exclusive_root: false,
+        parent_binding: None,
+        reservations: vec![],
+        native: vec![JointNativeIntent {
+            step: "delete-child".into(),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            digest: "a".repeat(64),
+            method: "thinkthread.delete".into(),
+            params: json!({"thinkthreadId":"native-child"}),
+            effect: NativeEffect::Remove,
+            compensation: false,
+        }],
+        publication_input: None,
+        turn: None,
+    }
+}
+
+#[tokio::test]
+async fn mutation_rejections_require_not_sent_and_no_recovery_blocker() {
+    for method in ["write", "exec"] {
+        for (code, delivery, settled) in [
+            ("FileWriteRejected", "not_sent", true),
+            ("FileWriteRejected", "accepted", false),
+            ("ChecksumMismatch", "sent_unknown", false),
+            ("NeedsRecovery", "not_sent", false),
+            ("NeedsRecovery", "accepted", false),
+            ("OperationInProgress", "not_sent", false),
+            ("OperationInProgress", "sent_unknown", false),
+        ] {
+            let f = Fixture::new().await;
+            f.state(json!({"scenario":"mutation-rejected","error_code":code,"delivery":delivery}));
+            let request = if method == "write" {
+                write(vec![1])
+            } else {
+                execute(exec())
+            };
+            let a = f.access("rejected", request.clone()).await.unwrap();
+            if method == "write" {
+                assert!(matches!(
+                    a.backend.write_host(request).await,
+                    Err(SessionDomainError::Unavailable { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    a.backend.exec().exec(exec()).await,
+                    Err(OperationError::Transport { .. })
+                ));
+            }
+            let h = f.intent("rejected").await;
+            assert_eq!(
+                h.observations[0].as_ref().unwrap().settled,
+                settled,
+                "{method}/{code}/{delivery}"
+            );
+            assert_eq!(h.state, if settled { "failed" } else { "unknown" });
+            assert_eq!(
+                h.observations[0]
+                    .as_ref()
+                    .unwrap()
+                    .native_outcome
+                    .as_ref()
+                    .unwrap()["error"]["delivery"],
+                delivery
+            );
+            let (dirty, holder):(u32, Option<String>)=f.conn().query_row("SELECT w.dirty,f.holder FROM joint_host_workspace w JOIN joint_fences f ON f.id='live' AND f.kind='source'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(dirty, if settled { 0 } else { 1 });
+            assert_eq!(holder.is_some(), !settled);
+            let snapshot = f.snapshot();
+            if settled {
+                let repo = repository(&f.root.path().join("db"));
+                assert!(matches!(
+                    f.owner().recover_host("rejected".into(), repo).await,
+                    Err(SessionDomainError::Unavailable { .. })
+                ));
+                assert_eq!(snapshot, f.snapshot());
+                f.repo.finish_host_cleanup(a.access).await.unwrap();
+            } else {
+                assert!(h.blocker_id.is_some());
+                assert!(f
+                    .repo
+                    .finish_host(a.access.clone(), json!({"error":"rejected"}))
+                    .await
+                    .is_err());
+                assert!(f.repo.finish_host_cleanup(a.access.clone()).await.is_err());
+                assert!(f.access("new", write(vec![])).await.is_err());
+                assert_eq!(snapshot, f.snapshot());
+                assert_eq!(
+                    f.conn()
+                        .query_row(
+                            "SELECT state FROM joint_host_allocations WHERE intent_id='rejected'",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "reserved"
+                );
+                assert_eq!(f.conn().query_row("SELECT count(*) FROM joint_refs WHERE kind='host_hold' AND public_id='rejected'",[],|r|r.get::<_,u32>(0)).unwrap(),1);
+            }
+            assert_eq!(f.count(&format!("thinkthread.{method}")), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failures_before_claim_settle_without_payload_and_release_local_resources() {
+    for scenario in [
+        "get-rejected",
+        "get-wrong-branch",
+        "get-hang",
+        "connect-failed",
+        "no-payload",
+    ] {
+        let f = Fixture::new().await;
+        let a = f.access("unsent", write(vec![1])).await.unwrap();
+        f.scenario(scenario);
+        let original = std::fs::read(&f.config.host_executable).unwrap();
+        if scenario == "connect-failed" {
+            std::fs::remove_file(&f.config.host_executable).unwrap();
+        }
+        let result = if scenario == "no-payload" {
+            f.owner()
+                .recover_host("unsent".into(), repository(&f.root.path().join("db")))
+                .await
+                .map(|_| 0)
+        } else {
+            a.backend.write_host(write(vec![1])).await
+        };
+        assert!(
+            matches!(result, Err(SessionDomainError::Unavailable { .. })),
+            "{scenario}: {result:?}"
+        );
+        let h = f.intent("unsent").await;
+        assert_eq!(h.state, "failed", "{scenario}");
+        assert_eq!(h.cleanup_state, "done");
+        assert!(h.observations.iter().all(Option::is_none));
+        assert!(h.blocker_id.is_none());
+        assert_eq!(f.count("thinkthread.write"), 0);
+        assert_eq!(
+            f.conn()
+                .query_row(
+                    "SELECT state FROM joint_host_allocations WHERE intent_id='unsent'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "released"
+        );
+        assert_eq!(
+            f.conn()
+                .query_row(
+                    "SELECT count(*) FROM joint_refs WHERE kind='host_hold'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+        let (dirty, holder):(u32,Option<String>)=f.conn().query_row("SELECT w.dirty,f.holder FROM joint_host_workspace w JOIN joint_fences f ON f.id='live' AND f.kind='source'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((dirty, holder), (0, None));
+        let snapshot = f.snapshot();
+        assert!(matches!(
+            f.owner()
+                .recover_host("unsent".into(), repository(&f.root.path().join("db")))
+                .await,
+            Err(SessionDomainError::Unavailable { .. })
+        ));
+        assert_eq!(snapshot, f.snapshot());
+        if scenario == "connect-failed" {
+            std::fs::write(&f.config.host_executable, original).unwrap();
+            std::fs::set_permissions(
+                &f.config.host_executable,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        f.scenario("ok");
+        let next = f.access("next", write(vec![2])).await.unwrap();
+        assert_eq!(next.backend.write_host(write(vec![2])).await.unwrap(), 1);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_exec_recovers_only_original_uuid_after_reopen() {
+    let f = Fixture::new().await;
+    f.scenario("drop");
+    let a = f.access("lost-exec", execute(exec())).await.unwrap();
+    assert!(matches!(
+        a.backend.exec().exec(exec()).await,
+        Err(OperationError::Transport { .. })
+    ));
+    let h = f.intent("lost-exec").await;
+    assert_eq!(h.state, "unknown");
+    let original = h.steps[0].original_uuid.clone().unwrap();
+    let native_digest = h.steps[0].sdk_operation_digest.clone().unwrap();
+    drop(a);
+    let repo = repository(&f.root.path().join("db"));
+    f.scenario("ok");
+    let result = f
+        .owner()
+        .recover_host("lost-exec".into(), repo.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["reason"], "exited");
+    let h = repo.host_intent("lost-exec".into()).await.unwrap();
+    assert_eq!(h.state, "completed");
+    assert_eq!(h.steps[0].original_uuid.as_deref(), Some(original.as_str()));
+    assert_eq!(
+        h.steps[0].sdk_operation_digest.as_deref(),
+        Some(native_digest.as_str())
+    );
+    assert_eq!(f.count("thinkthread.exec"), 1);
+    assert_eq!(f.count("operation.get"), 1);
+    let trace = f.trace();
+    let query = trace
+        .iter()
+        .find(|v| v["method"] == "operation.get")
+        .unwrap();
+    assert_eq!(query["params"]["operationId"], original);
+    let before = f.snapshot();
+    assert_eq!(
+        f.owner()
+            .recover_host("lost-exec".into(), repo)
+            .await
+            .unwrap(),
+        result
+    );
+    assert_eq!(before, f.snapshot());
+    assert_eq!(f.count("thinkthread.exec"), 1);
+}
+
+#[tokio::test]
+async fn reopened_intents_reject_changed_configuration_owner_schema_and_generations() {
+    for change in [
+        "configuration",
+        "owner",
+        "schema",
+        "root-generation",
+        "binding-generation",
+    ] {
+        let f = Fixture::new().await;
+        f.scenario("drop");
+        let a = f.access("persisted", write(vec![1])).await.unwrap();
+        assert!(a.backend.write_host(write(vec![1])).await.is_err());
+        drop(a);
+        let mut config = f.config.clone();
+        let mut owner = "candidate-fixture";
+        match change {
+            "configuration" => config.fs_root = f.root.path().join("changed-fs"),
+            "owner" => owner = "changed-owner",
+            "schema" => {
+                f.conn()
+                    .execute(
+                        "UPDATE joint_host_intents SET body=json_set(body,'$.schema_version',2)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "root-generation" => {
+                f.conn()
+                    .execute("UPDATE joint_host_roots SET generation=2", [])
+                    .unwrap();
+            }
+            "binding-generation" => {
+                f.conn()
+                    .execute(
+                        "UPDATE joint_bindings SET generation=2 WHERE id='live-binding'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let owner = CandidateHostOwner::new(
+            config,
+            owner.into(),
+            "fixed".into(),
+            Duration::from_millis(800),
+        )
+        .unwrap();
+        let repo = repository(&f.root.path().join("db"));
+        let snapshot = f.snapshot();
+        f.scenario("ok");
+        assert!(
+            owner.recover_host("persisted".into(), repo).await.is_err(),
+            "{change}"
+        );
+        assert_eq!(snapshot, f.snapshot(), "{change}");
+        assert_eq!(f.count("thinkthread.write"), 1);
+        assert_eq!(f.count("thinkthread.exec"), 0);
+        assert_eq!(f.count("operation.get"), 0);
+    }
 }

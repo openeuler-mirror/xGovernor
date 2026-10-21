@@ -414,7 +414,7 @@ impl HostRepository for SqliteSessionRepository {
                 vec![HostStepV1 { step_no:0, method:"thinkthread.read".into(), original_uuid:None, canonical_params_digest:host_digest(&prepared.request), sdk_operation_digest:None, target_digest:access.target_digest.clone() }]
             } else { prepared.native.iter().enumerate().map(|(step_no,n)| HostStepV1 {step_no,method:n.method.clone(),original_uuid:Some(n.operation_id.clone()),canonical_params_digest:host_digest(&n.params),sdk_operation_digest:Some(n.digest.clone()),target_digest:access.target_digest.clone()}).collect() };
 
-            let h=HostIntentV1 {schema_version:1,prepared,access:access.clone(),state:"prepared".into(),observations:vec![None;count],steps,recovery_evidence:vec![],result:None,cleanup_state:"none".into()};
+            let h=HostIntentV1 {schema_version:1,prepared,access:access.clone(),state:"prepared".into(),observations:vec![None;count],steps,recovery_evidence:vec![],result:None,cleanup_state:"none".into(),blocker_id:None,suspended_cleanup_plan_id:None,resume_joint_stage:None};
             tx.execute("INSERT INTO joint_host_intents VALUES(?1,?2)",params![access.admission.intent_id,encode(&h)?])?;Ok(access)
         }).await
     }
@@ -436,6 +436,7 @@ impl HostRepository for SqliteSessionRepository {
             h.observations[step]=Some(HostObservationV1 {state:NativeOperationState::Unknown,settled:false,result:Value::Null,transfer:None,exec:None,error:Some("claimed; delivery unknown".into()),native_outcome: None,
 });
             h.state="executing".into();
+            h.blocker_id=Some(format!("host:{}:unsettled",access.admission.intent_id));
             if !matches!(h.prepared.request,HostCanonicalRequestV1::Read{..}) {
                 let n=&h.prepared.native[step];let unknown=JointNativeOutcome {state:NativeOperationState::Unknown,resources:vec![],payload:json!({"delivery":"sent_unknown"})};
                 tx.execute("UPDATE joint_native_steps SET outcome_json=?1 WHERE intent_id=?2 AND step=?3 AND outcome_json IS NULL",params![encode(&unknown)?,access.admission.intent_id,n.step])?;
@@ -509,6 +510,8 @@ impl HostRepository for SqliteSessionRepository {
             }
             let settled = observation.settled;
             h.observations[step] = Some(observation);
+            h.blocker_id = (!all_settled(&h))
+                .then(|| format!("host:{}:unsettled", access.admission.intent_id));
             h.state = if settled { "executing" } else { "unknown" }.into();
             tx.execute(
                 "UPDATE joint_operations SET stage=?1 WHERE id=?2",
@@ -554,7 +557,11 @@ impl HostRepository for SqliteSessionRepository {
             let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_cleanup WHERE parent_id=?1 AND state!='done')",[&access.admission.intent_id],|r|r.get(0))?;
             if waiting {return Err(conflict("Host cleanup delegation is pending"));}
             if !unsent && result.get("error").is_none() && h.observations.iter().any(|o|o.as_ref().is_none_or(|v|v.state!=NativeOperationState::Completed || v.error.is_some())) {return Err(conflict("failed Host cannot publish success"));}
-            h.result=Some(result.clone());h.state=if result.get("error").is_some(){"failed"}else{"completed"}.into();h.cleanup_state="pending".into();
+            h.result=Some(result.clone());h.state=if result.get("error").is_some(){"failed"}else{"completed"}.into();h.cleanup_state=if unsent {"done"}else{"pending"}.into();h.blocker_id=None;
+            if unsent {
+                tx.execute("UPDATE joint_host_allocations SET state='released' WHERE intent_id=?1",[&access.admission.intent_id])?;
+                tx.execute("DELETE FROM joint_refs WHERE kind='host_hold' AND public_id=?1",[&access.admission.intent_id])?;
+            }
             tx.execute("UPDATE joint_operations SET stage='settled',publication_json=?1 WHERE id=?2",params![encode(&result)?,access.admission.intent_id])?;
             tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND (active_intent=?1 OR active_intent IS NULL)",params![access.admission.intent_id,access.admission.binding.binding_id])?;
             release_fences(tx,&access.admission.intent_id)?;save(tx,&h)?;Ok(result)
@@ -633,6 +640,9 @@ impl HostRepository for SqliteSessionRepository {
             if state!="prepared" {return Err(conflict("cleanup cannot suspend"));}
             let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_dependencies WHERE parent_id=?1 AND released=0)",[&access.admission.intent_id],|r|r.get(0))?;
             if !waiting {return Err(conflict("cleanup has no dependency wait"));}
+            let stage: String=tx.query_row("SELECT stage FROM joint_operations WHERE id=?1",[&access.admission.intent_id],|r|r.get(0))?;
+            h.suspended_cleanup_plan_id=Some(child.clone());h.resume_joint_stage=Some(stage);
+            h.blocker_id=Some(format!("host:{}:dependency",access.admission.intent_id));
             tx.execute("UPDATE joint_operations SET stage='suspended_waiting_dependency' WHERE id IN (?1,?2)",params![access.admission.intent_id,child])?;
             tx.execute("UPDATE joint_host_cleanup SET state='waiting_dependency',delegated=0 WHERE parent_id=?1",[&access.admission.intent_id])?;
             release_fences(tx,&access.admission.intent_id)?;h.state="suspended_waiting_dependency".into();save(tx,&h)
@@ -661,6 +671,7 @@ impl HostRepository for SqliteSessionRepository {
             if configured!=(encode(&h.prepared.target)?,encode(&h.prepared.policy)?) {return Err(conflict("Host configuration changed during dependency wait"));}
 
             let (child,state):(String,String)=tx.query_row("SELECT child_id,state FROM joint_host_cleanup WHERE parent_id=?1",[&access.admission.intent_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if h.suspended_cleanup_plan_id.as_deref()!=Some(child.as_str()) || h.resume_joint_stage.as_deref()!=Some("accepted") {return Err(conflict("Host suspended cleanup plan changed"));}
             let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_dependencies WHERE parent_id=?1 AND released=0)",[&access.admission.intent_id],|r|r.get(0))?;
             let allocation:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_allocations WHERE intent_id=?1 AND owner=?2 AND state!='released')",params![access.admission.intent_id,h.prepared.target.owner_ref],|r|r.get(0))?;
             let hold:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_refs WHERE kind='host_hold' AND public_id=?1 AND binding_id=?2)",params![access.admission.intent_id,h.prepared.target.root_binding_id],|r|r.get(0))?;
@@ -672,7 +683,7 @@ impl HostRepository for SqliteSessionRepository {
             let mut child_token=h.access.admission.clone();child_token.intent_id=child.clone();
             for a in [&h.access.admission,&child_token] {if tx.execute("UPDATE joint_operations SET stage='accepted',admission_json=?1 WHERE id=?2 AND stage='suspended_waiting_dependency'",params![encode(a)?,a.intent_id])?!=1 {return Err(conflict("parent/child phase changed"));}}
             tx.execute("UPDATE joint_host_cleanup SET state='prepared',delegated=1 WHERE parent_id=?1",[&access.admission.intent_id])?;
-            h.state="executing".into();save(tx,&h)?;Ok(h.access)
+            h.state="executing".into();h.blocker_id=None;h.suspended_cleanup_plan_id=None;h.resume_joint_stage=None;save(tx,&h)?;Ok(h.access)
         }).await
     }
     async fn finish_host_cleanup(

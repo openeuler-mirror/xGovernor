@@ -391,6 +391,12 @@ pub struct HostIntentV1 {
     pub recovery_evidence: Vec<Value>,
     pub result: Option<Value>,
     pub cleanup_state: String,
+    #[serde(default)]
+    pub blocker_id: Option<String>,
+    #[serde(default)]
+    pub suspended_cleanup_plan_id: Option<String>,
+    #[serde(default)]
+    pub resume_joint_stage: Option<String>,
 }
 pub struct JointHostAccess {
     pub access: HostAccessTokenV1,

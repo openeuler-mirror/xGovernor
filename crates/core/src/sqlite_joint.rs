@@ -417,6 +417,10 @@ impl SqliteSessionRepository {
                 if !owned {return Err(conflict("joint release does not own public reference"));}
                 let count:i64=tx.query_row("SELECT count(*) FROM joint_refs WHERE binding_id=?1",[&binding.binding_id],|r|r.get(0))?;
                 if count>1 {return Err(conflict("joint binding is referenced"));}
+                if request.context.operation=="close" {
+                    let suspended:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_cleanup c JOIN joint_operations o ON o.id=c.parent_id WHERE o.binding_id=?1 AND c.state='waiting_dependency')",[&binding.binding_id],|r|r.get(0))?;
+                    if suspended {return Err(conflict("source has suspended Host cleanup"));}
+                }
                 if request.context.operation!="turn" {
                     tx.execute("UPDATE joint_bindings SET state='releasing' WHERE id=?1",[&binding.binding_id])?;
                 }
