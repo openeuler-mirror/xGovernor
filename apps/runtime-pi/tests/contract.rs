@@ -31,9 +31,11 @@ use session_protocol::{
     SessionRuntimeCapability, SessionToolActivityPhase, SessionToolActivityStatus,
     SessionTurnOutcome, SessionTurnRequest,
 };
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::{
-    application, fake_pi_path, new_pi_runtime, pi_runtime_ext, started_runtime, workspace_facts,
+    application, application_with_runtime, build_managers, fake_pi_path, new_pi_runtime,
+    pi_runtime_ext, start_runtime, started_runtime, workspace_facts, MemoryRepository,
     LOCAL_BACKEND_ID,
 };
 use tempfile::TempDir;
@@ -579,6 +581,167 @@ async fn cancel_interrupts_a_real_pi_turn_before_its_natural_completion() {
     runtime.stop("runtime-1").await.ok();
 }
 
+/// When the cooperative abort cannot interrupt a half-dead LLM read, `cancel`
+/// must escalate: kill the worker tree, synthesize a `Cancelled` terminal
+/// event (so the turn gate is released), and lazily start a replacement worker
+/// on the next submission.
+#[tokio::test]
+async fn cancel_kills_a_hung_worker_and_the_next_turn_lazily_restarts_it() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = new_pi_runtime().with_cancel_grace(Duration::from_millis(200));
+    start_runtime(
+        &runtime,
+        RuntimeStartRequest {
+            runtime_id: "runtime-1".into(),
+            conversation_id: "conversation-1".into(),
+            sender_id: "sender-1".into(),
+            workspace: workspace_facts(workspace.path().to_str().unwrap()),
+            state: None,
+            llm: None,
+            ext: pi_runtime_ext(),
+        },
+    )
+    .await
+    .expect("start must succeed against the fake pi process");
+
+    // Give the forced-kill path a session file whose tail is an interrupted
+    // turn. The restart must trim it back to the completed assistant turn and
+    // pass the repaired file to the replacement `pi --session`.
+    let state = runtime
+        .export_state("runtime-1")
+        .await
+        .expect("runtime state must be exportable");
+    let session_dir = std::path::PathBuf::from(
+        state
+            .state
+            .get("pi_session_dir")
+            .and_then(Value::as_str)
+            .expect("runtime state must carry its pi session directory"),
+    );
+    let session_file = session_dir.join("session.jsonl");
+    std::fs::write(
+        &session_file,
+        [
+            r#"{"type":"session","id":"session-1"}"#,
+            r#"{"type":"message","id":"u1","message":{"role":"user","content":"before"}}"#,
+            r#"{"type":"message","id":"a1","message":{"role":"assistant","stopReason":"stop","content":[]}}"#,
+            r#"{"type":"message","id":"u2","message":{"role":"user","content":"interrupted"}}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .expect("write interrupted session file");
+
+    let mut events = runtime
+        .submit_turn(RuntimeTurnInput {
+            runtime_id: "runtime-1".into(),
+            turn_id: "turn-hung".into(),
+            text: "trigger-hung-turn".into(),
+            entry: Default::default(),
+            llm: None,
+            reasoning_effort: None,
+            ext: Default::default(),
+        })
+        .await
+        .expect("hung turn must be accepted");
+
+    runtime
+        .cancel(RuntimeCancelRequest {
+            runtime_id: "runtime-1".into(),
+            turn_id: Some("turn-hung".into()),
+        })
+        .await
+        .expect("cancel must be accepted");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if matches!(
+                event,
+                RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
+            ) {
+                return event;
+            }
+        }
+        panic!("turn stream closed without a terminal event");
+    })
+    .await
+    .expect("forced cancel must terminate within the grace period");
+    match terminal {
+        RuntimeEvent::Completed { outcome, .. } => assert_eq!(
+            outcome,
+            SessionTurnOutcome::Cancelled,
+            "a forced cancel must synthesize Cancelled, not a worker failure"
+        ),
+        RuntimeEvent::Failed { error, .. } => {
+            panic!("forced cancel surfaced as Failed: {error:?}")
+        }
+        other => panic!("unexpected terminal event: {other:?}"),
+    }
+
+    // A force-killed worker is still a recoverable session: `check_alive`
+    // must not let the reclaim sweeper close its provider before the next
+    // turn can lazily restart it.
+    assert!(
+        runtime
+            .check_alive("runtime-1")
+            .await
+            .expect("check_alive must succeed for a force-killed instance"),
+        "a force-killed, lazily restartable session must not be reported as dead"
+    );
+
+    // The killed worker is gone; the next submit must lazily start a
+    // replacement on the same backend/session directory.
+    let mut events = runtime
+        .submit_turn(RuntimeTurnInput {
+            runtime_id: "runtime-1".into(),
+            turn_id: "turn-after-restart".into(),
+            text: "hello after restart".into(),
+            entry: Default::default(),
+            llm: None,
+            reasoning_effort: None,
+            ext: Default::default(),
+        })
+        .await
+        .expect("the next turn must lazily restart the worker");
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if matches!(
+                event,
+                RuntimeEvent::Completed { .. } | RuntimeEvent::Failed { .. }
+            ) {
+                return event;
+            }
+        }
+        panic!("restarted worker produced no terminal event");
+    })
+    .await
+    .expect("restarted worker must finish the next turn");
+    match terminal {
+        RuntimeEvent::Completed { outcome, .. } => {
+            assert_eq!(outcome, SessionTurnOutcome::Complete)
+        }
+        other => panic!("restarted worker failed the next turn: {other:?}"),
+    }
+
+    let launch_args: Vec<String> = serde_json::from_slice(
+        &std::fs::read(session_dir.join("fake_pi_launch_args.json"))
+            .expect("restarted worker must record its launch args"),
+    )
+    .expect("launch args JSON");
+    assert!(
+        launch_args.windows(2).any(|args| {
+            args[0] == "--session" && args[1].as_str() == session_file.to_string_lossy().as_ref()
+        }),
+        "the replacement worker must resume the repaired session file: {launch_args:?}"
+    );
+    let repaired = std::fs::read_to_string(&session_file).expect("read repaired session file");
+    assert!(
+        !repaired.contains("interrupted"),
+        "the interrupted turn's user message must be trimmed before resume: {repaired}"
+    );
+    runtime.stop("runtime-1").await.ok();
+}
+
 /// Exercises the `InteractionRequested` -> `answer_interaction` round trip
 /// end to end against a real pi process: the fake process's
 /// `"trigger-interaction"` scenario emits a `confirm`-method
@@ -871,4 +1034,114 @@ async fn session_descriptor_tracks_confirmed_model_protocol_and_capabilities() {
     let llm = record.llm.unwrap();
     assert_eq!(llm.api, Some(session_protocol::LlmApi::AnthropicMessages));
     assert_eq!(llm.capabilities.unwrap().max_tokens, Some(512));
+}
+
+/// End-to-end regression for the original symptom: after `cancel`, the
+/// application must release its single-turn gate as soon as the forced
+/// `Cancelled` terminal arrives, not after the LLM transport's 300s timeout.
+#[tokio::test]
+async fn application_accepts_the_next_turn_after_a_forced_cancel() {
+    let workspace = TempDir::new().expect("tempdir");
+    let runtime = new_pi_runtime().with_cancel_grace(Duration::from_millis(200));
+    let repository = Arc::new(MemoryRepository::default());
+    let app = application_with_runtime(
+        runtime,
+        build_managers(),
+        repository,
+        workspace.path().to_str().unwrap().to_string(),
+    );
+    let ctx = SecurityContext::admin("test");
+
+    app.open(
+        &ctx,
+        SessionOpenRequest {
+            runtime_id: None,
+            runtime_kind: None,
+            conversation_id: "conversation-1".into(),
+            sender_id: "sender-1".into(),
+            workspace: Default::default(),
+            deployment: Default::default(),
+            requested_capabilities: Default::default(),
+            llm: None,
+            ext: pi_runtime_ext(),
+            lease: Default::default(),
+        },
+    )
+    .await
+    .expect("open must succeed");
+
+    let submission = app
+        .submit_turn(
+            &ctx,
+            SessionTurnRequest {
+                runtime_id: "runtime-1".into(),
+                text: "trigger-hung-turn".into(),
+                entry: Default::default(),
+                llm: None,
+                reasoning_effort: None,
+                client_request_id: None,
+                ext: Default::default(),
+                lease: Default::default(),
+            },
+        )
+        .await
+        .expect("hung turn must be accepted");
+    let mut events = submission.events.expect("turn carries an event stream");
+
+    app.cancel(&ctx, "runtime-1", Some("turn-1"))
+        .await
+        .expect("cancel must be accepted");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                session_protocol::SessionEvent::TurnCompleted { outcome, .. } => return outcome,
+                session_protocol::SessionEvent::TurnFailed { error, .. } => {
+                    panic!("forced cancel surfaced as Failed: {error:?}")
+                }
+                _ => {}
+            }
+        }
+        panic!("turn stream closed without a terminal event");
+    })
+    .await
+    .expect("cancel must terminate the turn within the grace period");
+    assert_eq!(outcome, SessionTurnOutcome::Cancelled);
+
+    // Before this fix the gate stayed claimed for the transport's 300s
+    // timeout and this submission returned `Conflict` (HTTP 409).
+    let submission = app
+        .submit_turn(
+            &ctx,
+            SessionTurnRequest {
+                runtime_id: "runtime-1".into(),
+                text: "hello after cancel".into(),
+                entry: Default::default(),
+                llm: None,
+                reasoning_effort: None,
+                client_request_id: None,
+                ext: Default::default(),
+                lease: Default::default(),
+            },
+        )
+        .await
+        .expect("the next turn must be accepted after a forced cancel");
+    let mut events = submission.events.expect("turn carries an event stream");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                session_protocol::SessionEvent::TurnCompleted { outcome, .. } => return outcome,
+                session_protocol::SessionEvent::TurnFailed { error, .. } => {
+                    panic!("restarted turn failed: {error:?}")
+                }
+                _ => {}
+            }
+        }
+        panic!("restarted turn closed without a terminal event");
+    })
+    .await
+    .expect("the lazily restarted worker must finish the next turn");
+    assert_eq!(outcome, SessionTurnOutcome::Complete);
+
+    app.close(&ctx, "runtime-1", Default::default()).await.ok();
 }

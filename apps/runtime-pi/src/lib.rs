@@ -21,14 +21,16 @@ use operation_protocol::OperationBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_protocol::{
-    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionUsage,
+    LlmOverrideRequest, SessionExtensions, SessionInteractionAnswer, SessionTurnOutcome,
+    SessionUsage,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use uuid::Uuid;
 use xgovernor_core::{
     enforce_workspace_axiom, IsolationBoundary, IsolationFacts, NetworkIsolation,
@@ -60,6 +62,12 @@ const DEFAULT_PI_EXECUTABLE: &str = "pi";
 /// an `Extension` event instead of an `InteractionRequested` one, since there
 /// is nothing for `answer_interaction` to reply to.
 const DIALOG_METHODS: &[&str] = &["select", "confirm", "input", "editor"];
+
+/// How long `cancel` lets the worker's cooperative abort run before the
+/// supervisor force-kills it. The abort itself is a single stdin write, so
+/// this only bounds how long a wedged LLM HTTP read can keep the turn (and
+/// the session's single-turn gate) pinned.
+const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Deserialize)]
 struct PiRuntimeExt {
@@ -875,6 +883,7 @@ struct PiInstance {
     current_turn: Mutex<Option<CurrentTurn>>,
     backend: Arc<dyn OperationBackend>,
     completion: Mutex<()>,
+    pgid: i32,
     /// Bearer token this instance's backend is registered under on the
     /// shared [`Bridge`]. `stop()` unregisters it so a dangling token can't
     /// keep proxying to a backend whose sandbox is about to be torn down.
@@ -883,6 +892,12 @@ struct PiInstance {
     /// a restart — see [`PiPersistedState`]. Immutable snapshot taken at
     /// `start()` time; `export_state()` just clones and re-wraps it.
     persisted_state: PiPersistedState,
+    /// Latest turn id whose forwarding task reached a terminal state (or
+    /// whose event stream closed). Retaining the value, instead of using a
+    /// bare `Notify`, means the cancel watchdog cannot miss a finish that
+    /// happened while it was being spawned.
+    turn_finished: watch::Sender<Option<String>>,
+    force_killed_turn: Mutex<Option<String>>,
 }
 
 /// `AgentRuntime` backed by one `pi-worker` subprocess per `runtime_id`.
@@ -893,6 +908,18 @@ pub struct PiRuntime {
     instances: RwLock<HashMap<String, Arc<PiInstance>>>,
     pi_session_root: PathBuf,
     worker_executable: PathBuf,
+    /// Cooperative `cancel` grace before the worker is force-killed.
+    cancel_grace: Duration,
+    /// Serializes lazy restarts (and `stop`) so a restarted worker cannot be
+    /// inserted after the same runtime was removed by a concurrent close.
+    lifecycle: Mutex<()>,
+}
+
+impl PiInstance {
+    async fn is_alive(&self) -> bool {
+        let mut child = self.child.lock().await;
+        matches!(child.try_wait(), Ok(None))
+    }
 }
 
 impl PiRuntime {
@@ -923,7 +950,17 @@ impl PiRuntime {
             instances: RwLock::new(HashMap::new()),
             pi_session_root,
             worker_executable,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
+            lifecycle: Mutex::new(()),
         })
+    }
+
+    /// Overrides the cooperative-cancel grace period. Integration tests use a
+    /// short grace so the forced-kill path can be exercised without waiting
+    /// the production five seconds.
+    pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
+        self.cancel_grace = grace;
+        self
     }
 
     async fn instance_for(&self, runtime_id: &str) -> Result<Arc<PiInstance>, SessionDomainError> {
@@ -935,6 +972,175 @@ impl PiRuntime {
             .ok_or_else(|| SessionDomainError::NotFound {
                 runtime_id: runtime_id.to_string(),
             })
+    }
+
+    /// Returns a live worker for `runtime_id`, lazily spawning a replacement
+    /// if the previous one was force-killed by the cancel watchdog. The
+    /// `lifecycle` lock makes concurrent submissions (or a submit racing a
+    /// close) agree on exactly one replacement.
+    async fn ensure_live_instance(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Arc<PiInstance>, SessionDomainError> {
+        let stale = self.instance_for(runtime_id).await?;
+        if stale.is_alive().await {
+            return Ok(stale);
+        }
+
+        let _guard = self.lifecycle.lock().await;
+        // Re-check: another request may have restarted it before we got here.
+        let stale = self.instance_for(runtime_id).await?;
+        if stale.is_alive().await {
+            return Ok(stale);
+        }
+        if stale.current_turn.lock().await.is_some() {
+            // The reader has not observed the old worker's EOF yet. The turn
+            // gate is still held in that case, so surfacing Conflict is more
+            // honest than starting a second worker behind the old turn.
+            return Err(SessionDomainError::Conflict {
+                message: format!("runtime '{runtime_id}' still has an active turn"),
+            });
+        }
+        self.restart_instance(runtime_id, stale).await
+    }
+
+    /// Reaps `stale` and starts a fresh worker on the same backend/session
+    /// directory. Called with `lifecycle` held. The session file is repaired
+    /// only when this process killed the worker mid-turn (otherwise the
+    /// normal fail-closed restore contract applies).
+    async fn restart_instance(
+        &self,
+        runtime_id: &str,
+        stale: Arc<PiInstance>,
+    ) -> Result<Arc<PiInstance>, SessionDomainError> {
+        let persisted = stale.persisted_state.clone();
+        let backend = Arc::clone(&stale.backend);
+        if stale.pgid > 0 {
+            // Also reaps a nested `pi` orphaned by an earlier SIGKILL of the
+            // worker's process group leader.
+            let _ = backend::process_group::terminate_process_group(stale.pgid);
+        }
+        {
+            let mut child = stale.child.lock().await;
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.start_kill();
+            }
+            let _ = child.wait().await;
+        }
+        if stale.pgid > 0 {
+            backend::process_group::unregister_pgid(stale.pgid);
+        }
+        self.bridge.unregister(&stale.bridge_token);
+
+        let session_dir = PathBuf::from(&persisted.pi_session_dir);
+        let resume_session_file = self.restart_session_file(&session_dir, &stale).await?;
+        let llm = load_llm_config(&session_dir).await?;
+        let workspace_root = backend.paths().workspace_root().clone();
+        let bridge_token = Uuid::new_v4().to_string();
+        let activity = Arc::new(tokio::sync::RwLock::new(()));
+        self.bridge.register(
+            bridge_token.clone(),
+            Arc::clone(&backend),
+            workspace_root.clone(),
+            activity,
+        );
+
+        let worker_config = worker::PiWorkerConfig {
+            runtime_id: runtime_id.to_string(),
+            executable: persisted.executable.clone().unwrap_or_else(|| {
+                std::env::var(PI_EXECUTABLE_ENV)
+                    .unwrap_or_else(|_| DEFAULT_PI_EXECUTABLE.to_string())
+            }),
+            extension_dir: persisted
+                .extension_dir
+                .clone()
+                .unwrap_or_else(|| DEFAULT_EXTENSION_DIR.to_string()),
+            session_dir: session_dir.clone(),
+            resume_session_file,
+            bridge_url: self.bridge.base_url(),
+            bridge_token: bridge_token.clone(),
+            workspace_root: workspace_root.0.clone(),
+            use_workspace_cwd: persisted.backend_id == LOCAL_BACKEND_ID,
+            llm,
+        };
+        let (child, stdin, stdout) =
+            match worker::spawn_worker_process(&self.worker_executable, &worker_config).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    self.bridge.unregister(&bridge_token);
+                    return Err(error);
+                }
+            };
+        let (turn_finished, _) = watch::channel(None);
+        #[cfg(unix)]
+        let pgid = child.id().map(|id| id as i32).unwrap_or(0);
+        #[cfg(not(unix))]
+        let pgid = 0;
+        backend::process_group::register_pgid(pgid);
+        let instance = Arc::new(PiInstance {
+            stdin: Mutex::new(stdin),
+            child: Mutex::new(child),
+            stdout: Mutex::new(stdout),
+            current_turn: Mutex::new(None),
+            backend,
+            completion: Mutex::new(()),
+            pgid,
+            bridge_token,
+            persisted_state: persisted,
+            turn_finished,
+            force_killed_turn: Mutex::new(None),
+        });
+        self.instances
+            .write()
+            .await
+            .insert(runtime_id.to_string(), Arc::clone(&instance));
+        tracing::info!(%runtime_id, "restarted Pi worker after forced cancel");
+        Ok(instance)
+    }
+
+    /// Picks the session file a restarted worker should resume. A clean
+    /// restore must still fail closed; only a worker this process killed
+    /// mid-turn is allowed to trim the interrupted turn's tail so the
+    /// replacement can start without losing the completed history.
+    async fn restart_session_file(
+        &self,
+        session_dir: &Path,
+        stale: &PiInstance,
+    ) -> Result<Option<PathBuf>, SessionDomainError> {
+        let force_killed = stale.force_killed_turn.lock().await.is_some();
+        match session_file::latest_complete_turn_file(session_dir) {
+            Ok(path) => Ok(Some(path)),
+            Err(session_file::SessionFileError::NoSessionFiles(_)) => Ok(None),
+            Err(error)
+                if force_killed
+                    && matches!(
+                        &error,
+                        session_file::SessionFileError::Empty(_)
+                            | session_file::SessionFileError::LastLineNotJson { .. }
+                            | session_file::SessionFileError::LastLineNotCompleteAssistantMessage { .. }
+                    ) =>
+            {
+                // The worker was killed mid-turn, so the newest file can end
+                // on that turn's user message / tool result / pending
+                // assistant message. Trim it back to the last completed turn
+                // and re-run the normal validation.
+                session_file::truncate_to_last_complete_turn(session_dir).map_err(|error| {
+                    SessionDomainError::Unavailable {
+                        message: format!("pi_session_state_lost: {error}"),
+                    }
+                })?;
+                match session_file::latest_complete_turn_file(session_dir) {
+                    Ok(path) => Ok(Some(path)),
+                    Err(session_file::SessionFileError::NoSessionFiles(_)) => Ok(None),
+                    Err(error) => Err(SessionDomainError::Unavailable {
+                        message: format!("pi_session_state_lost: {error}"),
+                    }),
+                }
+            }
+            Err(error) => Err(SessionDomainError::Unavailable {
+                message: format!("pi_session_state_lost: {error}"),
+            }),
+        }
     }
 
     /// Cold-start branch of `start()` (`request.state == None`): provisions a
@@ -1269,7 +1475,23 @@ async fn read_worker_turn(
             Ok(WorkerResponse::Ready | WorkerResponse::State { .. } | WorkerResponse::Unknown) => {
                 None
             }
-            Err(error) => Some(worker_error_event(error)),
+            Err(error) => {
+                let force_killed =
+                    instance.force_killed_turn.lock().await.as_deref() == Some(turn_id.as_str());
+                if force_killed {
+                    // The cancel watchdog killed this worker because the
+                    // cooperative abort did not land. The worker will never
+                    // emit its own terminal event, so synthesize the one the
+                    // caller is waiting for instead of surfacing the kill as
+                    // a generic worker failure.
+                    Some(RuntimeEvent::Completed {
+                        outcome: SessionTurnOutcome::Cancelled,
+                        usage: SessionUsage::default(),
+                    })
+                } else {
+                    Some(worker_error_event(error))
+                }
+            }
         };
 
         if let Some(event) = event {
@@ -1307,6 +1529,10 @@ async fn read_worker_turn(
                 {
                     current.take();
                 }
+                drop(current);
+                // Wake the cancel watchdog before handing the terminal event
+                // to a possibly slow consumer.
+                let _ = instance.turn_finished.send(Some(turn_id.clone()));
             }
             let _ = output.send(event).await;
         }
@@ -1323,6 +1549,8 @@ async fn read_worker_turn(
     {
         current.take();
     }
+    drop(current);
+    let _ = instance.turn_finished.send(Some(turn_id));
 }
 
 #[async_trait]
@@ -1403,7 +1631,14 @@ impl AgentRuntime for PiRuntime {
                 retryable: true,
             })?
             .is_none();
-        Ok(alive)
+        if alive {
+            return Ok(true);
+        }
+        // A worker we killed for cancelling is intentionally replaced on the
+        // next turn. Report the session as alive so the reclaim sweeper does
+        // not tear down its provider in the window before that turn arrives.
+        let recoverable = instance.force_killed_turn.lock().await.is_some();
+        Ok(recoverable)
     }
 
     async fn submit_turn(
@@ -1668,6 +1903,12 @@ impl PiRuntime {
                 }
             };
 
+        let (turn_finished, _) = watch::channel(None);
+        #[cfg(unix)]
+        let pgid = child.id().map(|id| id as i32).unwrap_or(0);
+        #[cfg(not(unix))]
+        let pgid = 0;
+        backend::process_group::register_pgid(pgid);
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -1675,8 +1916,11 @@ impl PiRuntime {
             current_turn: Mutex::new(None),
             backend,
             completion: Mutex::new(()),
+            pgid,
             bridge_token,
             persisted_state,
+            turn_finished,
+            force_killed_turn: Mutex::new(None),
         });
 
         self.instances
@@ -1687,6 +1931,7 @@ impl PiRuntime {
     }
 
     async fn stop_inner(&self, runtime_id: &str) -> Result<(), SessionDomainError> {
+        let _guard = self.lifecycle.lock().await;
         let instance = {
             let mut registry = self.instances.write().await;
             registry.remove(runtime_id)
@@ -1705,11 +1950,19 @@ impl PiRuntime {
                 .await
                 .is_err()
             {
-                if let Err(error) = child.start_kill() {
+                if instance.pgid > 0 {
+                    // The worker ignored `Shutdown`; kill its whole group so
+                    // the nested `pi` (and its open LLM stream) cannot outlive
+                    // the supervisor's instance.
+                    let _ = backend::process_group::terminate_process_group(instance.pgid);
+                } else if let Err(error) = child.start_kill() {
                     tracing::debug!(runtime_id = %runtime_id, %error, "start_kill on Pi worker failed");
                 }
                 let _ = child.wait().await;
             }
+        }
+        if instance.pgid > 0 {
+            backend::process_group::unregister_pgid(instance.pgid);
         }
         self.bridge.unregister(&instance.bridge_token);
         Ok(())
@@ -1731,7 +1984,8 @@ impl PiRuntime {
             })?;
             role.validate()?;
         }
-        let instance = self.instance_for(&input.runtime_id).await?;
+        let instance = self.ensure_live_instance(&input.runtime_id).await?;
+        *instance.force_killed_turn.lock().await = None;
         let (tx, rx) = mpsc::channel(32);
 
         {
@@ -1804,7 +2058,7 @@ impl PiRuntime {
         turn_id: Option<&str>,
     ) -> Result<(), SessionDomainError> {
         let instance = self.instance_for(runtime_id).await?;
-        let _completion = instance.completion.lock().await;
+        let completion = instance.completion.lock().await;
         let active = instance.current_turn.lock().await;
         let selected = active
             .as_ref()
@@ -1814,6 +2068,9 @@ impl PiRuntime {
         let Some(selected) = selected else {
             return Ok(());
         };
+        // Subscribe before asking Pi to abort so the watchdog can observe a
+        // terminal that lands immediately after the abort write.
+        let mut finished = instance.turn_finished.subscribe();
         // Mark the backend scope cancelled before asking Pi to abort. Concurrent
         // terminal delivery waits for this same completion lock.
         instance.backend.block_turn(&selected).map_err(|error| {
@@ -1829,13 +2086,71 @@ impl PiRuntime {
             }),
         )
         .await;
-        instance
+        let cancelled = instance
             .backend
             .cancel_turn(&selected)
             .await
             .map_err(|error| SessionDomainError::Unavailable {
                 message: error.to_string(),
-            })?;
+            });
+        // Do not hold `completion` while waiting: terminal delivery needs it
+        // to clear `current_turn`, and holding it here would turn every
+        // successful cancel into a timeout.
+        drop(completion);
+
+        let grace = self.cancel_grace;
+        let watched = Arc::clone(&instance);
+        let watched_turn = selected.clone();
+        let watched_runtime = runtime_id.to_string();
+        tokio::spawn(async move {
+            if finished.borrow().as_deref() == Some(watched_turn.as_str()) {
+                return;
+            }
+            if tokio::time::timeout(grace, finished.changed())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            // Serialize with terminal delivery: if the turn completed while
+            // the grace timer was running, `current_turn` is already None and
+            // we must not kill a healthy worker.
+            let completion = watched.completion.lock().await;
+            let still_active = watched
+                .current_turn
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|turn| turn.turn_id == watched_turn);
+            if !still_active {
+                return;
+            }
+            let mut child = watched.child.lock().await;
+            // `try_wait` returning `Some` means the worker already exited on
+            // its own; the reader will report that failure honestly instead
+            // of this watchdog painting it as a cancellation.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            *watched.force_killed_turn.lock().await = Some(watched_turn.clone());
+            tracing::warn!(
+                runtime_id = %watched_runtime,
+                turn_id = %watched_turn,
+                "Pi worker did not finish within the cancellation grace period; killing it"
+            );
+            if watched.pgid > 0 {
+                // Kill the whole group: the worker alone dying would leave
+                // the nested `pi` (and the LLM socket we are trying to cut)
+                // running as an orphan.
+                let _ = backend::process_group::terminate_process_group(watched.pgid);
+            } else {
+                let _ = child.start_kill();
+            }
+            let _ = child.wait().await;
+            drop(completion);
+        });
+
+        cancelled?;
         abort
     }
 }

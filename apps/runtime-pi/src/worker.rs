@@ -84,6 +84,12 @@ pub(crate) async fn spawn_worker_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // The worker owns a nested `pi --mode rpc` child. Put the worker in its
+    // own process group so a forced cancel can kill the whole tree (worker +
+    // pi + the in-flight LLM socket) instead of orphaning pi when the worker
+    // itself is SIGKILLed. The native pi inherits the group.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child =
         command
             .spawn()

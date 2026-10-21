@@ -34,6 +34,8 @@ Pi 和 xiaoO 都采用每个 runtime 实例一个 worker 的形态。worker 使�
 
 `submit_turn` 必须快速返回 receiver，实际 turn 在后台 task/worker 中执行。`cancel` 必须能影响正在执行的 turn，而不是只返回成功。
 
+取消必须有界（Pi adapter 的默认 grace 为 5 秒）：supervisor 先把 `Cancel` 送进 worker 走协作 abort；grace 内没有看到 terminal event 时，必须杀掉 worker 的整个进程组（worker + 嵌套的原生 `pi`），从 EOF 合成恰好一个 `Completed { Cancelled }` terminal event 来释放 turn gate，并在下一个 turn 到达时懒启动新 worker。只杀 worker 而不杀原生 `pi` 会把卡住的 LLM 连接留成孤儿，问题不会真正消失。
+
 ## Provider 与操作 backend
 
 Application open/restore 流程先通过 `InstanceManager` 获取 backend，再调用 runtime：

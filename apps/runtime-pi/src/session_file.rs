@@ -2,23 +2,25 @@
 //! inside a `--session-dir` directory, used by `PiRuntime::start()`'s
 //! restoration path (`docs/pi_session_restore_plan.md` §1.3).
 //!
-//! Per Phase 0's F14 finding, `pi` batches an entire turn's writes to disk
-//! atomically — nothing for an in-flight turn appears on disk until the
-//! model reaches a terminal `stopReason`, so SIGKILLing `pi` mid-turn never
-//! leaves a half-written turn behind. This demotes this module's job from
-//! "trim a possibly-corrupt tail" (the original plan) down to "confirm the
-//! latest file is exactly what F14 promises it will be" before trusting it
-//! enough to hand to a freshly spawned `pi --session <path>`. Nothing here
-//! ever repairs or rewrites a session file — a file that fails validation is
-//! reported, never touched.
+//! `pi` persists each message as its `message_end` arrives, so a process
+//! killed mid-turn can leave the newest file ending on that turn's user
+//! message, a tool result, or a `pending` assistant message. The normal
+//! restore path treats that as `pi_session_state_lost` rather than handing a
+//! half-finished turn to a new process. This module's job is therefore to
+//! confirm the latest file ends on a completed assistant turn before trusting
+//! it enough to spawn `pi --session <path>`. The normal path never repairs or
+//! rewrites a session file — a file that fails validation is reported, never
+//! touched. [`truncate_to_last_complete_turn`] is the one explicit exception,
+//! reserved for the forced-cancel restart path where this process itself
+//! killed `pi` mid-turn.
 //!
 //! `pi` may append bookkeeping records after a completed turn — `compaction`
 //! (context-compaction summaries), `model_change`, `thinking_level_change` —
 //! none of which are `message` records. Validation therefore anchors on the
-//! last `message`-typed record (which must be a complete, non-pending
-//! assistant message) and tolerates trailing bookkeeping records after it;
-//! only a physically half-written trailing line (failed JSON parse) is
-//! treated as truncation.
+//! last `message`-typed record (which must be a completed assistant turn: a
+//! non-empty `stopReason` other than `pending` or `toolUse`) and tolerates
+//! trailing bookkeeping records after it; only a physically half-written
+//! trailing line (failed JSON parse) is treated as truncation.
 
 use std::path::{Path, PathBuf};
 
@@ -60,8 +62,8 @@ impl std::fmt::Display for SessionFileError {
             ),
             Self::LastLineNotCompleteAssistantMessage { path } => write!(
                 f,
-                "last message record of session file {} is not a complete assistant message \
-                 with a non-pending stopReason",
+                "last message record of session file {} is not a completed assistant turn \
+                 (stopReason is empty, pending, or toolUse)",
                 path.display()
             ),
         }
@@ -79,6 +81,15 @@ impl std::fmt::Display for SessionFileError {
 /// the file's path on success; otherwise a [`SessionFileError`] describing
 /// exactly what did not hold.
 pub(crate) fn latest_complete_turn_file(session_dir: &Path) -> Result<PathBuf, SessionFileError> {
+    let latest = latest_session_file(session_dir)?;
+    validate_last_line_is_complete_turn(&latest)?;
+    Ok(latest)
+}
+
+/// Newest `*.jsonl` in `session_dir`, with no completeness judgement. Used by
+/// [`latest_complete_turn_file`] and by [`truncate_to_last_complete_turn`],
+/// which must be able to find the file it is about to repair.
+fn latest_session_file(session_dir: &Path) -> Result<PathBuf, SessionFileError> {
     if !session_dir.is_dir() {
         return Err(SessionFileError::DirectoryMissing(
             session_dir.to_path_buf(),
@@ -110,13 +121,72 @@ pub(crate) fn latest_complete_turn_file(session_dir: &Path) -> Result<PathBuf, S
         candidates.push((modified, path));
     }
 
-    let (_, latest) = candidates
+    candidates
         .into_iter()
         .max_by_key(|(modified, _)| *modified)
-        .ok_or_else(|| SessionFileError::NoSessionFiles(session_dir.to_path_buf()))?;
+        .map(|(_, path)| path)
+        .ok_or_else(|| SessionFileError::NoSessionFiles(session_dir.to_path_buf()))
+}
 
-    validate_last_line_is_complete_turn(&latest)?;
-    Ok(latest)
+pub(crate) fn truncate_to_last_complete_turn(session_dir: &Path) -> Result<(), SessionFileError> {
+    let path = latest_session_file(session_dir)?;
+    let contents = std::fs::read_to_string(&path).map_err(|error| SessionFileError::Io {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+
+    let mut cut = 0usize;
+    let mut offset = 0usize;
+    for line in contents.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = &value["message"];
+        if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let stop_reason = message
+            .get("stopReason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // `toolUse` is a completed assistant *message* but not a completed
+        // turn: the next entries are its tool results. Cutting there would
+        // leave a dangling tool call for the resumed model.
+        if stop_reason.is_empty() || stop_reason == "pending" || stop_reason == "toolUse" {
+            continue;
+        }
+        cut = offset;
+    }
+
+    if cut == 0 {
+        return std::fs::remove_file(&path).map_err(|error| SessionFileError::Io {
+            path,
+            message: error.to_string(),
+        });
+    }
+    if cut < contents.len() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|error| SessionFileError::Io {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        file.set_len(cut as u64)
+            .map_err(|error| SessionFileError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileError> {
@@ -132,9 +202,8 @@ fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileErr
         .next()
         .ok_or_else(|| SessionFileError::Empty(path.to_path_buf()))?;
 
-    // Truncation gate: the physical last line must parse as JSON. pi appends
-    // whole turns atomically (F14), so a half-written trailing line means the
-    // process was killed mid-append.
+    // Truncation gate: the physical last line must parse as JSON. A
+    // half-written trailing line means the process was killed mid-append.
     serde_json::from_str::<serde_json::Value>(last_line).map_err(|error| {
         SessionFileError::LastLineNotJson {
             path: path.to_path_buf(),
@@ -146,8 +215,10 @@ fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileErr
     // bookkeeping records after a completed turn (`compaction`,
     // `model_change`, `thinking_level_change`, ...), which are not messages
     // and must not fail validation. A file whose last message record is not a
-    // complete assistant message still fails, as does one with no message
-    // records at all.
+    // completed assistant turn still fails, as does one with no message
+    // records at all. `toolUse` is a completed assistant *message* but not a
+    // completed turn — the next entries are its tool results — so resuming
+    // there would leave a dangling tool call.
     for line in std::iter::once(last_line).chain(lines) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             // Only the physical last line must parse (checked above); an
@@ -166,7 +237,7 @@ fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileErr
                 .get("message")
                 .and_then(|message| message.get("stopReason"))
                 .and_then(serde_json::Value::as_str)
-                .map(|reason| reason != "pending")
+                .map(|reason| !reason.is_empty() && reason != "pending" && reason != "toolUse")
                 .unwrap_or(false);
         if !is_complete_assistant_message {
             return Err(SessionFileError::LastLineNotCompleteAssistantMessage {
