@@ -488,6 +488,12 @@ pub trait HostRepository: Send + Sync {
     ) -> Result<Value, SessionDomainError> {
         Err(crate::unsupported_joint("host_finish"))
     }
+    async fn fail_stale_host_read(
+        &self,
+        _access: HostAccessTokenV1,
+    ) -> Result<Value, SessionDomainError> {
+        Err(crate::unsupported_joint("host_stale_read"))
+    }
     async fn finish_host_read(
         &self,
         _access: HostAccessTokenV1,

@@ -74,6 +74,7 @@ impl Fixture {
             home_directory: p.join("home"),
             executable_search_path: vec![PathBuf::from("/usr/bin")],
             base_environment: BTreeMap::from([
+                ("XG_TEST_DB".into(), p.join("db").to_string_lossy().into()),
                 (
                     "XG_TEST_TRACE".into(),
                     p.join("trace").to_string_lossy().into(),
@@ -1866,15 +1867,23 @@ async fn mutation_rejections_require_not_sent_and_no_recovery_blocker() {
                 "{method}/{code}/{delivery}"
             );
             assert_eq!(h.state, if settled { "failed" } else { "unknown" });
-            assert_eq!(
+            let rejection = if delivery == "accepted"
+                && code != "NeedsRecovery"
+                && code != "OperationInProgress"
+            {
+                &h.recovery_evidence
+                    .iter()
+                    .find(|e| e["kind"] == "accepted_rejection")
+                    .unwrap()["response"]
+            } else {
                 h.observations[0]
                     .as_ref()
                     .unwrap()
                     .native_outcome
                     .as_ref()
-                    .unwrap()["error"]["delivery"],
-                delivery
-            );
+                    .unwrap()
+            };
+            assert_eq!(rejection["error"]["delivery"], delivery);
             let (dirty, holder):(u32, Option<String>)=f.conn().query_row("SELECT w.dirty,f.holder FROM joint_host_workspace w JOIN joint_fences f ON f.id='live' AND f.kind='source'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
             assert_eq!(dirty, if settled { 0 } else { 1 });
             assert_eq!(holder.is_some(), !settled);
@@ -2314,4 +2323,212 @@ mod native_host;
 #[ignore = "requires explicitly provisioned matching native installation and model credentials"]
 async fn native_current_view_host_bridge() {
     native_host::bridge().await;
+}
+
+#[tokio::test]
+async fn accepted_mutation_rejections_query_only_original_identity_and_require_postconditions() {
+    for method in ["write", "exec"] {
+        for case in [
+            "failed-old",
+            "failed-new",
+            "failed-directory",
+            "failed-missing-file",
+            "failed-read-error",
+            "needs_recovery",
+            "in_progress",
+            "accepted",
+            "not-found",
+            "bad-digest",
+            "bad-handle",
+            "bad-target",
+            "missing-error",
+            "missing-completed",
+        ] {
+            let f = Fixture::new().await;
+            let bytes = vec![0, 255, 7];
+            let state = match case {
+                "in_progress" => "running",
+                "needs_recovery" | "accepted" | "not-found" => case,
+                _ => "failed",
+            };
+            let mut patch = json!({"scenario":"accepted-error","error_code":"FileOperationFailed","delivery":"accepted","query_state":state,"files":{"work/artifact":STANDARD.encode(if case=="failed-new" {bytes.clone()}else{vec![2]})}});
+            if case == "failed-directory" {
+                patch["postcondition_read_error"] = json!("FileOperationFailed");
+                patch["postcondition_read_message"] = json!(
+                    "filesystem branch: invalid execution policy: target is not a regular file"
+                );
+            }
+            if case == "failed-missing-file" {
+                patch["postcondition_read_error"] = json!("FileOperationFailed");
+                patch["postcondition_read_message"] =
+                    json!("filesystem branch: read failed: No such file or directory (os error 2)");
+            }
+            if case == "failed-read-error" {
+                patch["postcondition_read_error"] = json!("ThinkThreadNotFound");
+            }
+            for (name, field) in [
+                ("bad-digest", "query_bad_digest"),
+                ("bad-handle", "query_bad_handle"),
+                ("bad-target", "query_error_target"),
+                ("missing-error", "query_missing_error"),
+                ("missing-completed", "query_missing_completed"),
+            ] {
+                if case == name {
+                    patch[field] = json!(true);
+                }
+            }
+            f.state(patch);
+            let request = if method == "write" {
+                write(bytes)
+            } else {
+                execute(exec())
+            };
+            let a = f.access("accepted", request.clone()).await.unwrap();
+            if method == "write" {
+                assert!(a.backend.write_host(request).await.is_err());
+            } else {
+                assert!(a.backend.exec().exec(exec()).await.is_err());
+            }
+            let h = f.intent("accepted").await;
+            let settled = method == "write"
+                && matches!(
+                    case,
+                    "failed-old" | "failed-directory" | "failed-missing-file"
+                );
+            assert_eq!(
+                h.state,
+                if settled { "failed" } else { "unknown" },
+                "{method}/{case}"
+            );
+            assert_eq!(h.result.is_some(), settled, "{method}/{case}");
+            assert_eq!(f.count(&format!("thinkthread.{method}")), 1);
+            assert_eq!(f.count("operation.get"), 1);
+            let query = f
+                .trace()
+                .into_iter()
+                .find(|v| v["method"] == "operation.get")
+                .unwrap();
+            assert_eq!(
+                query["params"]["operationId"],
+                h.prepared.native[0].operation_id
+            );
+            assert!(!h.recovery_evidence.is_empty());
+            if case != "not-found" {
+                assert!(
+                    h.recovery_evidence.iter().any(|e| e["state"] == state),
+                    "{method}/{case}: no parsed original query view"
+                );
+            }
+            let (dirty,holder):(u32,Option<String>)=f.conn().query_row("SELECT w.dirty,f.holder FROM joint_host_workspace w JOIN joint_fences f ON f.id='live' AND f.kind='source'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(dirty, if settled { 0 } else { 1 });
+            assert_eq!(holder.is_some(), !settled);
+            let allocation: String = f
+                .conn()
+                .query_row(
+                    "SELECT state FROM joint_host_allocations WHERE intent_id='accepted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(allocation, if settled { "released" } else { "reserved" });
+            let hold:u32=f.conn().query_row("SELECT count(*) FROM joint_refs WHERE kind='host_hold' AND public_id='accepted'",[],|r|r.get(0)).unwrap();
+            assert_eq!(hold, u32::from(!settled));
+            if settled {
+                assert_eq!(h.cleanup_state, "done");
+                assert!(h.blocker_id.is_none());
+                let before = f.snapshot();
+                assert!(f
+                    .owner()
+                    .recover_host("accepted".into(), repository(&f.root.path().join("db")))
+                    .await
+                    .is_err());
+                assert_eq!(before, f.snapshot());
+                assert!(f.access("next", write(vec![1])).await.is_ok());
+            } else {
+                assert!(h.blocker_id.is_some());
+                let before = f.snapshot();
+                assert!(f
+                    .repo
+                    .finish_host(a.access.clone(), json!({"error":"unsafe"}))
+                    .await
+                    .is_err());
+                assert!(f.repo.finish_host_cleanup(a.access).await.is_err());
+                assert!(f.access("next", write(vec![1])).await.is_err());
+                assert_eq!(before, f.snapshot());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_generation_changes_before_observation_or_finish_persist_failure_without_bytes() {
+    for before_finish in [false, true] {
+        let f = Fixture::new().await;
+        if before_finish {
+            f.conn().execute_batch("CREATE TRIGGER change_generation AFTER UPDATE ON joint_host_intents WHEN json_extract(NEW.body,'$.observations[0].result.data_base64') IS NOT NULL AND json_extract(NEW.body,'$.result') IS NULL BEGIN UPDATE joint_bindings SET generation=generation+1 WHERE id='live-binding'; END;").unwrap();
+        } else {
+            f.scenario("local-generation-change");
+        }
+        let a = f.access("stale-read", read()).await.unwrap();
+        assert!(a
+            .backend
+            .files()
+            .read_bytes(ReadBytesRequest {
+                path: BackendPath("artifact".into())
+            })
+            .await
+            .is_err());
+        let h = f.intent("stale-read").await;
+        assert_eq!(h.state, "failed");
+        assert_eq!(h.cleanup_state, "done");
+        assert!(h.artifact_evidence.is_none());
+        assert!(h.result.as_ref().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("generation changed"));
+        assert!(h.result.as_ref().unwrap().get("data_base64").is_none());
+        assert!(h.observations[0].as_ref().unwrap().result.is_null());
+        assert_eq!(f.count("thinkthread.read"), 1);
+        assert_eq!(f.count("thinkthread.write"), 0);
+        let generation: u64 = f
+            .conn()
+            .query_row(
+                "SELECT generation FROM joint_bindings WHERE id='live-binding'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+        let (dirty,holder):(u32,Option<String>)=f.conn().query_row("SELECT w.dirty,f.holder FROM joint_host_workspace w JOIN joint_fences f ON f.id='live' AND f.kind='source'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(dirty, 0);
+        assert!(holder.is_none());
+        assert_eq!(
+            f.conn()
+                .query_row(
+                    "SELECT state FROM joint_host_allocations WHERE intent_id='stale-read'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "released"
+        );
+        let before = f.snapshot();
+        assert!(f
+            .owner()
+            .recover_host("stale-read".into(), repository(&f.root.path().join("db")))
+            .await
+            .is_err());
+        assert_eq!(before, f.snapshot());
+    }
+}
+
+#[tokio::test]
+async fn stale_read_failure_cannot_release_a_replaced_writer_fence() {
+    let f = Fixture::new().await;
+    let a = f.access("stale", read()).await.unwrap();
+    f.repo.claim_host_step(a.access.clone(), 0).await.unwrap();
+    f.conn().execute_batch("UPDATE joint_bindings SET generation=2 WHERE id='live-binding'; UPDATE joint_fences SET epoch=epoch+1,holder='another-owner' WHERE kind='source' AND id='live';").unwrap();
+    let before = f.snapshot();
+    assert!(f.repo.fail_stale_host_read(a.access).await.is_err());
+    assert_eq!(before, f.snapshot());
 }

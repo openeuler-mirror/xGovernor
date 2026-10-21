@@ -555,6 +555,13 @@ impl HostRepository for SqliteSessionRepository {
         self.joint_transaction(move |tx| settle_host(tx, access, result, None))
             .await
     }
+    async fn fail_stale_host_read(
+        &self,
+        access: HostAccessTokenV1,
+    ) -> std::result::Result<Value, SessionDomainError> {
+        self.joint_transaction(move |tx| fail_stale_read(tx, access))
+            .await
+    }
     async fn finish_host_read(
         &self,
         access: HostAccessTokenV1,
@@ -724,6 +731,9 @@ fn settle_host(
             Err(conflict("Host result replay changed"))
         };
     }
+    if revisions.is_some() && read_generation_changed(tx, &old)? {
+        return fail_stale_read(tx, access);
+    }
     let mut h = check(tx, &access, true)?;
     let unsent = h.observations.iter().all(Option::is_none);
     if !all_settled(&h) && !(unsent && result.get("error").is_some()) {
@@ -811,9 +821,36 @@ fn settle_host(
         "completed"
     }
     .into();
-    h.cleanup_state = if unsent { "done" } else { "pending" }.into();
+    let reconciled_failure = result.get("error").is_some()
+        && h.recovery_evidence.iter().any(|e| {
+            e["kind"] == "failed_write_postcondition"
+                && e["confirmed"] == true
+                && e["target_digest"] == access.target_digest
+                && e["step"].as_u64().is_some_and(|step| {
+                    let step = step as usize;
+                    h.prepared.native.get(step).is_some_and(|n| {
+                        n.method == "thinkthread.write" && e["original_uuid"] == n.operation_id
+                    }) && h
+                        .observations
+                        .get(step)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|o| {
+                            o.settled
+                                && o.state == NativeOperationState::Failed
+                                && o.native_outcome
+                                    .as_ref()
+                                    .is_some_and(|v| v["state"] == "failed")
+                        })
+                })
+        });
+    h.cleanup_state = if unsent || reconciled_failure {
+        "done"
+    } else {
+        "pending"
+    }
+    .into();
     h.blocker_id = None;
-    if unsent {
+    if unsent || reconciled_failure {
         tx.execute(
             "UPDATE joint_host_allocations SET state='released' WHERE intent_id=?1",
             [&access.admission.intent_id],
@@ -828,6 +865,89 @@ fn settle_host(
         params![encode(&result)?, access.admission.intent_id],
     )?;
     tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND (active_intent=?1 OR active_intent IS NULL)",params![access.admission.intent_id,access.admission.binding.binding_id])?;
+    release_fences(tx, &access.admission.intent_id)?;
+    save(tx, &h)?;
+    Ok(result)
+}
+
+fn read_generation_changed(tx: &Transaction<'_>, h: &HostIntentV1) -> Result<bool> {
+    if !matches!(h.prepared.request, HostCanonicalRequestV1::Read { .. }) {
+        return Ok(false);
+    }
+    let t = &h.prepared.target;
+    let current: Option<(String,u64,u64)> = tx.query_row(
+        "SELECT s.binding_id,b.generation,r.generation FROM joint_sessions s JOIN joint_bindings b ON b.id=s.binding_id JOIN joint_host_roots r ON r.binding_id=?2 WHERE s.runtime_id=?1",
+        params![t.public_runtime_id,t.root_binding_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+    Ok(current.is_none_or(|(binding, generation, root)| {
+        binding != t.live_binding.binding_id
+            || generation != t.binding_generation
+            || root != t.root_runtime_generation
+    }))
+}
+
+fn fail_stale_read(tx: &Transaction<'_>, access: HostAccessTokenV1) -> Result<Value> {
+    let mut h = check(tx, &access, false)?;
+    if let Some(result) = h.result {
+        return Ok(result);
+    }
+    if !h.prepared.native.is_empty() || !read_generation_changed(tx, &h)? {
+        return Err(conflict(
+            "only a stale read can fail without current target admission",
+        ));
+    }
+    let (request, stage, _) = operation(tx, &access.admission)?;
+    if !["prepared", "accepted", "unknown"].contains(&stage.as_str())
+        || h.state == "suspended_waiting_dependency"
+    {
+        return Err(conflict("Host operation is not active"));
+    }
+    // A stale read has no native effects; release only its unchanged fence epochs.
+    let root: (u64, Option<String>) = tx.query_row(
+        "SELECT epoch,holder FROM joint_fences WHERE kind='root' AND id=?1",
+        [&request.root_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let source: (u64, Option<String>) = tx.query_row(
+        "SELECT epoch,holder FROM joint_fences WHERE kind='source' AND id=?1",
+        [&request.source_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if request.exclusive_root
+        || root.0 != access.admission.root_epoch
+        || root.1.is_some()
+        || Some(source.0) != access.admission.source_epoch
+        || source.1.as_deref() != Some(&access.admission.intent_id)
+    {
+        return Err(conflict("stale read fence changed"));
+    }
+    let result = json!({"error":"artifact local binding generation changed during read"});
+    h.observations[0] = Some(HostObservationV1 {
+        state: NativeOperationState::Failed,
+        settled: true,
+        result: Value::Null,
+        transfer: None,
+        exec: None,
+        error: Some("artifact local binding generation changed during read".into()),
+        native_outcome: None,
+    });
+    h.result = Some(result.clone());
+    h.artifact_evidence = None;
+    h.state = "failed".into();
+    h.cleanup_state = "done".into();
+    h.blocker_id = None;
+    tx.execute(
+        "UPDATE joint_operations SET stage='settled',publication_json=?1 WHERE id=?2",
+        params![encode(&result)?, access.admission.intent_id],
+    )?;
+    tx.execute(
+        "UPDATE joint_host_allocations SET state='released' WHERE intent_id=?1",
+        [&access.admission.intent_id],
+    )?;
+    tx.execute(
+        "DELETE FROM joint_refs WHERE kind='host_hold' AND public_id=?1",
+        [&access.admission.intent_id],
+    )?;
+    tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND generation=?3 AND (active_intent=?1 OR active_intent IS NULL)",params![access.admission.intent_id,access.admission.binding.binding_id,access.admission.generation])?;
     release_fences(tx, &access.admission.intent_id)?;
     save(tx, &h)?;
     Ok(result)

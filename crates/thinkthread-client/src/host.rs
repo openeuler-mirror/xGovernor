@@ -444,10 +444,14 @@ impl CandidateHostBackend {
                 }
                 Err(_) => false,
             };
-            let (target, policy) = repository
+            let local = repository
                 .host_target(self.prepared.target.public_runtime_id.clone())
-                .await?;
-            if !stable || target != self.prepared.target || policy != self.prepared.policy {
+                .await;
+            if !matches!(&local, Ok((target, policy)) if target == &self.prepared.target && policy == &self.prepared.policy)
+            {
+                return result_value(repository.fail_stale_host_read(self.access.clone()).await?);
+            }
+            if !stable {
                 let mut failed = result;
                 failed.state = NativeOperationState::Failed;
                 failed.error = Some("artifact target or revision changed during read".into());
@@ -457,25 +461,31 @@ impl CandidateHostBackend {
                     .await?;
                 return self.finish(failed).await;
             }
-            repository
+            if repository
                 .record_host_step(self.access.clone(), 0, result.clone())
-                .await?;
-            return repository
-                .finish_host_read(
-                    self.access.clone(),
-                    result.result,
-                    serde_json::to_value(view.content_revision)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                    serde_json::to_value(after.unwrap().content_revision)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_owned(),
-                )
-                .await;
+                .await
+                .is_err()
+            {
+                return result_value(repository.fail_stale_host_read(self.access.clone()).await?);
+            }
+            return result_value(
+                repository
+                    .finish_host_read(
+                        self.access.clone(),
+                        result.result,
+                        serde_json::to_value(view.content_revision)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                        serde_json::to_value(after.unwrap().content_revision)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                    .await?,
+            );
         }
         for step in 0..self.prepared.native.len() {
             let n = &self.prepared.native[step];
@@ -534,7 +544,7 @@ impl CandidateHostBackend {
                     .await
                 {
                     Ok(raw) => self.write_observation(raw, step)?,
-                    Err(e) => self.error_observation(e, false),
+                    Err(e) => self.mutation_error(client, step, e).await?,
                 }
             } else {
                 let req: sdk::ThinkThreadExecRequest = serde_json::from_value(n.params.clone())
@@ -545,7 +555,7 @@ impl CandidateHostBackend {
                     .await
                 {
                     Ok(raw) => self.exec_observation(raw, step)?,
-                    Err(e) => self.error_observation(e, false),
+                    Err(e) => self.mutation_error(client, step, e).await?,
                 }
             };
             repository
@@ -587,6 +597,85 @@ impl CandidateHostBackend {
                 .await?;
         }
         Err(host_unavailable(message))
+    }
+    async fn mutation_error(
+        &self,
+        client: &sdk::ThinkThreadClient,
+        step: usize,
+        error: sdk::ManagementError,
+    ) -> Result<HostObservationV1, SessionDomainError> {
+        let query = matches!(&error, sdk::ManagementError::Rejected(body) if body.delivery==sdk::Delivery::Accepted && body.code!="NeedsRecovery" && body.code!="OperationInProgress");
+        let observation = self.error_observation(error, false);
+        if !query {
+            return Ok(observation);
+        }
+        store(&self.repository)?.record_host_recovery(self.access.clone(),json!({"kind":"accepted_rejection","step":step,"original_uuid":self.prepared.native[step].operation_id,"response":observation.native_outcome})).await?;
+        store(&self.repository)?
+            .record_host_step(self.access.clone(), step, observation)
+            .await?;
+        self.query_step(client, step).await
+    }
+
+    async fn failed_postcondition(
+        &self,
+        client: &sdk::ThinkThreadClient,
+        step: usize,
+    ) -> Result<bool, SessionDomainError> {
+        let n = &self.prepared.native[step];
+        let (confirmed, observation) = if let HostCanonicalRequestV1::Write {
+            path,
+            size,
+            sha256,
+            max_bytes,
+            ..
+        } = &self.prepared.request
+        {
+            if n.method != "thinkthread.write" {
+                (
+                    false,
+                    json!({"reason":"exec business postcondition and settlement evidence are not declared"}),
+                )
+            } else {
+                match client
+                    .thinkthreads()
+                    .read(sdk::ThinkThreadReadRequest {
+                        thinkthread_id: self.prepared.target.native_child_id.clone(),
+                        path: PathBuf::from(path),
+                        max_bytes: *max_bytes,
+                    })
+                    .await
+                {
+                    Ok(raw) => {
+                        let bytes = STANDARD
+                            .decode(&raw.data_base64)
+                            .map_err(|_| host_unavailable("postcondition read encoding invalid"))?;
+                        let confirmed = raw.thinkthread_id == self.prepared.target.native_child_id
+                            && bytes.len() <= *max_bytes as usize
+                            && (bytes.len() as u64 != *size
+                                || host_bytes_digest(&bytes) != *sha256);
+                        (
+                            confirmed,
+                            json!({"thinkthread_id":raw.thinkthread_id,"length":bytes.len(),"sha256":host_bytes_digest(&bytes)}),
+                        )
+                    }
+                    Err(error) => {
+                        let confirmed = matches!(&error,sdk::ManagementError::Rejected(body) if body.code=="FileOperationFailed" && (body.message=="filesystem branch: invalid execution policy: target is not a regular file" || body.message=="filesystem branch: invalid execution policy: only regular file reads are supported" || (body.message.starts_with("filesystem branch: ") && body.message.ends_with("No such file or directory (os error 2)"))));
+                        let raw = match &error {
+                            sdk::ManagementError::Rejected(body) => json!({"error":body}),
+                            _ => json!({"error":error.to_string()}),
+                        };
+                        (confirmed, raw)
+                    }
+                }
+            }
+        } else {
+            (
+                false,
+                json!({"reason":"exec business postcondition and settlement evidence are not declared"}),
+            )
+        };
+        store(&self.repository)?.record_host_recovery(self.access.clone(),json!({"kind":"failed_write_postcondition","step":step,"original_uuid":n.operation_id,"target_digest":self.access.target_digest,"confirmed":confirmed,"observation":observation})).await?;
+        Ok(confirmed)
     }
     fn error_observation(&self, e: sdk::ManagementError, read: bool) -> HostObservationV1 {
         let recovery_required = matches!(&e, sdk::ManagementError::Rejected(body)
@@ -725,15 +814,25 @@ impl CandidateHostBackend {
         {
             return Err(host_unavailable("Host recovery context changed"));
         }
-        let view = client
+        let view = match client
             .get_operation(sdk::OperationGetRequest {
                 scope: sdk::OperationScope::ThinkThread,
                 operation_id: n.operation_id.clone(),
             })
             .await
-            .map_err(|_| {
-                host_unavailable("original Host operation unavailable; retained unknown")
-            })?;
+        {
+            Ok(view) => view,
+            Err(error) => {
+                let raw = match &error {
+                    sdk::ManagementError::Rejected(body) => json!({"error":body}),
+                    _ => json!({"error":error.to_string()}),
+                };
+                store(&self.repository)?.record_host_recovery(self.access.clone(),json!({"kind":"operation_query_error","original_uuid":n.operation_id,"response":raw})).await?;
+                return Err(host_unavailable(
+                    "original Host operation unavailable; retained unknown",
+                ));
+            }
+        };
         store(&self.repository)?
             .record_host_recovery(
                 self.access.clone(),
@@ -744,6 +843,36 @@ impl CandidateHostBackend {
         self.validate_handle(&view.operation, step)?;
         if view.method != n.method {
             return Err(host_unavailable("original Host operation method mismatch"));
+        }
+        if n.params["thinkthreadId"] != self.prepared.target.native_child_id {
+            return Err(host_unavailable("original Host target changed"));
+        }
+        if view.state == sdk::OperationState::Failed
+            && view.completed_at.is_some()
+            && view
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code != "NeedsRecovery" && e.code != "OperationInProgress")
+        {
+            if view
+                .error
+                .as_ref()
+                .and_then(|e| e.details.as_ref())
+                .and_then(|d| d.get("thinkthreadId"))
+                .is_some_and(|id| id != &json!(self.prepared.target.native_child_id))
+            {
+                return Err(host_unavailable("failed Host result target mismatch"));
+            }
+            let settled = self.failed_postcondition(client, step).await?;
+            return Ok(HostObservationV1 {
+                state: NativeOperationState::Failed,
+                settled,
+                result: Value::Null,
+                transfer: self.transfer(if settled { "failed" } else { "unknown" }, None),
+                exec: None,
+                error: Some("original Host operation failed; postcondition checked".into()),
+                native_outcome: Some(serde_json::to_value(view).unwrap()),
+            });
         }
         if view.state != sdk::OperationState::Succeeded {
             let state = match view.state {

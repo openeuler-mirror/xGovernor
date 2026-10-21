@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import time
+import sqlite3
 
 trace = os.environ['XG_TEST_TRACE']
 state_path = os.environ['XG_TEST_STATE']
@@ -60,6 +61,8 @@ while True:
                     'state': 'Running', 'sessionState': 'Ready', 'agent': 'fixture', 'fs': os.environ['XG_TEST_FS'],
                     'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' else 'private-branch', 'contentRevision': str(current.get('revision', '1')), 'needsRecovery': False})
     elif method == 'thinkthread.read':
+        if current.get('postcondition_read_error'):
+            reply(req,error={'code':current['postcondition_read_error'],'message':current.get('postcondition_read_message','unavailable'),'retryable':False,'delivery':'not_sent'});continue
         data = base64.b64decode(current.get('files', {}).get(params['path'], '')) if params['path'] in current.get('files', {}) else bytes(range(256)) * 513 + b'\x00\xfftail'
         if scenario == 'empty':
             data = b''
@@ -77,11 +80,14 @@ while True:
         if scenario != 'missing-end':
             sys.stdout.buffer.write(struct.pack('>I', 0))
         sys.stdout.buffer.flush()
+        if scenario == 'local-generation-change':
+            with sqlite3.connect(os.environ['XG_TEST_DB']) as conn:
+                conn.execute("UPDATE joint_bindings SET generation=generation+1 WHERE id='live-binding'")
         if scenario in ('changed-revision', 'changed-branch'):
             current['revision'] = '2'
             if scenario == 'changed-branch': current['scenario'] = 'get-wrong-branch'
             with open(state_path, 'w') as f: json.dump(current, f)
-        if scenario not in ('ok', 'empty', 'changed-revision', 'changed-branch', 'commit-failure'):
+        if scenario not in ('ok', 'empty', 'changed-revision', 'changed-branch', 'commit-failure', 'local-generation-change'):
             break
     elif method == 'thinkthread.write':
         data = bytearray()
@@ -92,7 +98,7 @@ while True:
             data.extend(sys.stdin.buffer.read(n))
         if scenario in ('checksum-reject', 'length-reject', 'rejected-write'):
             reject(req, {'checksum-reject': 'ChecksumMismatch', 'length-reject': 'LengthMismatch', 'rejected-write': 'FileWriteRejected'}[scenario], 'not_sent'); continue
-        if scenario == 'mutation-rejected':
+        if scenario in ('mutation-rejected','accepted-error'):
             reject(req, current['error_code'], current['delivery']); continue
         assert len(data) == params['byteLength']
         assert hashlib.sha256(data).hexdigest() == params['sha256']
@@ -112,13 +118,13 @@ while True:
                 reply(req, exec_result(params, {'code': 1})); continue
             current.setdefault('directories', []).append(params['argv'][-1])
             with open(state_path, 'w') as f: json.dump(current, f)
-        if scenario == 'mutation-rejected':
+        if scenario in ('mutation-rejected','accepted-error'):
             reject(req, current['error_code'], current['delivery']); continue
         if scenario == 'drop': sys.exit(0)
         if scenario == 'hang': time.sleep(20); sys.exit(0)
         reply(req, exec_result(params, current))
     elif method == 'operation.get':
-        if scenario in ('not-found', 'ttl'):
+        if scenario in ('not-found', 'ttl') or current.get('query_state') == 'not-found':
             reject(req, 'OperationNotFound'); continue
         with open(trace) as f:
             original = next(json.loads(line) for line in f if json.loads(line)['params'].get('operationId') == params['operationId'])
@@ -129,8 +135,14 @@ while True:
         if scenario == 'wrong-handle': h['operationId'] = 'wrong'
         if scenario == 'wrong-target': result['thinkthreadId'] = 'other-child'
         if scenario == 'missing-result': result = None
+        if current.get('query_bad_digest'): h['operationDigest']='0'*64
+        if current.get('query_bad_handle'): h['operationId']='wrong'
+        query_state=current.get('query_state', 'needs_recovery' if scenario in ('needs-recovery','mutation-rejected') else 'succeeded')
+        error={'code':'FileOperationFailed','message':'native terminal failure','retryable':False,'delivery':'accepted'}
+        if current.get('query_error_target'): error['details']={'thinkthreadId':'other-child'}
+        if current.get('query_missing_error'): error=None
         reply(req, {'operation': h, 'method': 'wrong.method' if scenario == 'wrong-method' else original['method'],
-                    'state': 'needs_recovery' if scenario == 'needs-recovery' else 'succeeded',
-                    'acceptedAt': '2026-01-01T00:00:00Z', 'result': result})
+                    'state': query_state,
+                    'acceptedAt': '2026-01-01T00:00:00Z', 'completedAt': None if current.get('query_missing_completed') else '2026-01-01T00:00:01Z', 'error':error if query_state=='failed' else None, 'result': result if query_state=='succeeded' else None})
     else:
         reject(req, 'UnknownFixtureMethod')

@@ -132,8 +132,16 @@ native mutation UUID. Mutation claims set the local workspace dirty before
 sending; EOF, an observation timeout, a missing operation or `needs_recovery`
 retains ownership and the fence. Recovery queries the original UUID and checks
 the SDK digest and exact target without sending a replacement mutation.
-Rejected mutations settle only with `delivery=not_sent`; `NeedsRecovery` and
-`OperationInProgress` retain the blocker even with that delivery value. Failures
+Rejected mutations initially settle only with `delivery=not_sent`; `NeedsRecovery`
+and `OperationInProgress` retain the blocker even with that delivery value.
+Other accepted rejections query the original operation UUID and verify its handle,
+digest and target. A terminal failed write also requires a public read confirming
+that the requested bytes were not published, or a recognized nonregular/missing
+file rejection. Only then do failure, dirty-state clearing, fence release and
+owned allocation release commit together. Missing or inconsistent evidence stays
+unknown; a failed exec record alone provides no declared business postcondition.
+The original rejection, query and postcondition observations remain in the journal.
+Failures
 before the first durable claim finish without sending and release their local
 reservation and Root hold. Replaying a committed failure preserves its error
 classification.
@@ -157,8 +165,10 @@ No filesystem durability or process cleanup helper is supplied.
 A successful read rechecks the exact target, local generations and public content
 revision after receiving all bytes. Its result and `ArtifactEvidenceV1` source,
 revision, length and hash commit together. A changed view cannot publish a stable
-artifact. Revision equality only describes the writers covered by the local
-fence. Export handles remain unsupported until owned byte-reference lifetime and
+artifact. A local binding-generation change aborts the read durably without
+returning bytes; this side-effect-free failure can release only its original,
+unchanged fence epochs and cannot release a newer writer's fence. Revision
+equality only describes the writers covered by the local fence. Export handles remain unsupported until owned byte-reference lifetime and
 cleanup are available.
 
 Owned cleanup dependencies can suspend an already settled parent and its child
