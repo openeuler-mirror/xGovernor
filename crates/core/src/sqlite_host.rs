@@ -8,7 +8,7 @@ use crate::{
     *,
 };
 use async_trait::async_trait;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
 const SCHEMA: &str = "
@@ -20,8 +20,7 @@ CREATE TABLE IF NOT EXISTS joint_host_workspace(binding_id TEXT PRIMARY KEY REFE
 CREATE TABLE IF NOT EXISTS joint_host_cleanup(parent_id TEXT PRIMARY KEY REFERENCES joint_operations(id), child_id TEXT UNIQUE REFERENCES joint_operations(id), state TEXT NOT NULL, delegated INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS joint_host_dependencies(parent_id TEXT NOT NULL REFERENCES joint_operations(id), dependency TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(parent_id,dependency));
 ";
-pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
+pub(crate) fn init(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS joint_host_schema(version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)")?;
     let versions: u32 = tx.query_row("SELECT count(*) FROM joint_host_schema", [], |r| r.get(0))?;
     if versions > 1 {
@@ -40,7 +39,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
     if old.is_none() {
         tx.execute("INSERT INTO joint_host_schema VALUES(1,?1)", [&checksum])?;
     }
-    tx.commit()
+    Ok(())
 }
 fn validate_target(
     tx: &Transaction<'_>,

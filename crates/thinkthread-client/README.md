@@ -213,3 +213,14 @@ The ordinary-cancel declaration records the supplier evidence and checkpoint
 requirement; this router exposes no new public cancellation path. Candidate
 capture/load and public close retain their existing unsupported behavior.
 No production backend registration is added.
+
+An enrolled database retains its deployment protection across connection and
+process lifetimes. Unbound session connections can read existing schema but do
+not initialize, migrate, or write it. Split and joint writes check the holder
+inside an immediate SQLite transaction, serialized with deployment enrollment.
+The SQLite provider ledger has no deployment-holder binding and therefore
+refuses schema initialization and all writes to an enrolled database; existing
+ledger rows remain readable. Ordinary databases without deployment registration
+retain their legacy session and provider-ledger behavior. The default server
+uses one database file for session records and all provider ledgers. No separate
+provider-ledger file is selected by the explicit joint profile implementation.

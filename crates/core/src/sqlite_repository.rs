@@ -59,8 +59,8 @@ impl SqliteSessionRepository {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(path)?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open(path)?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
@@ -73,8 +73,8 @@ impl SqliteSessionRepository {
     /// In-memory database. For tests only — by definition there is nothing
     /// to survive a restart.
     pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             joint_transactions: false,
@@ -122,11 +122,17 @@ impl SqliteSessionRepository {
         Ok(self)
     }
 
-    fn init(conn: &Connection) -> rusqlite::Result<()> {
-        // Best-effort: `:memory:` connections silently ignore WAL (falls
-        // back to the default journal mode), which is fine for tests.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.pragma_update(None, "busy_timeout", 5_000i64);
+    fn init(connection: &mut Connection) -> rusqlite::Result<()> {
+        let _ = connection.pragma_update(None, "busy_timeout", 5_000i64);
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        // Enrollment and initialization serialize with business writers. A reader
+        // must not migrate a database whose deployment holder it does not own.
+        let conn =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if deployment_registered(&conn)? {
+            return Ok(());
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS snapshot_operations (id TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sessions (
@@ -172,9 +178,36 @@ impl SqliteSessionRepository {
         if !has_execution {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{\"kind\":\"split_v1\"}';")?;
         }
-        crate::sqlite_joint::init(conn)?;
-        crate::sqlite_host::init(conn)
+        crate::sqlite_joint::init(&conn)?;
+        crate::sqlite_host::init(&conn)?;
+        conn.commit()?;
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        Ok(())
     }
+}
+
+/// The durable deployment row is also a write-protection marker. Treat even an
+/// incomplete registration as protected rather than guessing legacy ownership.
+pub(crate) fn deployment_registered(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deployment')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+pub(crate) fn verify_writer(
+    conn: &Connection,
+    #[cfg(unix)] deployment: Option<&crate::DeploymentGuard>,
+) -> rusqlite::Result<()> {
+    #[cfg(unix)]
+    if let Some(holder) = deployment {
+        return holder.validate().map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    if deployment_registered(conn)? {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
 }
 
 fn status_to_str(status: SessionStatus) -> &'static str {
@@ -461,14 +494,19 @@ impl SessionRepository for SqliteSessionRepository {
             let lease_json = record.lease.as_ref().map(json_encode).transpose()?;
             let lineage_json = record.lineage.as_ref().map(json_encode).transpose()?;
 
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            #[cfg(unix)]
-            if let Some(holder) = &deployment {
-                holder.validate().map_err(|e| e.to_string())?;
-            }
-            let changed = conn
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+            let changed = tx
                 .execute(
                     "INSERT INTO sessions (
                     runtime_id, conversation_id, sender_id, status,
@@ -517,7 +555,7 @@ impl SessionRepository for SqliteSessionRepository {
             if changed != 1 {
                 return Err("persisted execution route cannot be replaced".into());
             }
-            Ok(())
+            tx.commit().map_err(|e| e.to_string())
         })
         .await
         .map_err(|error| internal_error(format!("sqlite save task panicked: {error}")))?;
@@ -534,12 +572,11 @@ impl SessionRepository for SqliteSessionRepository {
         #[cfg(unix)]
         let deployment = self.deployment.clone();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || { let conn = conn.lock().unwrap();
-            #[cfg(unix)]
-            if let Some(holder) = &deployment {
-                holder.validate()?;
-            }
-            conn.execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map(|_|()).map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
+        tokio::task::spawn_blocking(move || { let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| internal_error(e.to_string()))?;
+            verify_writer(&tx, #[cfg(unix)] deployment.as_deref()).map_err(|e| internal_error(e.to_string()))?;
+            tx.execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map_err(|e|internal_error(e.to_string()))?;
+            tx.commit().map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
     }
     async fn operation_intents(
         &self,
@@ -571,14 +608,19 @@ impl SessionRepository for SqliteSessionRepository {
         let deployment = self.deployment.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            #[cfg(unix)]
-            if let Some(holder) = &deployment {
-                holder.validate()?;
-            }
-            conn.execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
-                .map(|_| ())
-                .map_err(|e| internal_error(e.to_string()))
+            let mut conn = conn.lock().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| internal_error(e.to_string()))?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
+            )
+            .map_err(|e| internal_error(e.to_string()))?;
+            tx.execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
+                .map_err(|e| internal_error(e.to_string()))?;
+            tx.commit().map_err(|e| internal_error(e.to_string()))
         })
         .await
         .map_err(|e| internal_error(e.to_string()))?
@@ -592,12 +634,10 @@ impl SessionRepository for SqliteSessionRepository {
         let deployment = self.deployment.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let runtime_json = json_encode(&record.runtime_state)?; let workspace_json = json_encode(&record.workspace)?; let isolation_json = json_encode(&record.isolation)?; let capabilities_json = json_encode(&record.capabilities)?;
-            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            #[cfg(unix)]
-            if let Some(holder) = &deployment {
-                holder.validate().map_err(|e| e.to_string())?;
-            }
-            conn.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; Ok(())
+            let mut conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            verify_writer(&tx, #[cfg(unix)] deployment.as_deref()).map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; tx.commit().map_err(|e| e.to_string())
         }).await.map_err(|e| internal_error(format!("sqlite checkpoint save task panicked: {e}")))?;
         result.map_err(|e| internal_error(format!("sqlite checkpoint save failed: {e}")))
     }
@@ -625,19 +665,26 @@ impl SessionRepository for SqliteSessionRepository {
         let deployment = self.deployment.clone();
         let checkpoint_id = checkpoint_id.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            #[cfg(unix)]
-            if let Some(holder) = &deployment {
-                holder.validate().map_err(|e| e.to_string())?;
-            }
-            conn.execute(
-                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
-                params![checkpoint_id],
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
             )
-            .map(|changed| changed > 0)
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())?;
+            let changed = tx
+                .execute(
+                    "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+                    params![checkpoint_id],
+                )
+                .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(changed > 0)
         })
         .await
         .map_err(|error| {

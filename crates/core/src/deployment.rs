@@ -236,6 +236,9 @@ impl DeploymentGuard {
                 .collect::<Vec<_>>(),
         )
         .map_err(|_| unavailable())?;
+        for object in &objects {
+            object.validate()?;
+        }
         tx.execute("INSERT INTO local_deployment VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,'configuration_verified',1) ON CONFLICT(singleton) DO UPDATE SET budget_hash=excluded.budget_hash,budget_policy_ref=excluded.budget_policy_ref,database_path=excluded.database_path,holder_instance_id=excluded.holder_instance_id,boot_id=excluded.boot_id,lock_identity_refs=excluded.lock_identity_refs,status=excluded.status,row_version=local_deployment.row_version+1",
             params![database_identity, deployment_id, namespace.to_string_lossy(), policy_hash,configuration.policy_ref,database_path.to_string_lossy(),uuid::Uuid::new_v4().to_string(),boot_id.trim(),locks])
             .map_err(|_| unavailable())?;
@@ -556,6 +559,7 @@ impl DeploymentGuard {
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| unavailable())?;
+        self.validate()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS execution_configurations(revision TEXT PRIMARY KEY, digest TEXT NOT NULL, references_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS execution_defaults(runtime_kind TEXT PRIMARY KEY, owner_kind TEXT NOT NULL, revision TEXT NOT NULL, digest TEXT NOT NULL, enabled INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS execution_admissions(intent_id TEXT PRIMARY KEY REFERENCES joint_operations(id),profile_revision TEXT NOT NULL REFERENCES execution_configurations(revision),operation_kind TEXT NOT NULL,tenant_key TEXT NOT NULL,owner_ref TEXT NOT NULL,principal TEXT NOT NULL,request_digest TEXT NOT NULL,policy_digest TEXT NOT NULL,declaration_ref TEXT NOT NULL,required_capabilities_json TEXT NOT NULL,usage_requirement TEXT NOT NULL,reservation_refs_json TEXT NOT NULL,decision TEXT NOT NULL,reason TEXT NOT NULL,budget_policy_ref TEXT NOT NULL,budget_policy_hash TEXT NOT NULL)").map_err(|_| unavailable())?;
@@ -598,6 +602,7 @@ impl DeploymentGuard {
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| unavailable())?;
+        self.validate()?;
         let previous:Option<u64>=tx.query_row("SELECT length(CAST(runtime_kind AS BLOB))+length(CAST(owner_kind AS BLOB))+length(CAST(revision AS BLOB))+length(CAST(digest AS BLOB))+1 FROM execution_defaults WHERE runtime_kind=?1",[runtime],|r|r.get(0)).optional().map_err(|_|unavailable())?;
         let new = (runtime.len() + owner.len() + revision.len() + digest.len() + 1) as u64;
         let growth = new.saturating_sub(previous.unwrap_or(0));
@@ -1692,6 +1697,259 @@ mod guarded_writes {
         assert!(guard.validate().is_err());
         eprintln!("sample replaced identity/split save+intent+checkpoint+delete/joint/copy contender: original rows and fences retained");
     }
+    fn ledger_instance() -> provider_protocol::ProviderInstance {
+        provider_protocol::ProviderInstance {
+            backend_id: provider_protocol::BackendId("local".into()),
+            provider: provider_protocol::ProviderKind("local".into()),
+            instance_id: provider_protocol::ProviderInstanceId("instance".into()),
+            state: provider_protocol::ProviderLifecycleState::Active,
+            endpoint: None,
+            snapshot: None,
+            capabilities: Default::default(),
+            resources: Default::default(),
+            metadata: serde_json::json!({}),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn enrollment_fences_unbound_session_and_ledger_connections_across_replacement_and_restart(
+    ) {
+        use backend::{ProviderInstanceLedger, SqliteProviderInstanceLedger};
+        let f = Fixture::new();
+        let original = SqliteSessionRepository::open(&f.database).unwrap();
+        let ledger = SqliteProviderInstanceLedger::open(&f.database).unwrap();
+        let mut record = original.get("existing-session").await.unwrap().unwrap();
+        record.runtime_id = "legacy".into();
+        record.execution_backing = crate::SessionExecutionBacking::SplitV1;
+        original.save(record.clone()).await.unwrap();
+        original
+            .save_operation_intent("kept", serde_json::json!({"original":true}))
+            .await
+            .unwrap();
+        let checkpoint = crate::CheckpointRecord {
+            checkpoint_id: "checkpoint".into(),
+            source_runtime_id: record.runtime_id.clone(),
+            provider_snapshot_id: "original-snapshot".into(),
+            runtime_state: record.runtime.clone(),
+            workspace: record.workspace.clone(),
+            isolation: record.isolation.clone(),
+            capabilities: record.capabilities.clone(),
+            owner_ref: crate::ADMIN_OWNER_REF.into(),
+            tenant_id: None,
+            created_by: None,
+            created_at_ms: 1,
+        };
+        original.save_checkpoint(checkpoint.clone()).await.unwrap();
+        ledger
+            .record_created("legacy", "owner", &ledger_instance())
+            .await
+            .unwrap();
+        let guard = f.guard();
+        let bound = guard
+            .bind_split_repository(
+                SqliteSessionRepository::open(&f.database)
+                    .unwrap()
+                    .with_joint_budget_policy(tests::budget(4))
+                    .unwrap(),
+            )
+            .unwrap();
+        record.updated_at_ms = 2;
+        bound.save(record.clone()).await.unwrap();
+        bound
+            .save_operation_intent("bound", serde_json::json!({"bound":true}))
+            .await
+            .unwrap();
+        for phase in ["live", "replaced"] {
+            if phase == "replaced" {
+                let lock = f
+                    .namespace
+                    .join(format!("{}.lock", guard.database_identity()));
+                std::fs::rename(&lock, lock.with_extension("previous")).unwrap();
+                std::fs::write(&lock, []).unwrap();
+                assert!(guard.validate().is_err());
+                assert!(bound.save(record.clone()).await.is_err());
+            }
+            // These connections are created after enrollment and after replacement;
+            // the original connections above were opened before enrollment.
+            let reopened = SqliteSessionRepository::open(&f.database).unwrap();
+            let reopened_ledger = SqliteProviderInstanceLedger::open(&f.database).unwrap();
+            let before = capacity_tests::business_snapshot(&f.database);
+            for (entry, repo) in [("pre-enrollment", &original), ("reopened", &reopened)] {
+                assert_eq!(repo.get("legacy").await.unwrap(), Some(record.clone()));
+                let mut changed = record.clone();
+                changed.updated_at_ms = 99;
+                assert!(repo.save(changed).await.is_err(), "{phase}/{entry}/split");
+                assert!(
+                    repo.save_operation_intent("new", serde_json::json!({}))
+                        .await
+                        .is_err(),
+                    "{phase}/{entry}/intent"
+                );
+                assert!(
+                    repo.delete_operation_intent("kept").await.is_err(),
+                    "{phase}/{entry}/delete-intent"
+                );
+                let mut changed = checkpoint.clone();
+                changed.checkpoint_id = "new".into();
+                assert!(
+                    repo.save_checkpoint(changed).await.is_err(),
+                    "{phase}/{entry}/checkpoint"
+                );
+                assert!(
+                    repo.delete_checkpoint("checkpoint").await.is_err(),
+                    "{phase}/{entry}/delete-checkpoint"
+                );
+                assert!(
+                    repo.joint_transaction(|_| Ok(())).await.is_err(),
+                    "{phase}/{entry}/joint"
+                );
+                assert!(repo
+                    .operation_intents()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|(id, _)| id == "kept"));
+                assert!(repo.get_checkpoint("checkpoint").await.unwrap().is_some());
+                eprintln!("sample enrolled writer/phase={phase}/connection={entry}/split+intent+checkpoint+joint=refused/reads=preserved");
+            }
+            for (entry, ledger) in [("pre-enrollment", &ledger), ("reopened", &reopened_ledger)] {
+                assert_eq!(
+                    ledger
+                        .list_active(&provider_protocol::ProviderKind("local".into()))
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(
+                    ledger
+                        .record_created("new", "owner", &ledger_instance())
+                        .await
+                        .is_err(),
+                    "{phase}/{entry}/ledger-create"
+                );
+                assert!(
+                    ledger.record_deleted("legacy").await.is_err(),
+                    "{phase}/{entry}/ledger-delete"
+                );
+                assert!(
+                    ledger.record_deleted("missing").await.is_err(),
+                    "{phase}/{entry}/ledger-missing-delete"
+                );
+                eprintln!("sample enrolled writer/phase={phase}/connection={entry}/ledger-create+delete=refused/reads=preserved");
+            }
+            assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+        }
+        drop(bound);
+        drop(guard);
+        let reopened = SqliteSessionRepository::open(&f.database).unwrap();
+        let ledger = SqliteProviderInstanceLedger::open(&f.database).unwrap();
+        let before = capacity_tests::business_snapshot(&f.database);
+        assert!(reopened.save(record).await.is_err());
+        assert!(reopened
+            .save_operation_intent("after-exit", serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(ledger
+            .record_created("after-exit", "owner", &ledger_instance())
+            .await
+            .is_err());
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+        eprintln!("sample enrolled writer/phase=no-holder/durable-marker=refused");
+    }
+
+    #[tokio::test]
+    async fn ordinary_databases_keep_split_and_provider_writes_without_a_deployment_holder() {
+        use backend::{ProviderInstanceLedger, SqliteProviderInstanceLedger};
+        let f = Fixture::new();
+        let repo = SqliteSessionRepository::open(&f.database).unwrap();
+        let ledger = SqliteProviderInstanceLedger::open(&f.database).unwrap();
+        let mut record = repo.get("existing-session").await.unwrap().unwrap();
+        record.runtime_id = "legacy".into();
+        record.execution_backing = crate::SessionExecutionBacking::SplitV1;
+        repo.save(record.clone()).await.unwrap();
+        repo.save_operation_intent("intent", serde_json::json!({"legacy":true}))
+            .await
+            .unwrap();
+        assert_eq!(repo.operation_intents().await.unwrap().len(), 1);
+        repo.delete_operation_intent("intent").await.unwrap();
+        let checkpoint = crate::CheckpointRecord {
+            checkpoint_id: "legacy-checkpoint".into(),
+            source_runtime_id: record.runtime_id.clone(),
+            provider_snapshot_id: "original".into(),
+            runtime_state: record.runtime.clone(),
+            workspace: record.workspace.clone(),
+            isolation: record.isolation.clone(),
+            capabilities: record.capabilities.clone(),
+            owner_ref: crate::ADMIN_OWNER_REF.into(),
+            tenant_id: None,
+            created_by: None,
+            created_at_ms: 1,
+        };
+        repo.save_checkpoint(checkpoint).await.unwrap();
+        assert!(repo
+            .get_checkpoint("legacy-checkpoint")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo.delete_checkpoint("legacy-checkpoint").await.unwrap());
+        ledger
+            .record_created("legacy", "owner", &ledger_instance())
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger
+                .list_active(&provider_protocol::ProviderKind("local".into()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        ledger.record_deleted("legacy").await.unwrap();
+        assert!(ledger
+            .list_active(&provider_protocol::ProviderKind("local".into()))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !crate::sqlite_repository::deployment_registered(&repo.conn.lock().unwrap()).unwrap()
+        );
+        // A separate legacy database belongs to the legacy provider, not to this
+        // fixture's joint owner. No joint binding or ledger reference selects it.
+        let separate =
+            SqliteProviderInstanceLedger::open(&f.root.path().join("legacy-only.db")).unwrap();
+        separate
+            .record_created("other", "owner", &ledger_instance())
+            .await
+            .unwrap();
+        separate.record_deleted("other").await.unwrap();
+        eprintln!("sample ordinary writer/shared+separate-ledger/split+intent+checkpoint+ledger=preserved");
+    }
+
+    #[test]
+    fn opening_enrolled_databases_never_initializes_an_unbound_ledger_schema() {
+        let f = Fixture::new();
+        let _guard = f.guard();
+        let before = capacity_tests::business_snapshot(&f.database);
+        let schema = |path: &Path| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT coalesce(sql,'') FROM sqlite_master ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let prior = schema(&f.database);
+        let _reader = SqliteSessionRepository::open(&f.database).unwrap();
+        let _ledger = backend::SqliteProviderInstanceLedger::open(&f.database).unwrap();
+        assert_eq!(schema(&f.database), prior);
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+    }
+
     #[test]
     fn explicit_deployments_reject_wide_namespaces_and_unsupported_resource_filesystems() {
         use std::os::unix::fs::PermissionsExt;

@@ -43,7 +43,7 @@ while True:
     req = json.loads(sys.stdin.buffer.read(struct.unpack('>I', prefix)[0]))
     method, params = req['method'], req['params']
     with open(trace, 'a') as f:
-        f.write(json.dumps({'method': method, 'params': params, 'connection': os.getpid()}) + '\n')
+        f.write(json.dumps({'method': method, 'params': params, 'connection': os.getpid(), 'received_ns': time.monotonic_ns()}) + '\n')
     current = state()
     scenario = current.get('scenario', 'ok')
     if method == 'handshake':

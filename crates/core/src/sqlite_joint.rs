@@ -57,8 +57,6 @@ fn no_credentials(value: &serde_json::Value) -> bool {
 }
 
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS joint_bindings (
           id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL, revision TEXT NOT NULL,
@@ -364,16 +362,16 @@ impl SqliteSessionRepository {
             let mut connection = connection
                 .lock()
                 .map_err(|_| conflict("joint database mutex poisoned"))?;
-            #[cfg(unix)]
-            {
-                let guarded: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deployment')",
-                    [], |row| row.get(0),
-                )?;
-                if let Some(holder) = &deployment { holder.check_policy(&budget)?; }
-                else if guarded { return Err(conflict("local deployment writer guard is required")); }
-            }
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::sqlite_repository::verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
+            )?;
+            #[cfg(unix)]
+            if let Some(holder) = &deployment {
+                holder.check_policy(&budget)?;
+            }
             let result = action(&tx)?;
             tx.commit()?;
             Ok(result)

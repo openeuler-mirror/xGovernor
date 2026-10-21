@@ -34,8 +34,8 @@ impl SqliteProviderInstanceLedger {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(path)?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open(path)?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -43,16 +43,20 @@ impl SqliteProviderInstanceLedger {
 
     /// In-memory database. For tests only.
     pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    fn init(conn: &Connection) -> rusqlite::Result<()> {
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.pragma_update(None, "busy_timeout", 5_000i64);
+    fn init(connection: &mut Connection) -> rusqlite::Result<()> {
+        let _ = connection.pragma_update(None, "busy_timeout", 5_000i64);
+        let conn =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if deployment_registered(&conn)? {
+            return Ok(());
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS provider_instances (
                 runtime_id TEXT PRIMARY KEY,
@@ -72,8 +76,29 @@ impl SqliteProviderInstanceLedger {
             );
             CREATE INDEX IF NOT EXISTS idx_provider_instances_owner_ref
                 ON provider_instances(owner_ref);",
-        )
+        )?;
+        conn.commit()?;
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        Ok(())
     }
+}
+
+// The ledger has no deployment-holder binding. It remains readable, but cannot
+// initialize or mutate a file enrolled by the session deployment owner.
+fn deployment_registered(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deployment')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn writer_transaction(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if deployment_registered(&tx)? {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(tx)
 }
 
 fn now_ms() -> u64 {
@@ -184,10 +209,11 @@ impl ProviderInstanceLedger for SqliteProviderInstanceLedger {
             let metadata_json =
                 serde_json::to_string(&instance.metadata).map_err(|error| error.to_string())?;
 
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite provider instance ledger lock poisoned".to_string())?;
-            conn.execute(
+            let tx = writer_transaction(&mut conn).map_err(|error| error.to_string())?;
+            tx.execute(
                 "INSERT INTO provider_instances (
                     runtime_id, owner_ref, backend_id, provider, instance_id,
                     state, desired_state, endpoint_json, snapshot_json,
@@ -225,7 +251,7 @@ impl ProviderInstanceLedger for SqliteProviderInstanceLedger {
                 ],
             )
             .map_err(|error| error.to_string())?;
-            Ok(())
+            tx.commit().map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| {
@@ -242,19 +268,20 @@ impl ProviderInstanceLedger for SqliteProviderInstanceLedger {
 
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let deleted_state = state_to_column(ProviderLifecycleState::Deleted);
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite provider instance ledger lock poisoned".to_string())?;
             // No-op (not an error) if `runtime_id` has no row — see the
             // trait doc on `record_deleted` for why.
-            conn.execute(
+            let tx = writer_transaction(&mut conn).map_err(|error| error.to_string())?;
+            tx.execute(
                 "UPDATE provider_instances
                  SET state = ?1, desired_state = ?1, updated_at_ms = ?2
                  WHERE runtime_id = ?3",
                 params![deleted_state, updated_at_ms, runtime_id],
             )
             .map_err(|error| error.to_string())?;
-            Ok(())
+            tx.commit().map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| {

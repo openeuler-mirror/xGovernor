@@ -22,6 +22,13 @@ use xgovernor_thinkthread_client::{
 
 #[path = "support/owned_snapshot.rs"]
 mod owned_snapshot;
+#[path = "support/timed_read_repository.rs"]
+mod timed_read_repository;
+
+// Functional checks include durable SQLite settlement as well as transport.
+// Allow shared-server scheduling and fsync; explicit hanging scenarios keep a
+// separate 800 ms deadline so their unknown/fence assertions remain bounded.
+const POSITIVE_OBSERVATION_MS: u64 = 5_000;
 
 struct Fixture {
     root: TempDir,
@@ -221,11 +228,14 @@ impl Fixture {
         }
     }
     fn owner(&self) -> CandidateHostOwner {
+        self.owner_with_observation(POSITIVE_OBSERVATION_MS)
+    }
+    fn owner_with_observation(&self, observation_ms: u64) -> CandidateHostOwner {
         CandidateHostOwner::new(
             self.config.clone(),
             "candidate-fixture".into(),
             "fixed".into(),
-            Duration::from_millis(800),
+            Duration::from_millis(observation_ms),
         )
         .unwrap()
     }
@@ -501,6 +511,15 @@ async fn complete_preflight_denies_paths_modes_env_extra_and_limits_without_muta
 #[tokio::test]
 async fn read_bytes_framing_records_observed_hash_and_discards_failed_connections() {
     let f = Fixture::new().await;
+    let owner = CandidateHostOwner::new(
+        f.config.clone(),
+        "candidate-fixture".into(),
+        "fixed".into(),
+        Duration::from_millis(POSITIVE_OBSERVATION_MS),
+    )
+    .unwrap();
+    let repository: Arc<dyn SessionRepository> =
+        Arc::new(timed_read_repository::TimedReadRepository(f.repo.clone()));
     let expected = [
         (0u8..=255).collect::<Vec<_>>().repeat(513),
         vec![0, 255, b't', b'a', b'i', b'l'],
@@ -516,7 +535,16 @@ async fn read_bytes_framing_records_observed_hash_and_discards_failed_connection
     ] {
         f.scenario(scenario);
         let id = format!("read-{scenario}");
-        let a = f.access(&id, read()).await.unwrap();
+        let stage = std::time::Instant::now();
+        let a = owner
+            .prepare_host_operation(f.context(&id), f.record.clone(), read(), repository.clone())
+            .await
+            .unwrap();
+        eprintln!(
+            "sample binary framing/scenario={scenario}/stage=initial-admission/elapsed_us={}",
+            stage.elapsed().as_micros()
+        );
+        let stage = std::time::Instant::now();
         let result = a
             .backend
             .files()
@@ -524,6 +552,11 @@ async fn read_bytes_framing_records_observed_hash_and_discards_failed_connection
                 path: BackendPath("artifact".into()),
             })
             .await;
+        eprintln!(
+            "sample binary framing/scenario={scenario}/stage=initial-read/elapsed_us={}/error={:?}",
+            stage.elapsed().as_micros(),
+            result.as_ref().err()
+        );
         if scenario == "ok" || scenario == "empty" {
             let bytes = result.unwrap();
             assert_eq!(
@@ -558,9 +591,27 @@ async fn read_bytes_framing_records_observed_hash_and_discards_failed_connection
                 "failed"
             );
         }
+        let stage = std::time::Instant::now();
         f.repo.finish_host_cleanup(a.access).await.unwrap();
+        eprintln!(
+            "sample binary framing/scenario={scenario}/stage=initial-cleanup/elapsed_us={}",
+            stage.elapsed().as_micros()
+        );
         f.scenario("ok");
-        let a = f.access(&format!("next-{scenario}"), read()).await.unwrap();
+        let stage = std::time::Instant::now();
+        let a = owner
+            .prepare_host_operation(
+                f.context(&format!("next-{scenario}")),
+                f.record.clone(),
+                read(),
+                repository.clone(),
+            )
+            .await
+            .unwrap();
+        eprintln!(
+            "sample binary framing/scenario={scenario}/stage=follow-up-admission/elapsed_us={}",
+            stage.elapsed().as_micros()
+        );
         let started = std::time::Instant::now();
         let next_result = a
             .backend
@@ -569,17 +620,33 @@ async fn read_bytes_framing_records_observed_hash_and_discards_failed_connection
                 path: BackendPath("artifact".into()),
             })
             .await;
+        let elapsed = started.elapsed();
+        let rpc_stages: Vec<_> = f
+            .trace()
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "method":r["method"],"connection":r["connection"],"received_ns":r["received_ns"]
+                })
+            })
+            .collect();
+        eprintln!("sample binary framing/scenario={scenario}/stage=follow-up-read/elapsed_us={}/error={:?}/rpc_stages={rpc_stages:?}",elapsed.as_micros(),next_result.as_ref().err());
         assert!(
             next_result.is_ok(),
             "read follow-up/scenario={scenario}/elapsed={:?}/error={:?}",
-            started.elapsed(),
+            elapsed,
             next_result.as_ref().err()
         );
         eprintln!(
             "sample binary framing/scenario={scenario}/follow-up=ok/elapsed_ms={}",
-            started.elapsed().as_millis()
+            elapsed.as_millis()
         );
+        let stage = std::time::Instant::now();
         f.repo.finish_host_cleanup(a.access).await.unwrap();
+        eprintln!(
+            "sample binary framing/scenario={scenario}/stage=follow-up-cleanup/elapsed_us={}",
+            stage.elapsed().as_micros()
+        );
     }
     let trace: Vec<_> = f
         .trace()
@@ -838,7 +905,16 @@ async fn observation_timeout_is_unknown_and_has_no_retry_or_cleanup() {
     for scenario in ["hang", "drop"] {
         let f = Fixture::new().await;
         f.scenario(scenario);
-        let a = f.access("interrupted", execute(exec())).await.unwrap();
+        let a = f
+            .owner_with_observation(800)
+            .prepare_host_operation(
+                f.context("interrupted"),
+                f.record.clone(),
+                execute(exec()),
+                f.repo.clone(),
+            )
+            .await
+            .unwrap();
         assert!(matches!(
             a.backend.exec().exec(exec()).await,
             Err(OperationError::Transport { .. })
@@ -1930,7 +2006,21 @@ async fn failures_before_claim_settle_without_payload_and_release_local_resource
         "no-payload",
     ] {
         let f = Fixture::new().await;
-        let a = f.access("unsent", write(vec![1])).await.unwrap();
+        let observation_ms = if scenario == "get-hang" {
+            800
+        } else {
+            POSITIVE_OBSERVATION_MS
+        };
+        let a = f
+            .owner_with_observation(observation_ms)
+            .prepare_host_operation(
+                f.context("unsent"),
+                f.record.clone(),
+                write(vec![1]),
+                f.repo.clone(),
+            )
+            .await
+            .unwrap();
         f.scenario(scenario);
         let original = std::fs::read(&f.config.host_executable).unwrap();
         if scenario == "connect-failed" {
@@ -2620,6 +2710,13 @@ mod execution_profiles {
         .collect()
     }
     fn profile(f: &Fixture, slots: u32) -> Arc<ProfileRouter> {
+        profile_with_observation(f, slots, POSITIVE_OBSERVATION_MS)
+    }
+    fn profile_with_observation(
+        f: &Fixture,
+        slots: u32,
+        observation_ms: u64,
+    ) -> Arc<ProfileRouter> {
         for path in [
             &f.config.state_root,
             &f.config.runtime_root,
@@ -2672,7 +2769,8 @@ mod execution_profiles {
             release: p.release.clone(),
             declaration: p.declaration.clone(),
         };
-        let revision = ProfileRevision::host(p, &manifest, f.config.clone(), 800).unwrap();
+        let revision =
+            ProfileRevision::host(p, &manifest, f.config.clone(), observation_ms).unwrap();
         ProfileRouter::assemble(
             guard,
             budgets(slots),
@@ -2710,7 +2808,7 @@ mod execution_profiles {
     #[tokio::test]
     async fn profile_preserves_host_parameters_capabilities_and_strict_limits() {
         let f = Fixture::new().await;
-        let p = profile(&f, 8);
+        let p = profile_with_observation(&f, 8, POSITIVE_OBSERVATION_MS);
         let request = write(vec![0, 255, 1, 2]);
         let a = access(&f, &p, "profile-write", request.clone())
             .await

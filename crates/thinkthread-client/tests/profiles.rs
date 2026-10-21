@@ -2347,7 +2347,16 @@ async fn golden_case(kind: &'static str, enabled: Option<bool>) -> Value {
         );
         router.repository()
     } else {
-        Arc::new(SqliteSessionRepository::open(&f.root.path().join("db")).unwrap())
+        Arc::new(
+            f.guard
+                .bind_split_repository(
+                    SqliteSessionRepository::open(&f.root.path().join("db"))
+                        .unwrap()
+                        .with_joint_budget_policy(budget())
+                        .unwrap(),
+                )
+                .unwrap(),
+        )
     };
     let ids = Arc::new(Ids(AtomicU64::new(1)));
     let application = SessionApplication::with_runtime_registry(
