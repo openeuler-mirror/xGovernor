@@ -54,6 +54,9 @@ fn repository(path: &Path) -> Arc<SqliteSessionRepository> {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::seed(true).await
+    }
+    async fn seed(register: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let p = root.path();
         let host = p.join("host");
@@ -199,9 +202,11 @@ impl Fixture {
             source_checkpoint_id: None,
             source_pair_ref: None,
         };
-        repo.register_host_target(target.clone(), policy.clone())
-            .await
-            .unwrap();
+        if register {
+            repo.register_host_target(target.clone(), policy.clone())
+                .await
+                .unwrap();
+        }
         Self {
             root,
             config,
@@ -919,7 +924,7 @@ async fn independent_connections_have_one_source_claim_and_guard_drop_keeps_it()
     );
 }
 #[tokio::test]
-async fn create_parents_preflights_both_steps_without_executing_helpers() {
+async fn create_parents_preflights_both_steps_and_preserves_original_ids() {
     let f = Fixture::new().await;
     let r = JointHostRequest::Write {
         path: "dir/file".into(),
@@ -956,16 +961,16 @@ async fn create_parents_preflights_both_steps_without_executing_helpers() {
         json!(["mkdir", "-p", "--", "work/dir"])
     );
     assert_eq!(h.prepared.native[1].method, "thinkthread.write");
-    assert!(matches!(
-        a.backend.write_host(r.clone()).await,
-        Err(SessionDomainError::UnsupportedCapability { .. })
-    ));
+    a.backend.write_host(r.clone()).await.unwrap();
     let snapshot = f.snapshot();
     let reopened = repository(&f.root.path().join("db"));
-    assert!(matches!(
-        f.owner().recover_host("parents".into(), reopened).await,
-        Err(SessionDomainError::UnsupportedCapability { .. })
-    ));
+    assert_eq!(
+        f.owner()
+            .recover_host("parents".into(), reopened)
+            .await
+            .unwrap()["bytes_written"],
+        1
+    );
     assert_eq!(snapshot, f.snapshot());
     let mut timeout = f.policy.clone();
     timeout.mkdir_timeout_ms = 300001;
@@ -1001,8 +1006,8 @@ async fn create_parents_preflights_both_steps_without_executing_helpers() {
         .steps
         .iter()
         .all(|s| s.original_uuid.is_some() && s.target_digest == a.access.target_digest));
-    assert_eq!(f.count("thinkthread.exec"), 0);
-    assert_eq!(f.count("thinkthread.write"), writes_before);
+    assert_eq!(f.count("thinkthread.exec"), 1);
+    assert_eq!(f.count("thinkthread.write"), writes_before + 1);
 }
 
 fn settled_write() -> HostObservationV1 {
@@ -2098,4 +2103,215 @@ async fn reopened_intents_reject_changed_configuration_owner_schema_and_generati
         assert_eq!(f.count("thinkthread.exec"), 0);
         assert_eq!(f.count("operation.get"), 0);
     }
+}
+
+#[tokio::test]
+async fn parent_creation_failures_never_send_write_and_keep_real_directory_effects() {
+    for scenario in [
+        "ok",
+        "mkdir-failed",
+        "mkdir-drop",
+        "mkdir-needs-recovery",
+        "rejected-write",
+    ] {
+        let f = Fixture::new().await;
+        f.scenario(scenario);
+        let r = JointHostRequest::Write {
+            path: "dir/file".into(),
+            content: vec![0, 255],
+            mode: WriteMode::Overwrite,
+            create_parents: true,
+        };
+        let a = f.access("parent", r.clone()).await.unwrap();
+        let result = a.backend.write_host(r).await;
+        let h = f.intent("parent").await;
+        assert_eq!(f.count("thinkthread.exec"), 1, "{scenario}");
+        let unknown = matches!(scenario, "mkdir-drop" | "mkdir-needs-recovery");
+        let reached_write = matches!(scenario, "ok" | "rejected-write");
+        assert_eq!(
+            f.count("thinkthread.write"),
+            usize::from(reached_write),
+            "{scenario}"
+        );
+        assert_eq!(result.is_ok(), scenario == "ok", "{scenario}");
+        assert_eq!(
+            h.state,
+            if unknown {
+                "unknown"
+            } else if scenario == "ok" {
+                "completed"
+            } else {
+                "failed"
+            }
+        );
+        assert_eq!(h.observations[1].is_some(), reached_write);
+        let trace: Vec<_> = f
+            .trace()
+            .into_iter()
+            .filter(|v| {
+                ["thinkthread.exec", "thinkthread.write"].contains(&v["method"].as_str().unwrap())
+            })
+            .collect();
+        for (step, item) in trace.iter().enumerate() {
+            assert_eq!(
+                item["params"]["operationId"],
+                h.steps[step].original_uuid.as_ref().unwrap().as_str()
+            );
+            assert_eq!(
+                item["params"]["thinkthreadId"],
+                h.prepared.target.native_child_id
+            );
+        }
+        if reached_write {
+            let state: Value =
+                serde_json::from_slice(&std::fs::read(f.root.path().join("state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["directories"], json!(["work/dir"]));
+            assert_eq!(
+                h.observations[0]
+                    .as_ref()
+                    .unwrap()
+                    .exec
+                    .as_ref()
+                    .unwrap()
+                    .code,
+                Some(0)
+            );
+        }
+        if unknown {
+            assert!(h.blocker_id.is_some());
+            assert!(f.access("next", write(vec![1])).await.is_err());
+            assert!(f
+                .repo
+                .finish_host(a.access, json!({"error":"unsafe"}))
+                .await
+                .is_err());
+            let sends = f.count("thinkthread.exec");
+            f.scenario("needs-recovery");
+            assert!(f
+                .owner()
+                .recover_host("parent".into(), repository(&f.root.path().join("db")))
+                .await
+                .is_err());
+            assert_eq!(f.count("thinkthread.exec"), sends);
+            assert_eq!(f.count("thinkthread.write"), 0);
+            assert!(f
+                .trace()
+                .iter()
+                .filter(|v| v["method"] == "operation.get")
+                .all(|v| v["params"]["operationId"]
+                    == h.steps[0].original_uuid.as_ref().unwrap().as_str()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn interrupted_parent_write_queries_the_correct_original_step_without_payload_replay() {
+    let f = Fixture::new().await;
+    // The fixture completes mkdir before dropping the write response.
+    f.scenario("drop-write");
+    let r = JointHostRequest::Write {
+        path: "dir/file".into(),
+        content: vec![0, 255],
+        mode: WriteMode::Overwrite,
+        create_parents: true,
+    };
+    let a = f.access("parent", r.clone()).await.unwrap();
+    assert!(a.backend.write_host(r).await.is_err());
+    let h = f.intent("parent").await;
+    assert!(h.observations[0].as_ref().unwrap().settled);
+    assert!(!h.observations[1].as_ref().unwrap().settled);
+    f.scenario("ok");
+    assert_eq!(
+        f.owner()
+            .recover_host("parent".into(), repository(&f.root.path().join("db")))
+            .await
+            .unwrap()["bytes_written"],
+        2
+    );
+    assert_eq!(f.count("thinkthread.exec"), 1);
+    assert_eq!(f.count("thinkthread.write"), 1);
+    let queries: Vec<_> = f
+        .trace()
+        .into_iter()
+        .filter(|v| v["method"] == "operation.get")
+        .collect();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0]["params"]["operationId"],
+        h.steps[1].original_uuid.as_ref().unwrap().as_str()
+    );
+}
+
+#[tokio::test]
+async fn artifact_bytes_and_provenance_commit_together_and_reject_changed_revisions() {
+    for scenario in ["ok", "changed-revision", "changed-branch", "commit-failure"] {
+        let f = Fixture::new().await;
+        f.scenario(scenario);
+        if scenario == "commit-failure" {
+            f.conn().execute_batch("CREATE TRIGGER reject_artifact BEFORE UPDATE ON joint_host_intents WHEN json_extract(NEW.body,'$.artifact_evidence') IS NOT NULL BEGIN SELECT RAISE(ABORT,'artifact failpoint'); END;").unwrap();
+        }
+        let a = f.access("artifact", read()).await.unwrap();
+        let result = a
+            .backend
+            .files()
+            .read_bytes(ReadBytesRequest {
+                path: BackendPath("/workspace/artifact".into()),
+            })
+            .await;
+        let h = f.intent("artifact").await;
+        if scenario == "ok" {
+            let bytes = result.unwrap();
+            assert!(bytes.len() > 65536);
+            assert_eq!(&bytes[bytes.len() - 6..], b"\x00\xfftail");
+            let e = h.artifact_evidence.as_ref().unwrap();
+            assert_eq!(e.byte_length, bytes.len() as u64);
+            assert_eq!(e.sha256, host_bytes_digest(&bytes));
+            assert_eq!(e.native_child_id, f.target.native_child_id);
+            assert_eq!(e.branch_id, f.target.branch_id);
+            assert_eq!(e.live_binding_id, f.target.live_binding.binding_id);
+            assert_eq!(e.binding_generation, f.target.binding_generation);
+            assert_eq!(e.root_runtime_generation, f.target.root_runtime_generation);
+            assert_eq!(e.configuration_revision, f.policy.configuration_revision);
+            assert_eq!(e.relative_path, "work/artifact");
+            assert_eq!(e.content_revision_before, "1");
+            assert_eq!(e.content_revision_after, "1");
+            assert!(e.completeness);
+            assert!(e.bytes_ref.is_none());
+            assert_eq!(
+                STANDARD
+                    .decode(h.result.as_ref().unwrap()["data_base64"].as_str().unwrap())
+                    .unwrap(),
+                bytes
+            );
+            let reopened = repository(&f.root.path().join("db"));
+            assert_eq!(
+                reopened
+                    .host_intent("artifact".into())
+                    .await
+                    .unwrap()
+                    .artifact_evidence,
+                h.artifact_evidence
+            );
+        } else {
+            assert!(result.is_err(), "{scenario}");
+            assert!(h.artifact_evidence.is_none());
+            if scenario == "commit-failure" {
+                assert!(h.result.is_none());
+                assert!(f.access("next", write(vec![1])).await.is_err());
+            } else {
+                assert_eq!(h.state, "failed");
+                assert!(h.result.as_ref().unwrap().get("error").is_some());
+            }
+        }
+    }
+}
+
+#[path = "support/native_host.rs"]
+mod native_host;
+
+#[tokio::test]
+#[ignore = "requires explicitly provisioned matching native installation and model credentials"]
+async fn native_current_view_host_bridge() {
+    native_host::bridge().await;
 }

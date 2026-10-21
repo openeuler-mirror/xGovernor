@@ -190,16 +190,20 @@ fn check(tx: &Transaction<'_>, a: &HostAccessTokenV1, active: bool) -> Result<Ho
     Ok(h)
 }
 fn all_settled(h: &HostIntentV1) -> bool {
-    h.observations.iter().all(|o| {
-        o.as_ref().is_some_and(|o| {
-            o.settled
+    let mut failed = false;
+    h.observations.iter().all(|o| match o {
+        None => failed,
+        Some(o) => {
+            let settled = o.settled
                 && matches!(
                     o.state,
                     NativeOperationState::Completed
                         | NativeOperationState::Failed
                         | NativeOperationState::NotSent
-                )
-        })
+                );
+            failed |= settled && (o.error.is_some() || o.state != NativeOperationState::Completed);
+            settled
+        }
     })
 }
 fn native_params(t: &HostTargetV1, r: &HostCanonicalRequestV1) -> Vec<(String, Value)> {
@@ -414,7 +418,7 @@ impl HostRepository for SqliteSessionRepository {
                 vec![HostStepV1 { step_no:0, method:"thinkthread.read".into(), original_uuid:None, canonical_params_digest:host_digest(&prepared.request), sdk_operation_digest:None, target_digest:access.target_digest.clone() }]
             } else { prepared.native.iter().enumerate().map(|(step_no,n)| HostStepV1 {step_no,method:n.method.clone(),original_uuid:Some(n.operation_id.clone()),canonical_params_digest:host_digest(&n.params),sdk_operation_digest:Some(n.digest.clone()),target_digest:access.target_digest.clone()}).collect() };
 
-            let h=HostIntentV1 {schema_version:1,prepared,access:access.clone(),state:"prepared".into(),observations:vec![None;count],steps,recovery_evidence:vec![],result:None,cleanup_state:"none".into(),blocker_id:None,suspended_cleanup_plan_id:None,resume_joint_stage:None};
+            let h=HostIntentV1 {schema_version:1,prepared,access:access.clone(),state:"prepared".into(),observations:vec![None;count],steps,recovery_evidence:vec![],result:None,cleanup_state:"none".into(),artifact_evidence:None,blocker_id:None,suspended_cleanup_plan_id:None,resume_joint_stage:None};
             tx.execute("INSERT INTO joint_host_intents VALUES(?1,?2)",params![access.admission.intent_id,encode(&h)?])?;Ok(access)
         }).await
     }
@@ -431,7 +435,7 @@ impl HostRepository for SqliteSessionRepository {
     ) -> std::result::Result<bool, SessionDomainError> {
         self.joint_transaction(move|tx|{
             let mut h=check(tx,&access,true)?;
-            if step>=h.observations.len() || (step>0 && !h.observations[step-1].as_ref().is_some_and(|v|v.settled && v.state==NativeOperationState::Completed)) {return Err(conflict("Host previous step has not succeeded"));}
+            if step>=h.observations.len() || (step>0 && !h.observations[step-1].as_ref().is_some_and(|v|v.settled && v.state==NativeOperationState::Completed && v.error.is_none())) {return Err(conflict("Host previous step has not succeeded"));}
             if h.observations[step].is_some() {return Ok(false);}
             h.observations[step]=Some(HostObservationV1 {state:NativeOperationState::Unknown,settled:false,result:Value::Null,transfer:None,exec:None,error:Some("claimed; delivery unknown".into()),native_outcome: None,
 });
@@ -548,25 +552,22 @@ impl HostRepository for SqliteSessionRepository {
         access: HostAccessTokenV1,
         result: Value,
     ) -> std::result::Result<Value, SessionDomainError> {
-        self.joint_transaction(move|tx|{
-            let old=check(tx,&access,false)?;
-            if old.result.is_some() {return if old.result==Some(result.clone()){Ok(result)}else{Err(conflict("Host result replay changed"))};}
-            let mut h=check(tx,&access,true)?;
-            let unsent=h.observations.iter().all(Option::is_none);
-            if !all_settled(&h) && !(unsent && result.get("error").is_some()) {return Err(conflict("Host effects or execution are not settled"));}
-            let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_cleanup WHERE parent_id=?1 AND state!='done')",[&access.admission.intent_id],|r|r.get(0))?;
-            if waiting {return Err(conflict("Host cleanup delegation is pending"));}
-            if !unsent && result.get("error").is_none() && h.observations.iter().any(|o|o.as_ref().is_none_or(|v|v.state!=NativeOperationState::Completed || v.error.is_some())) {return Err(conflict("failed Host cannot publish success"));}
-            h.result=Some(result.clone());h.state=if result.get("error").is_some(){"failed"}else{"completed"}.into();h.cleanup_state=if unsent {"done"}else{"pending"}.into();h.blocker_id=None;
-            if unsent {
-                tx.execute("UPDATE joint_host_allocations SET state='released' WHERE intent_id=?1",[&access.admission.intent_id])?;
-                tx.execute("DELETE FROM joint_refs WHERE kind='host_hold' AND public_id=?1",[&access.admission.intent_id])?;
-            }
-            tx.execute("UPDATE joint_operations SET stage='settled',publication_json=?1 WHERE id=?2",params![encode(&result)?,access.admission.intent_id])?;
-            tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND (active_intent=?1 OR active_intent IS NULL)",params![access.admission.intent_id,access.admission.binding.binding_id])?;
-            release_fences(tx,&access.admission.intent_id)?;save(tx,&h)?;Ok(result)
-        }).await
+        self.joint_transaction(move |tx| settle_host(tx, access, result, None))
+            .await
     }
+    async fn finish_host_read(
+        &self,
+        access: HostAccessTokenV1,
+        result: Value,
+        revision_before: String,
+        revision_after: String,
+    ) -> std::result::Result<Value, SessionDomainError> {
+        self.joint_transaction(move |tx| {
+            settle_host(tx, access, result, Some((revision_before, revision_after)))
+        })
+        .await
+    }
+
     async fn pending_hosts(&self) -> std::result::Result<Vec<HostIntentV1>, SessionDomainError> {
         self.joint_transaction(|tx| {
             let ids = tx
@@ -707,4 +708,127 @@ let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM joint_host_dependenci
             save(tx,&h)
         }).await
     }
+}
+
+fn settle_host(
+    tx: &Transaction<'_>,
+    access: HostAccessTokenV1,
+    result: Value,
+    revisions: Option<(String, String)>,
+) -> Result<Value> {
+    let old = check(tx, &access, false)?;
+    if old.result.is_some() {
+        return if old.result == Some(result.clone()) {
+            Ok(result)
+        } else {
+            Err(conflict("Host result replay changed"))
+        };
+    }
+    let mut h = check(tx, &access, true)?;
+    let unsent = h.observations.iter().all(Option::is_none);
+    if !all_settled(&h) && !(unsent && result.get("error").is_some()) {
+        return Err(conflict("Host effects or execution are not settled"));
+    }
+    let waiting: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM joint_host_cleanup WHERE parent_id=?1 AND state!='done')",
+        [&access.admission.intent_id],
+        |r| r.get(0),
+    )?;
+    if waiting {
+        return Err(conflict("Host cleanup delegation is pending"));
+    }
+    if !unsent
+        && result.get("error").is_none()
+        && h.observations.iter().any(|o| {
+            o.as_ref()
+                .is_none_or(|v| v.state != NativeOperationState::Completed || v.error.is_some())
+        })
+    {
+        return Err(conflict("failed Host cannot publish success"));
+    }
+    if let Some((before, after)) = revisions {
+        if before.is_empty() || before != after || result.get("error").is_some() {
+            return Err(conflict("artifact revision is not stable"));
+        }
+        let HostCanonicalRequestV1::Read { path, .. } = &h.prepared.request else {
+            return Err(conflict("artifact requires a read"));
+        };
+        let transfer = h.observations[0]
+            .as_ref()
+            .and_then(|o| o.transfer.as_ref())
+            .ok_or_else(|| conflict("artifact transfer missing"))?;
+        let encoded = result
+            .get("data_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| conflict("artifact bytes missing"))?;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|_| conflict("artifact encoding invalid"))?;
+        if transfer.observed_size != Some(bytes.len() as u64)
+            || transfer.observed_sha256.as_deref() != Some(&host_bytes_digest(&bytes))
+            || transfer.state != "completed"
+        {
+            return Err(conflict("artifact bytes do not match transfer"));
+        }
+        let epoch: u64 = tx.query_row(
+            "SELECT epoch FROM joint_host_workspace WHERE binding_id=?1",
+            [&access.admission.binding.binding_id],
+            |r| r.get(0),
+        )?;
+        let t = &h.prepared.target;
+        h.artifact_evidence = Some(ArtifactEvidenceV1 {
+            artifact_id: format!("artifact:{}", access.admission.intent_id),
+            read_intent_id: access.admission.intent_id.clone(),
+            public_runtime_id: t.public_runtime_id.clone(),
+            live_binding_id: t.live_binding.binding_id.clone(),
+            native_child_id: t.native_child_id.clone(),
+            branch_id: t.branch_id.clone(),
+            binding_generation: t.binding_generation,
+            root_runtime_generation: t.root_runtime_generation,
+            configuration_revision: h.prepared.policy.configuration_revision.clone(),
+            content_revision_before: before,
+            content_revision_after: after,
+            workspace_epoch: epoch,
+            relative_path: path.clone(),
+            byte_length: bytes.len() as u64,
+            sha256: host_bytes_digest(&bytes),
+            completeness: true,
+            source_checkpoint_id: t.source_checkpoint_id.clone(),
+            source_pair_ref: t.source_pair_ref.clone(),
+            load_intent_id: None,
+            bytes_ref: None,
+        });
+    } else if matches!(h.prepared.request, HostCanonicalRequestV1::Read { .. })
+        && result.get("error").is_none()
+    {
+        return Err(conflict("successful read requires artifact evidence"));
+    }
+    h.result = Some(result.clone());
+    h.state = if result.get("error").is_some() {
+        "failed"
+    } else {
+        "completed"
+    }
+    .into();
+    h.cleanup_state = if unsent { "done" } else { "pending" }.into();
+    h.blocker_id = None;
+    if unsent {
+        tx.execute(
+            "UPDATE joint_host_allocations SET state='released' WHERE intent_id=?1",
+            [&access.admission.intent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM joint_refs WHERE kind='host_hold' AND public_id=?1",
+            [&access.admission.intent_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE joint_operations SET stage='settled',publication_json=?1 WHERE id=?2",
+        params![encode(&result)?, access.admission.intent_id],
+    )?;
+    tx.execute("UPDATE joint_host_workspace SET dirty=0,active_intent=NULL,last_settled=?1 WHERE binding_id=?2 AND (active_intent=?1 OR active_intent IS NULL)",params![access.admission.intent_id,access.admission.binding.binding_id])?;
+    release_fences(tx, &access.admission.intent_id)?;
+    save(tx, &h)?;
+    Ok(result)
 }

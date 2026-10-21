@@ -58,7 +58,7 @@ while True:
         if scenario == 'get-hang': time.sleep(20); sys.exit(0)
         reply(req, {'thinkthreadId': params['thinkthreadId'], 'rootId': 'native-root', 'parentId': 'native-root',
                     'state': 'Running', 'sessionState': 'Ready', 'agent': 'fixture', 'fs': os.environ['XG_TEST_FS'],
-                    'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' else 'private-branch', 'contentRevision': '1', 'needsRecovery': False})
+                    'fsBranchId': 'other-branch' if scenario == 'get-wrong-branch' else 'private-branch', 'contentRevision': str(current.get('revision', '1')), 'needsRecovery': False})
     elif method == 'thinkthread.read':
         data = base64.b64decode(current.get('files', {}).get(params['path'], '')) if params['path'] in current.get('files', {}) else bytes(range(256)) * 513 + b'\x00\xfftail'
         if scenario == 'empty':
@@ -77,7 +77,11 @@ while True:
         if scenario != 'missing-end':
             sys.stdout.buffer.write(struct.pack('>I', 0))
         sys.stdout.buffer.flush()
-        if scenario != 'ok' and scenario != 'empty':
+        if scenario in ('changed-revision', 'changed-branch'):
+            current['revision'] = '2'
+            if scenario == 'changed-branch': current['scenario'] = 'get-wrong-branch'
+            with open(state_path, 'w') as f: json.dump(current, f)
+        if scenario not in ('ok', 'empty', 'changed-revision', 'changed-branch', 'commit-failure'):
             break
     elif method == 'thinkthread.write':
         data = bytearray()
@@ -95,12 +99,19 @@ while True:
         current.setdefault('files', {})[params['path']] = base64.b64encode(data).decode()
         with open(state_path, 'w') as f:
             json.dump(current, f)
-        if scenario == 'drop':
+        if scenario in ('drop', 'drop-write'):
             sys.exit(0)
         result = {'operation': handle(params), 'thinkthreadId': params['thinkthreadId'], 'bytesWritten': len(data)}
         if scenario == 'wrong-handle': result['operation']['operationId'] = 'wrong'
         reply(req, result)
     elif method == 'thinkthread.exec':
+        if params['argv'][:3] == ['mkdir', '-p', '--']:
+            if scenario == 'mkdir-drop': sys.exit(0)
+            if scenario == 'mkdir-needs-recovery': reject(req, 'NeedsRecovery'); continue
+            if scenario == 'mkdir-failed':
+                reply(req, exec_result(params, {'code': 1})); continue
+            current.setdefault('directories', []).append(params['argv'][-1])
+            with open(state_path, 'w') as f: json.dump(current, f)
         if scenario == 'mutation-rejected':
             reject(req, current['error_code'], current['delivery']); continue
         if scenario == 'drop': sys.exit(0)

@@ -379,6 +379,30 @@ pub struct HostStepV1 {
     pub sdk_operation_digest: Option<String>,
     pub target_digest: String,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactEvidenceV1 {
+    pub artifact_id: String,
+    pub read_intent_id: String,
+    pub public_runtime_id: String,
+    pub live_binding_id: String,
+    pub native_child_id: String,
+    pub branch_id: String,
+    pub binding_generation: u64,
+    pub root_runtime_generation: u64,
+    pub configuration_revision: String,
+    pub content_revision_before: String,
+    pub content_revision_after: String,
+    pub workspace_epoch: u64,
+    pub relative_path: String,
+    pub byte_length: u64,
+    pub sha256: String,
+    pub completeness: bool,
+    pub source_checkpoint_id: Option<String>,
+    pub source_pair_ref: Option<String>,
+    pub load_intent_id: Option<String>,
+    pub bytes_ref: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostIntentV1 {
@@ -391,6 +415,8 @@ pub struct HostIntentV1 {
     pub recovery_evidence: Vec<Value>,
     pub result: Option<Value>,
     pub cleanup_state: String,
+    #[serde(default)]
+    pub artifact_evidence: Option<ArtifactEvidenceV1>,
     #[serde(default)]
     pub blocker_id: Option<String>,
     #[serde(default)]
@@ -461,6 +487,15 @@ pub trait HostRepository: Send + Sync {
         _result: Value,
     ) -> Result<Value, SessionDomainError> {
         Err(crate::unsupported_joint("host_finish"))
+    }
+    async fn finish_host_read(
+        &self,
+        _access: HostAccessTokenV1,
+        _result: Value,
+        _revision_before: String,
+        _revision_after: String,
+    ) -> Result<Value, SessionDomainError> {
+        Err(crate::unsupported_joint("host_read_evidence"))
     }
     async fn pending_hosts(&self) -> Result<Vec<HostIntentV1>, SessionDomainError> {
         Err(crate::unsupported_joint("host_pending"))

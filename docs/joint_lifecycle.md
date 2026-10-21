@@ -147,9 +147,19 @@ timeout or a cancellation cannot establish settlement.
 
 Public overwrite uses `JointHostBackend::write_host` and returns only path and
 byte count. The filesystem `write_bytes` trait, atomic writes, export, metadata,
-search and directory helpers remain unsupported. Parent creation can be
-preflighted and journaled as separate exec/write steps, but its execution remains
-unsupported. No filesystem durability or process cleanup helper is supplied.
+search and directory helpers remain unsupported. Public `create_parents` executes
+one argv-based parent-directory exec followed by write under the same intent and
+fence. Both original UUIDs and outcomes are retained. A failed or unsettled exec
+prevents write; a failed write leaves any created directories in place. Recovery
+queries only the claimed step's original UUID and never recreates missing payload.
+No filesystem durability or process cleanup helper is supplied.
+
+A successful read rechecks the exact target, local generations and public content
+revision after receiving all bytes. Its result and `ArtifactEvidenceV1` source,
+revision, length and hash commit together. A changed view cannot publish a stable
+artifact. Revision equality only describes the writers covered by the local
+fence. Export handles remain unsupported until owned byte-reference lifetime and
+cleanup are available.
 
 Owned cleanup dependencies can suspend an already settled parent and its child
 record atomically. Suspension removes the execution fence and delegation while
