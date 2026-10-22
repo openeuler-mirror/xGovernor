@@ -870,3 +870,364 @@ async fn sweep_expired_streams_prunes_the_runtime_id_entirely_once_it_has_no_tur
         "a runtime_id with no remaining turns must not linger as an empty inner map"
     );
 }
+
+#[tokio::test]
+async fn successful_close_preserves_other_sessions_pending_streams() {
+    let (app, state) = test_router_with_state();
+    let (closed_sender, closed_receiver) = mpsc::channel(1);
+    let (other_sender, other_receiver) = mpsc::channel(1);
+    assert!(register_stream(&state.streams, "runtime-1", "turn-closed", closed_receiver).await);
+    assert!(register_stream(&state.streams, "runtime-2", "turn-other", other_receiver).await);
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/sessions/close")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"runtime_id":"runtime-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let streams = state.streams.lock().await;
+    assert!(!streams.contains_key("runtime-1"));
+    assert_eq!(streams["runtime-2"].len(), 1);
+    assert!(streams["runtime-2"].contains_key("turn-other"));
+    assert!(closed_sender.is_closed());
+    assert!(!other_sender.is_closed());
+}
+
+#[tokio::test]
+async fn successful_close_preserves_an_already_claimed_terminal_stream() {
+    let (app, state) = test_router_with_state();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/sessions/turns")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"runtime_id":"runtime-1","text":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let receipt: SessionSubmitReceipt = serde_json::from_slice(&body).unwrap();
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/sessions/{}/turns/{}/events",
+                receipt.runtime_id, receipt.turn_id
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert!(state.streams.lock().await.is_empty());
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/sessions/close")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"runtime_id":"runtime-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(Duration::from_secs(2), stream.into_body().collect())
+        .await
+        .expect("claimed SSE must terminate after the completed turn")
+        .unwrap()
+        .to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(body.matches("event: turn_completed").count(), 1);
+    assert!(body.contains(&receipt.runtime_id));
+    assert!(body.contains(&receipt.turn_id));
+}
+
+struct CloseTestRuntime {
+    fail_stop: bool,
+    stops: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl AgentRuntime for CloseTestRuntime {
+    fn runtime_kind(&self) -> &str {
+        "test"
+    }
+
+    fn capabilities(&self) -> BTreeSet<RuntimeCapability> {
+        CompletingRuntime.capabilities()
+    }
+
+    async fn start(
+        &self,
+        request: RuntimeStartRequest,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        CompletingRuntime.start(request, context).await
+    }
+
+    async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
+        self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_stop {
+            Err(RuntimeError::WorkerUnavailable {
+                message: "test stop failure".into(),
+                retryable: true,
+            })
+        } else {
+            CompletingRuntime.stop(runtime_id).await
+        }
+    }
+
+    async fn attach(
+        &self,
+        runtime_id: &str,
+        context: RuntimeExecutionContext,
+    ) -> Result<(), RuntimeError> {
+        CompletingRuntime.attach(runtime_id, context).await
+    }
+
+    async fn check_alive(&self, runtime_id: &str) -> Result<bool, RuntimeError> {
+        CompletingRuntime.check_alive(runtime_id).await
+    }
+
+    async fn submit_turn(
+        &self,
+        input: RuntimeTurnInput,
+    ) -> Result<RuntimeEventReceiver, RuntimeError> {
+        CompletingRuntime.submit_turn(input).await
+    }
+
+    async fn answer_interaction(&self, input: RuntimeInteractionInput) -> Result<(), RuntimeError> {
+        CompletingRuntime.answer_interaction(input).await
+    }
+
+    async fn cancel(&self, request: RuntimeCancelRequest) -> Result<(), RuntimeError> {
+        CompletingRuntime.cancel(request).await
+    }
+}
+
+struct CloseTestRepository {
+    fail_save: bool,
+    saves: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl SessionRepository for CloseTestRepository {
+    async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
+        TenantARepository.get(runtime_id).await
+    }
+
+    async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(record.status, xgovernor_core::SessionStatus::Closed);
+        if self.fail_save {
+            Err(SessionDomainError::Internal {
+                message: "test persistence failure".into(),
+                source: None,
+            })
+        } else {
+            TenantARepository.save(record).await
+        }
+    }
+
+    async fn list_active(
+        &self,
+        tenant_id: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        TenantARepository.list_active(tenant_id, limit).await
+    }
+}
+
+async fn failed_close_preserves_streams(
+    token: &str,
+    writer: &str,
+    fail_stop: bool,
+    fail_save: bool,
+    expected: StatusCode,
+    expected_stops: u32,
+    expected_saves: u32,
+) {
+    use super::super::auth::{security_layer, TokenTable};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use xgovernor_core::session_lease::SessionLeaseTable;
+
+    let runtime = Arc::new(CloseTestRuntime {
+        fail_stop,
+        stops: AtomicU32::new(0),
+    });
+    let repository = Arc::new(CloseTestRepository {
+        fail_save,
+        saves: AtomicU32::new(0),
+    });
+    let leases = Arc::new(SessionLeaseTable::new());
+    leases.acquire("runtime-1", "writer-a", None, None).await;
+    let state = Arc::new(SessionHttpState::new(
+        SessionApplication::new(
+            runtime.clone(),
+            HashMap::new(),
+            repository.clone(),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(UnusedEnvironment),
+            Arc::new(FixedTurnId),
+        )
+        .with_lease_table(leases),
+    ));
+    let tokens = TokenTable::new(
+        [
+            ("owner".into(), SecurityContext::tenant("tenant-a", "alice")),
+            ("foreign".into(), SecurityContext::tenant("tenant-b", "bob")),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let app = security_layer(session_router(state.clone()), Some(tokens));
+    let (sender, receiver) = mpsc::channel(1);
+    let (expiring_sender, expiring_receiver) = mpsc::channel(1);
+    let (other_sender, other_receiver) = mpsc::channel(1);
+    assert!(register_stream(&state.streams, "runtime-1", "turn-owner", receiver).await);
+    assert!(
+        register_stream(
+            &state.streams,
+            "runtime-1",
+            "turn-expiring",
+            expiring_receiver
+        )
+        .await
+    );
+    assert!(register_stream(&state.streams, "runtime-2", "turn-other", other_receiver).await);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/sessions/close")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(
+                    serde_json::json!({"runtime_id":"runtime-1", "lease":{"client_id":writer}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), expected);
+    assert_eq!(runtime.stops.load(Ordering::SeqCst), expected_stops);
+    assert_eq!(repository.saves.load(Ordering::SeqCst), expected_saves);
+    {
+        let streams = state.streams.lock().await;
+        assert_eq!(streams["runtime-1"].len(), 2);
+        assert_eq!(streams["runtime-2"].len(), 1);
+    }
+    assert!(!sender.is_closed());
+    assert!(!expiring_sender.is_closed());
+    assert!(!other_sender.is_closed());
+
+    sender
+        .send(SessionEvent::TurnCompleted {
+            runtime_id: "runtime-1".into(),
+            turn_id: "turn-owner".into(),
+            outcome: session_protocol::SessionTurnOutcome::Complete,
+            usage: session_protocol::SessionUsage::default(),
+        })
+        .await
+        .unwrap();
+    drop(sender);
+    let stream = app
+        .oneshot(
+            Request::get("/api/v1/sessions/runtime-1/turns/turn-owner/events")
+                .header("authorization", "Bearer owner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let body = tokio::time::timeout(Duration::from_secs(2), stream.into_body().collect())
+        .await
+        .expect("owner must receive the preserved terminal event")
+        .unwrap()
+        .to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(body.matches("event: turn_completed").count(), 1);
+    assert!(body.contains("runtime-1"));
+    assert!(body.contains("turn-owner"));
+
+    state
+        .streams
+        .lock()
+        .await
+        .get_mut("runtime-1")
+        .unwrap()
+        .get_mut("turn-expiring")
+        .unwrap()
+        .registered_at = Instant::now() - state.stream_entry_ttl - Duration::from_secs(1);
+    sweep_expired_streams(&state.streams, state.stream_entry_ttl).await;
+    let streams = state.streams.lock().await;
+    assert!(!streams.contains_key("runtime-1"));
+    assert_eq!(streams["runtime-2"].len(), 1);
+    assert!(expiring_sender.is_closed());
+    assert!(!other_sender.is_closed());
+}
+
+#[tokio::test]
+async fn failed_close_from_foreign_tenant_preserves_owner_streams() {
+    failed_close_preserves_streams(
+        "foreign",
+        "writer-a",
+        false,
+        false,
+        StatusCode::NOT_FOUND,
+        0,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_close_from_wrong_writer_preserves_owner_streams() {
+    failed_close_preserves_streams(
+        "owner",
+        "writer-b",
+        false,
+        false,
+        StatusCode::CONFLICT,
+        0,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_close_on_runtime_stop_preserves_owner_streams() {
+    failed_close_preserves_streams(
+        "owner",
+        "writer-a",
+        true,
+        false,
+        StatusCode::SERVICE_UNAVAILABLE,
+        1,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn failed_close_on_persistence_preserves_owner_streams_after_runtime_stop() {
+    failed_close_preserves_streams(
+        "owner",
+        "writer-a",
+        false,
+        true,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        1,
+        1,
+    )
+    .await;
+}

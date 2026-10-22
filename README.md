@@ -88,6 +88,8 @@ Honest gaps (see Roadmap): the operation plane is not yet exposed as HTTP routes
 | E2B | no SDK dependency | the e2b provider is a self-contained reqwest client against the E2B REST API (`api.e2b.dev` + the sandbox's envd HTTP); requires `E2B_API_KEY` at runtime |
 | LLM | any provider/model pi supports | selected per session through `llm`; the daemon does not require a fixed LLM key at startup |
 
+E2B Agent command supervision requires a Linux template with Python 3, `/proc`, `waitid` and child-subreaper support. Each tool command runs under an independent supervisor which reaps its process tree on exit, cancellation and timeout. An unconfirmed supervisor exit blocks the turn until the sandbox is successfully closed; it cannot authorize a clean terminal or another turn.
+
 Key Rust dependencies (workspace-pinned): tokio ≥ 1.35, axum 0.7, rusqlite 0.32 (bundled), reqwest 0.12 (rustls), serde/serde_json 1, uuid 1.6, tracing 0.1.
 
 ## Quick start

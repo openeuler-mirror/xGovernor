@@ -52,7 +52,7 @@ fn record_command(command: &serde_json::Value) {
     let root = std::path::Path::new(session_dir)
         .parent()
         .unwrap_or_else(|| std::path::Path::new(session_dir));
-    let path = root.join("fake_pi_commands.jsonl");
+    let path = root.join("fake_pi_commands.ndjson");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

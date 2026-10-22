@@ -305,15 +305,13 @@ async fn close_session(
         .application
         .close(&ctx, &request.runtime_id, request.lease)
         .await;
-    // Any turn stream still sitting unclaimed for this runtime_id will never
-    // be attached to now that the session itself is closing — sweep it
-    // immediately rather than waiting out the configured stream TTL. Done regardless
-    // of whether close succeeded: a failure (e.g. NotFound because it was
-    // already closed through another path) still means nobody is coming
-    // back for this runtime_id's streams either.
-    state.streams.lock().await.remove(&request.runtime_id);
     match result {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            // A successful close releases unclaimed streams immediately. On error,
+            // the owner may still claim them; the existing TTL bounds retention.
+            state.streams.lock().await.remove(&request.runtime_id);
+            Json(response).into_response()
+        }
         Err(error) => session_error(project_session_error(error)),
     }
 }

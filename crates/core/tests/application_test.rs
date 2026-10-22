@@ -17,6 +17,7 @@ use backend;
 struct SnapshotLifecycle {
     local: Arc<backend::local::LocalProvider>,
     fail_snapshot_delete: bool,
+    snapshot_deletes: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 #[async_trait]
@@ -80,6 +81,9 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
     ) -> Result<provider_protocol::ProviderDeleteOutcome, provider_protocol::ProviderControlError>
     {
         if let Some(snapshot_id) = request.snapshot_id {
+            if let Some(deletes) = &self.snapshot_deletes {
+                deletes.lock().await.push(snapshot_id.0.clone());
+            }
             if self.fail_snapshot_delete {
                 return Err(provider_protocol::ProviderControlError::Transport {
                     message: "snapshot delete failed".into(),
@@ -115,6 +119,13 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
 }
 
 fn snapshot_provider_managers(fail_snapshot_delete: bool) -> HashMap<String, Arc<InstanceManager>> {
+    snapshot_provider_managers_with_deletes(fail_snapshot_delete, None)
+}
+
+fn snapshot_provider_managers_with_deletes(
+    fail_snapshot_delete: bool,
+    snapshot_deletes: Option<Arc<Mutex<Vec<String>>>>,
+) -> HashMap<String, Arc<InstanceManager>> {
     use backend::{OperationAttach, ProviderInstanceLedger, SqliteProviderInstanceLedger};
     use provider_protocol::{ProviderKind, ProviderLifecycle};
     use xgovernor_manager::InstanceManagerConfig;
@@ -123,6 +134,7 @@ fn snapshot_provider_managers(fail_snapshot_delete: bool) -> HashMap<String, Arc
     let lifecycle: Arc<dyn ProviderLifecycle> = Arc::new(SnapshotLifecycle {
         local: Arc::clone(&local),
         fail_snapshot_delete,
+        snapshot_deletes,
     });
     let attach: Arc<dyn OperationAttach> = local;
     let ledger: Arc<dyn ProviderInstanceLedger> = Arc::new(
@@ -1682,6 +1694,7 @@ async fn second_submit_while_a_turn_is_active_is_rejected_with_conflict() {
 #[derive(Default)]
 struct CountingRuntime {
     submissions: std::sync::atomic::AtomicU32,
+    state_export: bool,
 }
 
 #[async_trait]
@@ -1691,7 +1704,11 @@ impl AgentRuntime for CountingRuntime {
     }
 
     fn capabilities(&self) -> BTreeSet<agent_runtime_protocol::RuntimeCapability> {
-        BTreeSet::new()
+        if self.state_export {
+            BTreeSet::from([agent_runtime_protocol::RuntimeCapability::StateExport])
+        } else {
+            BTreeSet::new()
+        }
     }
 
     async fn start(
@@ -2841,3 +2858,12 @@ async fn active_turn_blocks_external_operations_and_checkpoint() {
         Err(SessionDomainError::Conflict { .. })
     ));
 }
+
+#[path = "application_test/session_contract.rs"]
+mod session_contract;
+
+#[path = "application_test/cancel_checkpoint.rs"]
+mod cancel_contract;
+
+#[path = "application_test/snapshot_recovery.rs"]
+mod snapshot_recovery;
