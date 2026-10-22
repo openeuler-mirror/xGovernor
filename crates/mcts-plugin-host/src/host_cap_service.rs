@@ -37,6 +37,12 @@ pub trait HostApplication: Send + Sync {
         path: &str,
         data: &str,
     ) -> Result<u64, PluginHostError>;
+    async fn heartbeat(
+        &self,
+        run_id: &str,
+        branch_id: &str,
+        client_id: &str,
+    ) -> Result<(), PluginHostError>;
     async fn diff(&self, run_id: &str, branch_id: &str, base_state_id: &str) -> Result<String, PluginHostError>;
     async fn release(&self, run_id: &str, branch_id: &str) -> Result<(), PluginHostError>;
 }
@@ -56,6 +62,10 @@ impl<A: HostApplication> HostCapService<A> {
 
     pub fn run_map(&self) -> Arc<RunMap> {
         self.run_map.clone()
+    }
+
+    pub fn application(&self) -> Arc<A> {
+        self.app.clone()
     }
 
     pub async fn handle(&self, id: RpcId, method: MethodName, params: Value) -> Response {
@@ -387,6 +397,20 @@ impl HostApplication for FakeApplication {
                     .calls
                     .push(format!("file_write:{branch_id}:{path}:{data}"));
                 data.len() as u64
+            })
+            .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
+    }
+
+    async fn heartbeat(
+        &self,
+        _run_id: &str,
+        branch_id: &str,
+        client_id: &str,
+    ) -> Result<(), PluginHostError> {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state.calls.push(format!("heartbeat:{branch_id}:{client_id}"));
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }

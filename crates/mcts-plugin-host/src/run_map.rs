@@ -14,12 +14,15 @@ pub enum JobStatus {
 pub struct BranchRecord {
     pub run_id: String,
     pub parent_state_id: String,
+    pub mcts_owned: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct StateRecord {
     pub run_id: String,
     pub branch_id: String,
+    pub expires_at_ms: Option<u64>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +63,14 @@ impl RunMap {
         }
     }
 
+    pub fn ensure_run(&self, run_id: &str) -> Result<(), PluginHostError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        inner.runs.insert(run_id.to_string());
+        Ok(())
+    }
+
     pub fn require_run(&self, run_id: &str) -> Result<(), PluginHostError> {
         let inner = self.inner.read().map_err(|_| {
             PluginHostError::Manifest("run map lock poisoned".to_string())
@@ -91,9 +102,24 @@ impl RunMap {
             BranchRecord {
                 run_id: run_id.to_string(),
                 parent_state_id: parent_state_id.to_string(),
+                mcts_owned: true,
             },
         );
         Ok(())
+    }
+
+    pub fn list_run_branches(&self, run_id: &str) -> Vec<String> {
+        self.inner
+            .read()
+            .map(|inner| {
+                inner
+                    .branches
+                    .iter()
+                    .filter(|(_, branch)| branch.run_id == run_id && branch.mcts_owned)
+                    .map(|(branch_id, _)| branch_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn remove_branch(&self, branch_id: &str) -> Result<(), PluginHostError> {
@@ -136,6 +162,34 @@ impl RunMap {
             StateRecord {
                 run_id: run_id.to_string(),
                 branch_id: branch_id.to_string(),
+                expires_at_ms: None,
+                tenant_id: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn register_root_state(&self, run_id: &str, state_id: &str) -> Result<(), PluginHostError> {
+        self.require_run(run_id)?;
+        let mut inner = self.inner.write().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        if let Some(existing) = inner.states.get(state_id) {
+            if existing.run_id == run_id {
+                return Ok(());
+            }
+            return Err(PluginHostError::IdempotencyConflict(format!(
+                "state {state_id} is already owned by run {}",
+                existing.run_id
+            )));
+        }
+        inner.states.insert(
+            state_id.to_string(),
+            StateRecord {
+                run_id: run_id.to_string(),
+                branch_id: String::new(),
+                expires_at_ms: None,
+                tenant_id: None,
             },
         );
         Ok(())
@@ -247,5 +301,28 @@ mod tests {
         map.register_run("run-1").unwrap();
         map.add_branch("run-1", "branch-1", "state-root").unwrap();
         assert!(map.add_branch("run-1", "branch-1", "state-root").is_err());
+    }
+
+    #[test]
+    fn adopts_external_root_state_idempotently() {
+        let map = RunMap::new();
+        map.register_run("run-1").unwrap();
+        map.register_root_state("run-1", "checkpoint-1").unwrap();
+        map.register_root_state("run-1", "checkpoint-1").unwrap();
+
+        assert!(map.require_state_in_run("run-1", "checkpoint-1").is_ok());
+        assert!(map.require_state_in_run("run-2", "checkpoint-1").is_err());
+    }
+
+    #[test]
+    fn lists_only_owned_branches_for_cleanup() {
+        let map = RunMap::new();
+        map.register_run("run-1").unwrap();
+        map.register_run("run-2").unwrap();
+        map.add_branch("run-1", "branch-1", "state-root").unwrap();
+        map.add_branch("run-2", "branch-2", "state-other").unwrap();
+
+        assert_eq!(map.list_run_branches("run-1"), vec!["branch-1"]);
+        assert_eq!(map.list_run_branches("run-2"), vec!["branch-2"]);
     }
 }

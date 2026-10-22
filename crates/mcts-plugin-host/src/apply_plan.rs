@@ -22,6 +22,8 @@ impl ApplyPlanValidator {
     ) -> Result<(), PluginHostError> {
         result.validate()?;
         if let Some(plan) = &result.apply_plan {
+            // Day 6 keeps expiry/tenant placeholders on StateRecord but has no
+            // real host lease metadata yet, so do not pseudo-enforce them here.
             // State ownership is enforceable only once the host has actually
             // materialized branches/states through host.* calls.  The mock
             // stdio plugin runs in-process and never registers host states,

@@ -19,6 +19,7 @@ use crate::apply_plan::ApplyPlanValidator;
 use crate::error::PluginHostError;
 use crate::host_cap_service::{HostApplication, HostCapService};
 use crate::job_notifier::{empty_usage, JobNotifier};
+use crate::lease_keeper::{spawn_lease_keeper, DEFAULT_HEARTBEAT_INTERVAL};
 use crate::llm_policy::LlmPolicy;
 use crate::manifest::PLUGIN_ID;
 use crate::process::PluginProcess;
@@ -172,12 +173,34 @@ impl<A: HostApplication> MctsRun<A> {
         )
     }
 
-    pub async fn execute(self) -> Result<MctsRunOutcome, PluginHostError> {
+    pub async fn execute(mut self) -> Result<MctsRunOutcome, PluginHostError>
+    where
+        A: 'static,
+    {
         validate_request(&self.request)?;
 
+        let run_id = self.request.run_id.clone();
+        let run_map = self.host_cap_service.run_map();
+        run_map.ensure_run(&run_id)?;
+        run_map.register_root_state(&run_id, &self.request.root_state_id)?;
+        let client_id = format!("mcts-run:{run_id}");
+        let lease_keeper = spawn_lease_keeper(
+            run_id.clone(),
+            run_map.clone(),
+            self.host_cap_service.application(),
+            client_id,
+            DEFAULT_HEARTBEAT_INTERVAL,
+        );
+
+        let result = self.run_loop().await;
+        lease_keeper.shutdown().await;
+        let _ = self.cleanup_branches().await;
+        result
+    }
+
+    async fn run_loop(&mut self) -> Result<MctsRunOutcome, PluginHostError> {
         let plugin_id = self.request.plugin_id.clone();
         let run_id = self.request.run_id.clone();
-        self.host_cap_service.run_map().register_run(&run_id)?;
 
         let envs: Vec<(&str, &str)> = self
             .envs
@@ -185,7 +208,7 @@ impl<A: HostApplication> MctsRun<A> {
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
         self.llm_policy.validate_env(&envs)?;
-        let process = PluginProcess::spawn(self.command, &envs).await?;
+        let process = PluginProcess::spawn_isolated(&mut self.command, &envs).await?;
         let mut progress = RunProgress {
             status: MctsRunStatus::Accepted,
             ..RunProgress::default()
@@ -270,6 +293,24 @@ impl<A: HostApplication> MctsRun<A> {
 
         let _ = process.shutdown().await;
         Ok(progress.into_outcome())
+    }
+
+    async fn cleanup_branches(&self) -> Result<(), PluginHostError> {
+        let run_id = &self.request.run_id;
+        let run_map = self.host_cap_service.run_map();
+        let app = self.host_cap_service.application();
+        for branch_id in run_map.list_run_branches(run_id) {
+            if let Err(error) = app.release(run_id, &branch_id).await {
+                tracing::warn!(
+                    run_id,
+                    branch_id,
+                    error = %error,
+                    "MCTS branch release failed during cleanup"
+                );
+            }
+            let _ = run_map.remove_branch(&branch_id);
+        }
+        Ok(())
     }
 }
 

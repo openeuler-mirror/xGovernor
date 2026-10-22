@@ -26,6 +26,24 @@ impl PluginProcess {
         mut command: Command,
         envs: &[(&str, &str)],
     ) -> Result<Self, PluginHostError> {
+        Self::spawn_inner(&mut command, envs).await
+    }
+
+    /// Spawn the plugin with an empty inherited environment, then inject only
+    /// the caller-provided allow-list. This prevents xg model/token/tenant
+    /// credentials from leaking into the plugin process.
+    pub async fn spawn_isolated(
+        command: &mut Command,
+        envs: &[(&str, &str)],
+    ) -> Result<Self, PluginHostError> {
+        command.env_clear();
+        Self::spawn_inner(command, envs).await
+    }
+
+    async fn spawn_inner(
+        command: &mut Command,
+        envs: &[(&str, &str)],
+    ) -> Result<Self, PluginHostError> {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());

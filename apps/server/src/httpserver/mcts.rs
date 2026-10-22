@@ -115,6 +115,20 @@ pub fn mcts_router(state: MctsHttpState) -> Router {
         .with_state(state.clone())
 }
 
+const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
+    "ZSOFT_TASKS_DIR",
+    "PYTHONPATH",
+    "ZSOFT_TRIAL_SERVER_URL",
+    "XIAOO_MCTS_TOKEN_FUSE_LIMIT",
+];
+
+fn collect_plugin_envs() -> Vec<(String, String)> {
+    MCTS_PLUGIN_ENV_ALLOWLIST
+        .iter()
+        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_string(), value)))
+        .collect()
+}
+
 async fn create_run(
     State(state): State<MctsHttpState>,
     Json(mut request): Json<MctsRunRequest>,
@@ -146,6 +160,25 @@ async fn create_run(
         });
     }
 
+    let host_service = if state.config.spawn_enabled {
+        let run_map = RunMap::new();
+        if let Err(error) = run_map.register_run(&request.run_id) {
+            return Err(MctsApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to register MCTS run map: {error}"),
+            });
+        }
+        if let Err(error) = run_map.register_root_state(&request.run_id, &request.root_state_id) {
+            return Err(MctsApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("failed to adopt root state: {error}"),
+            });
+        }
+        Some(Arc::new(HostCapService::new(FakeApplication::new(), run_map)))
+    } else {
+        None
+    };
+
     let record = MctsRunRecord {
         run_id: request.run_id.clone(),
         status: MctsRunStatus::Accepted,
@@ -156,8 +189,8 @@ async fn create_run(
     runs.insert(record.run_id.clone(), record);
     drop(runs);
 
-    if state.config.spawn_enabled {
-        spawn_mcts_task(state.clone(), request.clone());
+    if let Some(host_service) = host_service {
+        spawn_mcts_task(state.clone(), request.clone(), host_service);
     }
 
     Ok((
@@ -172,18 +205,18 @@ async fn create_run(
     ))
 }
 
-fn spawn_mcts_task(state: MctsHttpState, request: MctsRunRequest) {
+fn spawn_mcts_task(
+    state: MctsHttpState,
+    request: MctsRunRequest,
+    host_service: Arc<HostCapService<FakeApplication>>,
+) {
     let run_id = request.run_id.clone();
     let command = build_launch_command(
         state.config.python_bin.clone(),
         state.config.repo_root.clone(),
         &request,
     );
-    let host_service = Arc::new(HostCapService::new(
-        FakeApplication::new(),
-        RunMap::new(),
-    ));
-    let run = MctsRun::new(command, vec![], request, host_service);
+    let run = MctsRun::new(command, collect_plugin_envs(), request, host_service);
     let runs = state.runs.clone();
 
     tokio::spawn(async move {
@@ -268,6 +301,15 @@ mod tests {
             },
             "granted_capabilities": ["snapshot", "fork", "agent_turn"]
         })
+    }
+
+    #[test]
+    fn plugin_env_allowlist_excludes_llm_credentials() {
+        assert!(
+            MCTS_PLUGIN_ENV_ALLOWLIST
+                .iter()
+                .all(|key| !key.starts_with("XGOVERNOR_LLM_"))
+        );
     }
 
     fn test_router() -> Router {
