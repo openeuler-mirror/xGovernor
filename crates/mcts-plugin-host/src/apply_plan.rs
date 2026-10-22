@@ -28,7 +28,7 @@ impl ApplyPlanValidator {
             // materialized branches/states through host.* calls.  The mock
             // stdio plugin runs in-process and never registers host states,
             // so in that no-host-state case protocol validation is sufficient.
-            if run_map.has_states() {
+            if run_map.has_host_states() {
                 run_map.require_state_in_run(run_id, &plan.state_id)?;
             }
         }
@@ -79,6 +79,15 @@ mod tests {
     fn accepts_owned_apply_plan_state() {
         let map = run_map_with_state();
         let result = valid_result("state-1");
+        assert!(ApplyPlanValidator::new().validate(&result, "run-1", &map).is_ok());
+    }
+
+    #[test]
+    fn external_root_state_alone_does_not_enable_local_mock_ownership_gate() {
+        let map = RunMap::new();
+        map.register_run("run-1").unwrap();
+        map.register_root_state("run-1", "state-root").unwrap();
+        let result = valid_result("state-3");
         assert!(ApplyPlanValidator::new().validate(&result, "run-1", &map).is_ok());
     }
 

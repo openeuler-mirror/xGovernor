@@ -235,6 +235,18 @@ impl RunMap {
             .unwrap_or(false)
     }
 
+    /// True only when the plugin has already created at least one immutable
+    /// state through ``host.snapshot``. An adopted external root state has an
+    /// empty ``branch_id`` and is deliberately excluded: it is not a state the
+    /// plugin produced locally, so it must not turn on ``ApplyPlanValidator``'s
+    /// ownership gate for the no-host-state mock path.
+    pub fn has_host_states(&self) -> bool {
+        self.inner
+            .read()
+            .map(|inner| inner.states.values().any(|state| !state.branch_id.is_empty()))
+            .unwrap_or(false)
+    }
+
     pub fn add_job(&self, run_id: &str, branch_id: &str, job_id: &str) -> Result<(), PluginHostError> {
         self.require_branch_in_run(run_id, branch_id)?;
         let mut inner = self.inner.write().map_err(|_| {
