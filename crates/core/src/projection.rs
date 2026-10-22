@@ -89,7 +89,7 @@ pub fn project_session_summary(record: &SessionRecord) -> SessionSummary {
 }
 
 pub fn project_session_error(error: SessionDomainError) -> SessionWireError {
-    match error {
+    let wire = match error {
         SessionDomainError::InvalidRequest { message } => {
             SessionWireError::InvalidRequest { message }
         }
@@ -133,7 +133,29 @@ pub fn project_session_error(error: SessionDomainError) -> SessionWireError {
             message,
             details: serde_json::Value::Null,
         },
+    };
+    #[cfg(unix)]
+    {
+        fn scrub(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::String(s) => *s = crate::deployment::safe_diagnostic(s),
+                serde_json::Value::Array(values) => values.iter_mut().for_each(scrub),
+                serde_json::Value::Object(values) => {
+                    for (key, value) in values {
+                        if key != "code" && key != "family" {
+                            scrub(value);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(wire).expect("wire error serialization");
+        scrub(&mut value);
+        return serde_json::from_value(value).expect("wire error preserves its shape");
     }
+    #[cfg(not(unix))]
+    wire
 }
 
 /// `pub(crate)`: also used by `application.rs`'s `close`/`detach` control
@@ -188,6 +210,7 @@ mod tests {
     #[test]
     fn domain_projection_exposes_only_wire_facts() {
         let record = SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: "runtime-1".into(),
             conversation_id: "conversation-1".into(),
             sender_id: "sender-1".into(),

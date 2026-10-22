@@ -1,0 +1,37 @@
+[package]
+name = "xgovernor-thinkthread-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.89"
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+operation-protocol = { path = "../protocol/operation" }
+uuid.workspace = true
+session-protocol = { path = "../protocol/session" }
+xgovernor-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thinkthread-management = { git = "https://gitcode.com/aideveloper/capsule_public.git", rev = "881ff5d49395bfe53904c2da2f8d6403db1b42fd", version = "=2.2.0" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+backend = { path = "../backend" }
+xgovernor-manager = { path = "../manager" }
+provider-protocol = { path = "../protocol/provider" }
+axum.workspace = true
+http-body-util = "0.1"
+tower = { workspace = true, features = ["util"] }
+xgovernor-server = { path = "../../apps/server" }
+xgovernor-runtime-pi = { path = "../../apps/runtime-pi" }
+xgovernor-runtime-xiaoo = { path = "../../apps/runtime-xiaoo" }
+rusqlite.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

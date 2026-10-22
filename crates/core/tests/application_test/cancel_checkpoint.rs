@@ -48,7 +48,7 @@ async fn finish_cancelled_turn(runtime: &HoldingRuntime, mut submission: Session
                     assert_eq!(runtime_id, receipt.runtime_id);
                     assert_eq!(turn_id, receipt.turn_id);
                     assert_eq!(outcome, SessionTurnOutcome::Cancelled);
-                    assert_eq!(actual, usage);
+                    assert_eq!(actual, session_protocol::SessionUsageReport::Known(usage));
                     count += 1;
                 }
                 SessionEvent::TurnFailed { error, .. } => panic!("unexpected failure: {error:?}"),

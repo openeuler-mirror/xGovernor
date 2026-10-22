@@ -3,13 +3,24 @@
 //! Nothing in this crate is serialized by the HTTP transport directly.
 
 pub mod application;
+#[cfg(unix)]
+pub mod deployment;
 pub mod domain;
+#[cfg(unix)]
+pub use deployment::{DeploymentBudgetConfiguration, DeploymentGuard};
+pub mod joint_cancel;
+pub mod joint_host;
+pub mod joint_lifecycle;
+pub mod joint_store;
 pub mod orphan_reaper;
 pub mod projection;
 pub mod prompt_utils;
 pub mod reclaim_sweeper;
 pub mod security;
 pub mod session_lease;
+mod sqlite_cancel;
+mod sqlite_host;
+mod sqlite_joint;
 pub mod sqlite_repository;
 pub mod turn_cancellation;
 
@@ -22,6 +33,10 @@ pub use application::{
     TurnIdGenerator,
 };
 pub use domain::*;
+pub use joint_cancel::*;
+pub use joint_host::*;
+pub use joint_lifecycle::*;
+pub use joint_store::*;
 pub use orphan_reaper::{spawn_orphan_reaper, spawn_orphan_reaper_with_config, OrphanReaperConfig};
 pub use projection::{project_session, project_session_error, project_session_summary};
 pub use prompt_utils::{

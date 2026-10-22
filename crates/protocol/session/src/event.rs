@@ -48,6 +48,53 @@ pub struct SessionUsage {
     pub total_tokens: u64,
 }
 
+/// Terminal metering. Unknown is a string so older numeric decoders reject it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionUsageReport {
+    Known(SessionUsage),
+    #[default]
+    Unknown,
+}
+impl From<SessionUsage> for SessionUsageReport {
+    fn from(value: SessionUsage) -> Self {
+        Self::Known(value)
+    }
+}
+impl Serialize for SessionUsageReport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Known(counts) => counts.serialize(serializer),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for SessionUsageReport {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Counts {
+            input_tokens: u64,
+            output_tokens: u64,
+            total_tokens: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Known(Counts),
+            Unknown(String),
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Known(v) => Self::Known(SessionUsage {
+                input_tokens: v.input_tokens,
+                output_tokens: v.output_tokens,
+                total_tokens: v.total_tokens,
+            }),
+            Wire::Unknown(value) if value == "unknown" => Self::Unknown,
+            Wire::Unknown(_) => return Err(serde::de::Error::custom("unknown usage marker")),
+        })
+    }
+}
+
 /// Failure reported after a turn was accepted. This is distinct from
 /// [`crate::SessionWireError`], which describes rejection at the HTTP boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -124,14 +171,14 @@ pub enum SessionEvent {
         turn_id: String,
         outcome: SessionTurnOutcome,
         #[serde(default)]
-        usage: SessionUsage,
+        usage: SessionUsageReport,
     },
     TurnFailed {
         runtime_id: String,
         turn_id: String,
         error: SessionTurnFailure,
         #[serde(default)]
-        usage: SessionUsage,
+        usage: SessionUsageReport,
     },
     Extension {
         runtime_id: String,
@@ -252,5 +299,46 @@ mod tests {
             SessionEvent::InteractionRequested { sensitive, .. } => assert!(!sensitive),
             _ => panic!("expected interaction_requested"),
         }
+    }
+}
+
+#[cfg(test)]
+mod metering_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn unknown_metering_cannot_be_decoded_as_zero() {
+        let known = SessionUsageReport::Known(SessionUsage::default());
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            json!({"input_tokens":0,"output_tokens":0,"total_tokens":0})
+        );
+        assert_eq!(
+            serde_json::to_value(SessionUsageReport::Unknown).unwrap(),
+            json!("unknown")
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionUsageReport>(json!("unknown")).unwrap(),
+            SessionUsageReport::Unknown
+        );
+        assert!(serde_json::from_value::<SessionUsage>(json!("unknown")).is_err());
+        for invalid in [
+            json!(null),
+            json!({}),
+            json!({"quality":"unknown"}),
+            json!({"unknown":null}),
+            json!({"input_tokens":0}),
+            json!("missing"),
+        ] {
+            assert!(serde_json::from_value::<SessionUsageReport>(invalid).is_err());
+        }
+        let event:SessionEvent=serde_json::from_value(json!({"kind":"turn_completed","runtime_id":"public","turn_id":"turn","outcome":"complete"})).unwrap();
+        assert!(matches!(
+            event,
+            SessionEvent::TurnCompleted {
+                usage: SessionUsageReport::Unknown,
+                ..
+            }
+        ));
     }
 }

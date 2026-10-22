@@ -167,11 +167,11 @@ async fn restart_then_submit_turn_triggers_lazy_restoration_and_resumes_the_pers
             SessionEvent::TurnCompleted { outcome, usage, .. } => {
                 assert_eq!(
                     usage,
-                    session_protocol::SessionUsage {
+                    session_protocol::SessionUsageReport::Known(session_protocol::SessionUsage {
                         input_tokens: 1,
                         output_tokens: 1,
                         total_tokens: 2,
-                    },
+                    }),
                     "restored history must not be charged again"
                 );
                 assert_eq!(outcome, SessionTurnOutcome::Complete);

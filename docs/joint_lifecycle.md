@@ -1,0 +1,236 @@
+# Joint execution lifecycle
+
+`RuntimeRegistration::new` retains the provider/runtime split lifecycle. An explicit `with_joint_lifecycle` strategy can instead own indivisible execution resources. This is an internal application boundary; it adds no HTTP fields and no server backend registration.
+
+The application retains authorization, environment normalization, capability checks, leases, public identifiers and event projection. `JointOperationContext` carries the authenticated role/quota, tenant ownership, parent intent, public identities and pinned configuration revision. It never carries model credentials.
+
+A joint owner returns records already committed by the supplied durable repository. The application checks their identity and persisted result; it does not independently save a second copy or adjust resource references. Ordinary SQLite session writes cannot create a joint record or replace an existing joint/unknown route with a split route.
+
+Session routing is persisted as a versioned `SessionExecutionBacking`. Existing databases acquire the `split_v1` default without changing their records. Unknown variants fail decoding. Joint bindings name an owner, binding and configuration revision; they are internal and excluded from public projections.
+
+Open, capture, load, close, cancel, attachment and health checks use the joint strategy for joint records. Unsupported turns, interaction and fork fail before invoking a split runtime/provider. Host requests require an explicitly implemented request-bound Host access strategy and otherwise fail before invoking a split backend. Closing a joint session invokes one owner and never the split cleanup sequence. Joint operations do not hold the legacy global snapshot lock across downstream work; they require durable source/Root fencing.
+
+`SessionRepository::supports_joint_transactions` defaults to false. The SQLite repository requires an explicit `with_joint_transactions()` assembly opt-in for a verified joint owner; its default remains disabled. The legacy path remains usable. A strategy must not claim this capability by relying on default no-op intent methods.
+
+Joint checkpoint records use a real binding reference; legacy checkpoints keep their real provider snapshot and runtime state. No placeholder provider snapshot ID is used to represent a joint resource. Durable migration/publication and recovery are requirements for enabling a joint owner, and do not follow merely from selecting the strategy.
+
+## Durable admission and publication
+
+SQLite stores joint sessions and checkpoints in independent tables in the same database. Legacy readers see only split records; triggers prevent a legacy writer from taking a published or reserved joint public identity. New readers merge the two routes for authorized listings and quota restoration. Ordinary `save` remains exclusively for split records.
+
+The durable repository API commits a binding, public identity claim, native UUID/digest/parameters, reservations, parent reference and Root/source fence before downstream effects. A repeated parent intent must match the original request exactly. Admission counts active legacy sessions plus joint reservations, including unpublished and unknown operations. A new Root requires its own reservation. Every later binding in that Root has an explicit active parent with matching tenant, owner, runtime and configuration revision. Independent native objects have one owner within a Root.
+
+Record native outcomes with their exact original UUID and digest. Accepted, unknown and failed results retain the union of resource identities already observed for the same native step. The payload is the latest observation; intermediate payload history is not retained. Terminal outcomes remain immutable. An unknown result does not release a reservation, identity claim or fence. A later create result invalidates earlier absence for its objects. Native parameters and results must be sanitized by the trusted adapter before persistence; the repository rejects known credential fields but does not provide arbitrary secret discovery.
+
+Public session/checkpoint publication atomically checks parent stage, binding generation, Root/source fence and completed native results, then commits the public record, reference, reservations and publication result. Replaying the same publication returns the committed result. No provider snapshot placeholder or separate second save is involved.
+
+A release first prevents new dependent references. Final release requires settled original operations, exact absence for every owned object in the binding generation and no other references. Unpublished creation has a separate compensation finish with the same requirements; unknown delivery cannot be treated as not sent. Known resource identities, UUIDs and terminal outcomes remain after release for reconciliation. Pending intents are dispatched to their persisted joint owner; the application does not create replacement mutations or invoke legacy cleanup.
+
+This API supplies durable storage primitives. `supports_joint_transactions` remains false by default; an explicitly assembled owner can opt into the verified SQLite implementation. These primitives do not enable a server backend or provide a multi-writer deployment contract for the legacy lifecycle.
+
+A prepared operation can atomically enter compensation after all original mutations
+are settled and no public/dependent reference exists. Compensation is a durable
+phase: ordinary sends and publication are excluded, including after restart before
+the first cleanup step. Native steps identify their execution or compensation
+purpose; new optional fields preserve the encoding of legacy intents. Safe Session
+publication input can be persisted with admission and cannot be replaced later.
+
+## Assembled resource budgets
+
+Configure `SqliteSessionRepository::with_joint_budget_policy` on every repository
+that admits joint resources. `JointBudgetPolicy` maps a resource kind to a
+`JointResourceBudget { total, recovery_reserve }`; `recovery_reserve` defaults to
+zero. An omitted kind has zero capacity, and an empty policy denies new
+allocations. Assembly rejects a reserve larger than its total or an unknown
+resource kind. Setting a policy does not enable `supports_joint_transactions`;
+the separate lifecycle opt-in remains necessary.
+
+The policy is supplied by trusted server assembly, not by an operation request.
+It is not persisted or revisioned in SQLite. All processes accessing one database
+must be assembled with the same policy, and coordinated configuration changes
+must update every writer. This deployment requirement does not introduce a
+multi-writer contract for the legacy lifecycle. Reopening with lower limits
+retains existing records and reservations, and rejects new ordinary allocations
+while the remaining capacity is insufficient. Recovery, exact request replay,
+publication and release of an admitted operation do not allocate again and are
+not blocked by a later policy reduction or an empty policy.
+
+All supported allocations (`open`, `load`, `checkpoint`) are ordinary. For each
+kind they must satisfy both `ordinary_used + units <= total - recovery_reserve`
+and `total_used + units <= total` in the same prepare transaction, before native
+execution. Every unreleased reservation contributes to both counts; for sessions,
+active legacy sessions contribute too. An authenticated tenant's `max_sessions`
+further limits session admission. Each tenant/owner is accounted independently.
+Session and Root reserves are zero unless explicitly configured otherwise.
+
+`JointResourceReservation.limit` is accepted only for decoding older requests
+and source compatibility. Its value is ignored for admission and replay identity,
+and new serialized requests omit it. Older stored request bodies remain intact
+and can be decoded, reconciled and published. Other request fields, including
+native UUIDs, digests, parameters and resource quantities, still have to match on
+replay. The legacy Session/Root limit arguments to `RootSessionOwner::new` are
+also accepted for source compatibility and do not control admission; repository
+assembly is the sole resource-budget authority.
+
+Reserved and committed units both remain charged. Unknown delivery,
+`needs_recovery`, known failure with residual objects and pending cleanup do not
+release capacity through timeout, TTL, restart or a single missing projection.
+Release requires confirmed non-delivery without residual resources, or settled
+original operations, validated absence of all owned objects and no surviving
+references. Release is transactional and idempotent; repeating it cannot return
+capacity twice.
+
+A nonzero recovery reserve withholds capacity from ordinary admissions; it does
+not create resources or provide a repair facility. The Root/direct owner consumes
+only ordinary Session/Root capacity. No supported operation consumes the reserved
+recovery pool. Replica creation, failure budgets, minimum retained copies,
+replacement publication and retirement of old copies require their own resource
+lifecycle implementations. Reservation names such as `replica` and `repair` do
+not establish those capabilities, and capacity pressure never authorizes deletion
+of a last usable copy.
+
+
+Concurrent open recovery accepts a committed Session only after matching the
+original intent, binding, generation, complete creation request and publication
+input. The idempotent publication transaction verifies the full admission token
+and persisted result. A public runtime ID alone is insufficient. If another
+executor publishes while a caller is resuming a pending operation, that caller
+returns the verified committed result without another native mutation. Missing or
+mismatching durable evidence remains an error.
+
+Unpublished Root compensation resolves residual identities from the durable
+binding, including older journals whose last outcome omitted a previously known
+Root. A failed create with no known object in either the outcome or binding keeps
+its ownership and capacity; an empty result is not proof of absence.
+
+The internal binding lookup keeps live objects in `objects` and exposes known
+objects with durable absence evidence separately in `absent_objects`, scoped to
+the same binding generation. After compensation reaches durable absence, a
+restart can complete the existing strict finish transaction without repeating
+stop/remove, including older journals whose create result omitted the identity.
+A failed create with no identity in either object collection or its outcome is
+still rejected, even if its operation is already compensating. Release still
+requires settled native steps, no surviving references and no live objects.
+
+Repeated terminal observations first retain the previously known resource
+identities, then compare the normalized result. The same state and payload with
+no new resource identity is idempotent, including an empty incoming resource list.
+A changed terminal state, payload or added resource identity remains a conflict.
+
+## Request-bound Host access
+
+An optional `prepare_host_operation` strategy admits one complete exec/read/write
+request against a registered active private Child and branch. It preserves the
+application's authorization, lease, workspace and capability checks. The
+administrator-only Root/direct owner does not implement this strategy; there is
+no production server registration for the candidate Host owner.
+
+The Host repository stores canonical input and policy digests, local generation
+checks, original mutation UUIDs, a source fence, resource reservations and
+results in the Session database. Reads have local observation steps without a
+native mutation UUID. Mutation claims set the local workspace dirty before
+sending; EOF, an observation timeout, a missing operation or `needs_recovery`
+retains ownership and the fence. Recovery queries the original UUID and checks
+the SDK digest and exact target without sending a replacement mutation.
+Rejected mutations initially settle only with `delivery=not_sent`; `NeedsRecovery`
+and `OperationInProgress` retain the blocker even with that delivery value.
+Other accepted rejections query the original operation UUID and verify its handle,
+digest and target. A terminal failed write also requires a public read confirming
+that the requested bytes were not published. Read rejections are recognized only
+for `backend_release_ref=alpha11/0.1.0-25` (Management SDK `881ff5d`), with
+`FileOperationFailed`, `delivery=not_sent`, no `details`, and one of these exact
+messages observed for target-level failures in that fixed release:
+
+- `filesystem branch: invalid execution policy: only regular file reads are supported`
+- `filesystem branch: fs snapshot: No such file or directory (os error 2)`
+
+The adapter then queries the exact Child under the same source fence and requires
+the expected Root, parent, branch and filesystem, Running/Ready, `needsRecovery=false`
+and `fsBranchState=attached`. Both the read error and branch observation remain in
+the journal. Other messages (including ENOENT from branch metadata), supplied
+details, unpinned releases, missing views and recovery states stay unknown. The
+text fallback does not interpret an undeclared structured error contract.
+Only then do failure, dirty-state clearing, fence release and
+owned allocation release commit together. Missing or inconsistent evidence stays
+unknown; a failed exec record alone provides no declared business postcondition.
+The original rejection, query and postcondition observations remain in the journal.
+Failures
+before the first durable claim finish without sending and release their local
+reservation and Root hold. Replaying a committed failure preserves its error
+classification.
+
+The pinned SDK owns raw file framing. Read lengths and hashes are local
+observations; expected write lengths/hashes describe the original input.
+Incomplete or rejected transfers fail, and connections are discarded. Exec
+retains native reason/code separately from ordinary exit codes. An explicitly
+assembled settlement guarantee is required to release execution fences; a local
+timeout or a cancellation cannot establish settlement.
+
+Public overwrite uses `JointHostBackend::write_host` and returns only path and
+byte count. The filesystem `write_bytes` trait, atomic writes, export, metadata,
+search and directory helpers remain unsupported. Public `create_parents` executes
+one argv-based parent-directory exec followed by write under the same intent and
+fence. Both original UUIDs and outcomes are retained. A failed or unsettled exec
+prevents write; a failed write leaves any created directories in place. Recovery
+queries only the claimed step's original UUID and never recreates missing payload.
+No filesystem durability or process cleanup helper is supplied.
+
+A successful read rechecks the exact target, local generations and public content
+revision after receiving all bytes. Its result and `ArtifactEvidenceV1` source,
+revision, length and hash commit together. A changed view cannot publish a stable
+artifact. A local binding-generation change aborts the read durably without
+returning bytes; this side-effect-free failure can release only its original,
+unchanged fence epochs and cannot release a newer writer's fence. Revision
+equality only describes the writers covered by the local fence. Export handles remain unsupported until owned byte-reference lifetime and
+cleanup are available.
+
+Owned cleanup dependencies can suspend an already settled parent and its child
+record atomically. Suspension removes the execution fence and delegation while
+retaining ownership, resource accounting and the Root hold. Resume requires
+released dependencies and valid ownership/configuration, obtains a fresh epoch,
+and atomically restores the parent and child. Legacy journal/publication/release
+entry points reject these records. The intent stores the blocker, suspended
+cleanup plan identity and stage to resume. Source close admission is rejected
+while its cleanup is suspended, keeping that binding available for resumption.
+Committing a sent Host result also records a pending owned cleanup item, so a
+lost commit acknowledgement cannot lose the result or permit a duplicate release.
+
+## Ordinary cancellation
+
+Joint cancellation routes through `cancel_turn` on the persisted owner and
+configuration revision. The default implementation refuses unsupported owners.
+Authorization remains in `SessionApplication`; cancellation does not require a
+write lease. The split runtime path retains its existing exact-turn checks.
+
+The Root owner records cancellation against the original turn admission before
+sending `message.cancel`. An omitted turn ID selects the outstanding turn once;
+recovery retains that target, Message ID and operation UUID. Acknowledgement
+alone does not settle a turn or release its source fence. Only an authoritative
+Message terminal determines completion, failure or cancellation. Exact retries
+preserve an already committed terminal, including a natural completion that won
+the race. Cancelled turns emit the existing `Cancelled` outcome with unknown
+usage and no reply.
+
+A cancelled Message does not establish workspace convergence or tool exit.
+SQLite retains a cancellation epoch separately from per-operation dirty state.
+Later turns and Host settlement cannot clear it, and stable artifact publication
+is refused while that epoch is outstanding. Internal checkpoint observation
+registers the original request before an externally issued SDK checkpoint,
+validates its operation, domain outcome and retained metadata, and clears only
+the same binding generation and cancellation epoch. A failed boundary is
+returned without mutation retry. This observer does not expose public candidate
+checkpoint or load capabilities. Existing enrolled databases without these
+control tables retain their existing reads. Only the deployment writer holding
+both object and identity locks may create the additive tables in its registration
+transaction. Unbound readers never migrate the database; new cancellation
+controls require the holder and the upgraded schema. Partial control schemas
+are rejected rather than repaired.
+
+Post-cancellation execution failure retains the original Message records and an
+execution-invalidated error. Unknown observations retain their protection;
+verified failure does not create a replacement Root or restart the Session.
+
+Execution invalidation blocks submissions without a persisted terminal. An
+authorized exact retry can still replay its original terminal and turn ID after
+owner, configuration revision and input identity verification, without another
+Message operation.

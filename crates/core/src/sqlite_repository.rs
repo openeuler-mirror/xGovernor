@@ -44,7 +44,11 @@ use std::sync::{Arc, Mutex};
 
 /// Durable, single-process SQLite-backed [`SessionRepository`].
 pub struct SqliteSessionRepository {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
+    joint_transactions: bool,
+    #[cfg(unix)]
+    pub(crate) deployment: Option<Arc<crate::DeploymentGuard>>,
+    pub(crate) joint_budget_policy: crate::JointBudgetPolicy,
 }
 
 impl SqliteSessionRepository {
@@ -55,28 +59,82 @@ impl SqliteSessionRepository {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(path)?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open(path)?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            joint_transactions: false,
+            #[cfg(unix)]
+            deployment: None,
+            joint_budget_policy: Default::default(),
         })
     }
 
     /// In-memory database. For tests only — by definition there is nothing
     /// to survive a restart.
     pub fn open_in_memory() -> rusqlite::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        Self::init(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        Self::init(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            joint_transactions: false,
+            #[cfg(unix)]
+            deployment: None,
+            joint_budget_policy: Default::default(),
         })
     }
 
-    fn init(conn: &Connection) -> rusqlite::Result<()> {
-        // Best-effort: `:memory:` connections silently ignore WAL (falls
-        // back to the default journal mode), which is fine for tests.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.pragma_update(None, "busy_timeout", 5_000i64);
+    /// Explicit assembly opt-in for a verified joint lifecycle owner. Defaults to disabled.
+    pub fn with_joint_transactions(mut self) -> Self {
+        self.joint_transactions = true;
+        self
+    }
+
+    /// Sets admission capacity without enabling joint lifecycle assembly.
+    /// Existing reservations remain charged when a new policy lowers capacity.
+    pub fn with_joint_budget_policy(
+        mut self,
+        policy: crate::JointBudgetPolicy,
+    ) -> Result<Self, SessionDomainError> {
+        if policy.iter().any(|(kind, budget)| {
+            ![
+                "session",
+                "root",
+                "replica",
+                "checkpoint",
+                "repair",
+                "disk",
+                "operation",
+                "record_bytes",
+            ]
+            .contains(&kind.as_str())
+                || budget.recovery_reserve > budget.total
+        }) {
+            return Err(SessionDomainError::InvalidRequest {
+                message: "invalid joint resource budget".into(),
+            });
+        }
+        #[cfg(unix)]
+        if let Some(deployment) = &self.deployment {
+            deployment.check_policy(&policy)?;
+        }
+        self.joint_budget_policy = policy;
+        Ok(self)
+    }
+
+    fn init(connection: &mut Connection) -> rusqlite::Result<()> {
+        let _ = connection.pragma_update(None, "busy_timeout", 5_000i64);
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        // Enrollment and initialization serialize with business writers. A reader
+        // must not migrate a database whose deployment holder it does not own.
+        let conn =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if deployment_registered(&conn)? {
+            crate::sqlite_host::validate_schema(&conn)?;
+            crate::sqlite_cancel::validate_existing_schema(&conn)?;
+            return Ok(());
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS snapshot_operations (id TEXT PRIMARY KEY, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sessions (
@@ -112,8 +170,46 @@ impl SqliteSessionRepository {
                 created_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_checkpoints_tenant_runtime ON checkpoints(tenant_id, source_runtime_id);",
-        )
+        )?;
+        let has_execution = conn
+            .prepare("PRAGMA table_info(sessions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "execution_json");
+        if !has_execution {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN execution_json TEXT NOT NULL DEFAULT '{\"kind\":\"split_v1\"}';")?;
+        }
+        crate::sqlite_joint::init(&conn)?;
+        crate::sqlite_host::init(&conn)?;
+        conn.commit()?;
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        Ok(())
     }
+}
+
+/// The durable deployment row is also a write-protection marker. Treat even an
+/// incomplete registration as protected rather than guessing legacy ownership.
+pub(crate) fn deployment_registered(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_deployment')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+pub(crate) fn verify_writer(
+    conn: &Connection,
+    #[cfg(unix)] deployment: Option<&crate::DeploymentGuard>,
+) -> rusqlite::Result<()> {
+    #[cfg(unix)]
+    if let Some(holder) = deployment {
+        return holder.validate().map_err(|_| rusqlite::Error::InvalidQuery);
+    }
+    if deployment_registered(conn)? {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
 }
 
 fn status_to_str(status: SessionStatus) -> &'static str {
@@ -163,6 +259,7 @@ fn row_to_record(row: &Row) -> rusqlite::Result<Result<SessionRecord, String>> {
     let isolation_json: String = row.get("isolation_json")?;
     let capabilities_json: String = row.get("capabilities_json")?;
     let runtime_json: String = row.get("runtime_json")?;
+    let execution_json: String = row.get("execution_json")?;
     let llm_json: Option<String> = row.get("llm_json")?;
     let lease_json: Option<String> = row.get("lease_json")?;
     let lineage_json: Option<String> = row.get("lineage_json")?;
@@ -189,6 +286,7 @@ fn row_to_record(row: &Row) -> rusqlite::Result<Result<SessionRecord, String>> {
             lineage_json.as_deref().map(json_decode).transpose()?;
 
         Ok(SessionRecord {
+            execution_backing: json_decode(&execution_json)?,
             runtime_id,
             conversation_id,
             sender_id,
@@ -218,8 +316,216 @@ fn internal_error(message: impl Into<String>) -> SessionDomainError {
     }
 }
 
+fn read_session(conn: &Connection, id: &str) -> Result<Option<SessionRecord>, String> {
+    let body: Option<String> = conn
+        .query_row(
+            "SELECT body FROM joint_sessions WHERE runtime_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(body) = body {
+        return json_decode(&body).map(Some);
+    }
+    let found = conn
+        .query_row(
+            "SELECT * FROM sessions WHERE runtime_id=?1",
+            [id],
+            row_to_record,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    found.transpose()
+}
+
 #[async_trait]
 impl SessionRepository for SqliteSessionRepository {
+    fn host_repository(&self) -> Option<&dyn crate::HostRepository> {
+        Some(self)
+    }
+    fn supports_joint_transactions(&self) -> bool {
+        self.joint_transactions
+    }
+    async fn get_joint_binding(
+        &self,
+        binding: crate::JointBinding,
+    ) -> Result<Option<crate::JointBindingState>, SessionDomainError> {
+        self.read_joint_binding(binding).await
+    }
+    async fn get_joint_checkpoint(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::JointCheckpointRecord>, SessionDomainError> {
+        self.read_joint_checkpoint(id).await
+    }
+    async fn prepare_joint_operation(
+        &self,
+        request: crate::JointPrepareRequest,
+    ) -> Result<crate::JointAdmission, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_operation(self, request).await
+    }
+    async fn get_joint_turn(
+        &self,
+        runtime_id: String,
+        client_request_id: String,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        SqliteSessionRepository::get_joint_turn(self, runtime_id, client_request_id).await
+    }
+    async fn joint_turn_result(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointTurnTerminal>, SessionDomainError> {
+        SqliteSessionRepository::joint_turn_result(self, admission).await
+    }
+    async fn finish_joint_turn(
+        &self,
+        admission: crate::JointAdmission,
+        terminal: crate::JointTurnTerminal,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_turn(self, admission, terminal).await
+    }
+    async fn prepare_joint_cancel(
+        &self,
+        context: crate::JointOperationContext,
+        session: SessionRecord,
+        turn_id: Option<String>,
+    ) -> Result<Option<crate::JointTurnRecord>, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_cancel(self, context, session, turn_id).await
+    }
+    async fn joint_cancel_control(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<Option<crate::JointCancelControl>, SessionDomainError> {
+        SqliteSessionRepository::joint_cancel_control(self, admission).await
+    }
+    async fn prepare_joint_cancel_native(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCancelControl, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_cancel_native(self, admission, native).await
+    }
+    async fn claim_joint_cancel_send(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<bool, SessionDomainError> {
+        SqliteSessionRepository::claim_joint_cancel_send(self, admission).await
+    }
+    async fn record_joint_cancel_result(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+        outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::record_joint_cancel_result(self, admission, native, outcome).await
+    }
+    async fn joint_workspace_boundary(
+        &self,
+        binding: crate::JointBinding,
+    ) -> Result<crate::JointWorkspaceBoundary, SessionDomainError> {
+        SqliteSessionRepository::joint_workspace_boundary(self, binding).await
+    }
+    async fn prepare_joint_checkpoint_boundary(
+        &self,
+        binding: crate::JointBinding,
+        native: crate::JointNativeIntent,
+    ) -> Result<crate::JointCheckpointBoundaryObservation, SessionDomainError> {
+        SqliteSessionRepository::prepare_joint_checkpoint_boundary(self, binding, native).await
+    }
+    async fn confirm_joint_checkpoint_boundary(
+        &self,
+        ticket: crate::JointCheckpointBoundaryObservation,
+        checkpoint_id: String,
+    ) -> Result<bool, SessionDomainError> {
+        SqliteSessionRepository::confirm_joint_checkpoint_boundary(self, ticket, checkpoint_id)
+            .await
+    }
+    async fn invalidate_joint_turn(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::invalidate_joint_turn(self, admission).await
+    }
+    async fn begin_joint_compensation(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::begin_joint_compensation(self, admission).await
+    }
+    async fn claim_joint_native_send(
+        &self,
+        admission: crate::JointAdmission,
+        step: String,
+    ) -> Result<Option<crate::JointNativeIntent>, SessionDomainError> {
+        SqliteSessionRepository::claim_joint_native_send(self, admission, step).await
+    }
+    async fn append_joint_native_step(
+        &self,
+        admission: crate::JointAdmission,
+        native: crate::JointNativeIntent,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::append_joint_native_step(self, admission, native).await
+    }
+    async fn record_joint_native_result(
+        &self,
+        admission: crate::JointAdmission,
+        step: String,
+        operation_id: String,
+        digest: String,
+        outcome: crate::JointNativeOutcome,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::record_joint_native_result(
+            self,
+            admission,
+            step,
+            operation_id,
+            digest,
+            outcome,
+        )
+        .await
+    }
+    async fn publish_joint_session(
+        &self,
+        admission: crate::JointAdmission,
+        record: SessionRecord,
+    ) -> Result<SessionRecord, SessionDomainError> {
+        SqliteSessionRepository::publish_joint_session(self, admission, record).await
+    }
+    async fn publish_joint_checkpoint(
+        &self,
+        admission: crate::JointAdmission,
+        record: crate::JointCheckpointRecord,
+    ) -> Result<crate::JointCheckpointRecord, SessionDomainError> {
+        SqliteSessionRepository::publish_joint_checkpoint(self, admission, record).await
+    }
+    async fn finish_joint_release(
+        &self,
+        admission: crate::JointAdmission,
+        reference_kind: String,
+        public_id: String,
+        updated_at_ms: u64,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_release(
+            self,
+            admission,
+            reference_kind,
+            public_id,
+            updated_at_ms,
+        )
+        .await
+    }
+    async fn finish_joint_compensation(
+        &self,
+        admission: crate::JointAdmission,
+    ) -> Result<(), SessionDomainError> {
+        SqliteSessionRepository::finish_joint_compensation(self, admission).await
+    }
+    async fn pending_joint_operations(
+        &self,
+    ) -> Result<Vec<crate::JointPendingOperation>, SessionDomainError> {
+        SqliteSessionRepository::pending_joint_operations(self).await
+    }
     async fn get(&self, runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
         let conn = self.conn.clone();
         let runtime_id = runtime_id.to_string();
@@ -227,19 +533,7 @@ impl SessionRepository for SqliteSessionRepository {
             let conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            let found = conn
-                .query_row(
-                    "SELECT * FROM sessions WHERE runtime_id = ?1",
-                    params![runtime_id],
-                    row_to_record,
-                )
-                .optional()
-                .map_err(|error| error.to_string())?;
-            match found {
-                Some(Ok(record)) => Ok(Some(record)),
-                Some(Err(decode_error)) => Err(decode_error),
-                None => Ok(None),
-            }
+            read_session(&conn, &runtime_id)
         })
         .await
         .map_err(|error| internal_error(format!("sqlite get task panicked: {error}")))?;
@@ -248,26 +542,42 @@ impl SessionRepository for SqliteSessionRepository {
     }
 
     async fn save(&self, record: SessionRecord) -> Result<(), SessionDomainError> {
+        if record.execution_backing.joint().is_some() {
+            return Err(crate::unsupported_joint("publication"));
+        }
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let workspace_json = json_encode(&record.workspace)?;
             let isolation_json = json_encode(&record.isolation)?;
             let capabilities_json = json_encode(&record.capabilities)?;
             let runtime_json = json_encode(&record.runtime)?;
+            let execution_json = json_encode(&record.execution_backing)?;
             let llm_json = record.llm.as_ref().map(json_encode).transpose()?;
             let lease_json = record.lease.as_ref().map(json_encode).transpose()?;
             let lineage_json = record.lineage.as_ref().map(json_encode).transpose()?;
 
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            conn.execute(
-                "INSERT INTO sessions (
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO sessions (
                     runtime_id, conversation_id, sender_id, status,
                     created_at_ms, updated_at_ms, workspace_json, isolation_json,
                     capabilities_json, runtime_json, llm_json, lease_json,
-                    lineage_json, last_error, tenant_id, created_by
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                    lineage_json, last_error, tenant_id, created_by, execution_json
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                 ON CONFLICT(runtime_id) DO UPDATE SET
                     conversation_id = excluded.conversation_id,
                     sender_id = excluded.sender_id,
@@ -282,28 +592,34 @@ impl SessionRepository for SqliteSessionRepository {
                     lineage_json = excluded.lineage_json,
                     last_error = excluded.last_error,
                     tenant_id = excluded.tenant_id,
-                    created_by = excluded.created_by",
-                params![
-                    record.runtime_id,
-                    record.conversation_id,
-                    record.sender_id,
-                    status_to_str(record.status),
-                    record.created_at_ms as i64,
-                    record.updated_at_ms as i64,
-                    workspace_json,
-                    isolation_json,
-                    capabilities_json,
-                    runtime_json,
-                    llm_json,
-                    lease_json,
-                    lineage_json,
-                    record.last_error,
-                    record.tenant_id,
-                    record.created_by,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
+                    created_by = excluded.created_by,
+                    execution_json = excluded.execution_json
+                WHERE sessions.execution_json = excluded.execution_json",
+                    params![
+                        record.runtime_id,
+                        record.conversation_id,
+                        record.sender_id,
+                        status_to_str(record.status),
+                        record.created_at_ms as i64,
+                        record.updated_at_ms as i64,
+                        workspace_json,
+                        isolation_json,
+                        capabilities_json,
+                        runtime_json,
+                        llm_json,
+                        lease_json,
+                        lineage_json,
+                        record.last_error,
+                        record.tenant_id,
+                        record.created_by,
+                        execution_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("persisted execution route cannot be replaced".into());
+            }
+            tx.commit().map_err(|e| e.to_string())
         })
         .await
         .map_err(|error| internal_error(format!("sqlite save task panicked: {error}")))?;
@@ -317,8 +633,14 @@ impl SessionRepository for SqliteSessionRepository {
         body: serde_json::Value,
     ) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || { conn.lock().unwrap().execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map(|_|()).map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
+        tokio::task::spawn_blocking(move || { let mut conn = conn.lock().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| internal_error(e.to_string()))?;
+            verify_writer(&tx, #[cfg(unix)] deployment.as_deref()).map_err(|e| internal_error(e.to_string()))?;
+            tx.execute("INSERT INTO snapshot_operations VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,body.to_string()]).map_err(|e|internal_error(e.to_string()))?;
+            tx.commit().map_err(|e|internal_error(e.to_string())) }).await.map_err(|e|internal_error(e.to_string()))?
     }
     async fn operation_intents(
         &self,
@@ -346,13 +668,23 @@ impl SessionRepository for SqliteSessionRepository {
     }
     async fn delete_operation_intent(&self, id: &str) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            conn.lock()
-                .unwrap()
-                .execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
-                .map(|_| ())
-                .map_err(|e| internal_error(e.to_string()))
+            let mut conn = conn.lock().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| internal_error(e.to_string()))?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
+            )
+            .map_err(|e| internal_error(e.to_string()))?;
+            tx.execute("DELETE FROM snapshot_operations WHERE id=?1", [id])
+                .map_err(|e| internal_error(e.to_string()))?;
+            tx.commit().map_err(|e| internal_error(e.to_string()))
         })
         .await
         .map_err(|e| internal_error(e.to_string()))?
@@ -362,10 +694,14 @@ impl SessionRepository for SqliteSessionRepository {
         record: crate::CheckpointRecord,
     ) -> Result<(), SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let runtime_json = json_encode(&record.runtime_state)?; let workspace_json = json_encode(&record.workspace)?; let isolation_json = json_encode(&record.isolation)?; let capabilities_json = json_encode(&record.capabilities)?;
-            let conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            conn.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; Ok(())
+            let mut conn = conn.lock().map_err(|_| "sqlite session repository lock poisoned".to_string())?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+            verify_writer(&tx, #[cfg(unix)] deployment.as_deref()).map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO checkpoints (checkpoint_id,source_runtime_id,provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,owner_ref,tenant_id,created_by,created_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![record.checkpoint_id,record.source_runtime_id,record.provider_snapshot_id,runtime_json,workspace_json,isolation_json,capabilities_json,record.owner_ref,record.tenant_id,record.created_by,record.created_at_ms as i64]).map_err(|e| e.to_string())?; tx.commit().map_err(|e| e.to_string())
         }).await.map_err(|e| internal_error(format!("sqlite checkpoint save task panicked: {e}")))?;
         result.map_err(|e| internal_error(format!("sqlite checkpoint save failed: {e}")))
     }
@@ -389,17 +725,30 @@ impl SessionRepository for SqliteSessionRepository {
 
     async fn delete_checkpoint(&self, checkpoint_id: &str) -> Result<bool, SessionDomainError> {
         let conn = self.conn.clone();
+        #[cfg(unix)]
+        let deployment = self.deployment.clone();
         let checkpoint_id = checkpoint_id.to_string();
         let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-            let conn = conn
+            let mut conn = conn
                 .lock()
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
-            conn.execute(
-                "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
-                params![checkpoint_id],
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+            verify_writer(
+                &tx,
+                #[cfg(unix)]
+                deployment.as_deref(),
             )
-            .map(|changed| changed > 0)
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())?;
+            let changed = tx
+                .execute(
+                    "DELETE FROM checkpoints WHERE checkpoint_id = ?1",
+                    params![checkpoint_id],
+                )
+                .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(changed > 0)
         })
         .await
         .map_err(|error| {
@@ -424,7 +773,7 @@ impl SessionRepository for SqliteSessionRepository {
                 .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
             let total: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM checkpoints WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)",
+                    "SELECT count(*) FROM (SELECT checkpoint_id,tenant_id FROM checkpoints WHERE NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id) UNION ALL SELECT checkpoint_id,tenant_id FROM joint_checkpoints) WHERE tenant_id=?1 OR ?1 IS NULL",
                     params![tenant_id],
                     |row| row.get(0),
                 )
@@ -432,8 +781,10 @@ impl SessionRepository for SqliteSessionRepository {
             let mut stmt = conn
                 .prepare(
                     "SELECT checkpoint_id, source_runtime_id, tenant_id, created_by, created_at_ms
-                     FROM checkpoints
-                     WHERE (tenant_id = ?1 OR ?1 IS NULL) AND NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)
+                     FROM (SELECT checkpoint_id,source_runtime_id,tenant_id,created_by,created_at_ms FROM checkpoints
+                       WHERE NOT EXISTS(SELECT 1 FROM snapshot_operations WHERE id='delete:'||checkpoint_id)
+                       UNION ALL SELECT checkpoint_id,source_runtime_id,tenant_id,created_by,created_at_ms FROM joint_checkpoints)
+                     WHERE tenant_id = ?1 OR ?1 IS NULL
                      ORDER BY created_at_ms DESC, checkpoint_id DESC
                      LIMIT ?2 OFFSET ?3",
                 )
@@ -476,7 +827,7 @@ impl SessionRepository for SqliteSessionRepository {
                     .map_err(|_| "sqlite session repository lock poisoned".to_string())?;
                 let mut stmt = conn
                     .prepare(
-                        "SELECT tenant_id, COUNT(*) FROM sessions \
+                        "SELECT tenant_id, COUNT(*) FROM (SELECT tenant_id,status FROM sessions UNION ALL SELECT tenant_id,status FROM joint_sessions) \
                  WHERE tenant_id IS NOT NULL AND status IN ('opening','idle','running','paused') \
                  GROUP BY tenant_id",
                     )
@@ -524,7 +875,7 @@ impl SessionRepository for SqliteSessionRepository {
             let total_active: i64 = conn
                 .query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM sessions \
+                        "SELECT COUNT(*) FROM (SELECT tenant_id,status FROM sessions UNION ALL SELECT tenant_id,status FROM joint_sessions) \
                          WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL)"
                     ),
                     params![tenant_id],
@@ -534,17 +885,18 @@ impl SessionRepository for SqliteSessionRepository {
 
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT * FROM sessions \
+                    "SELECT runtime_id FROM (SELECT runtime_id,tenant_id,status,updated_at_ms FROM sessions UNION ALL SELECT runtime_id,tenant_id,status,updated_at_ms FROM joint_sessions) \
                      WHERE {ACTIVE_STATUSES} AND (tenant_id = ?1 OR ?1 IS NULL) \
                      ORDER BY updated_at_ms DESC LIMIT ?2"
                 ))
                 .map_err(|error| error.to_string())?;
             let rows = stmt
-                .query_map(params![tenant_id, limit], row_to_record)
+                .query_map(params![tenant_id, limit], |r|r.get::<_,String>(0))
                 .map_err(|error| error.to_string())?;
             let mut sessions = Vec::new();
             for row in rows {
-                sessions.push(row.map_err(|error| error.to_string())??);
+                let id=row.map_err(|error|error.to_string())?;
+                sessions.push(read_session(&conn,&id)?.ok_or("missing listed session")?);
             }
 
             Ok(SessionListPage {
@@ -567,6 +919,7 @@ mod tests {
 
     fn sample_record(runtime_id: &str) -> SessionRecord {
         SessionRecord {
+            execution_backing: Default::default(),
             runtime_id: runtime_id.to_string(),
             conversation_id: "conversation-1".to_string(),
             sender_id: "sender-1".to_string(),
@@ -808,5 +1161,61 @@ mod tests {
         let counts = repo.active_session_counts_by_tenant().await.unwrap();
         assert_eq!(counts.get("tenant-a"), Some(&2));
         assert!(!counts.contains_key("admin"));
+    }
+
+    #[tokio::test]
+    async fn legacy_database_migrates_without_changing_session_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.sqlite");
+        let record = sample_record("legacy-session");
+        let repo = SqliteSessionRepository::open(&path).unwrap();
+        repo.save(record.clone()).await.unwrap();
+        drop(repo);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE sessions DROP COLUMN execution_json;")
+            .unwrap();
+        drop(conn);
+        let reopened = SqliteSessionRepository::open(&path).unwrap();
+        assert_eq!(reopened.get("legacy-session").await.unwrap(), Some(record));
+    }
+
+    #[tokio::test]
+    async fn unknown_execution_backing_is_rejected_before_legacy_read() {
+        let repo = SqliteSessionRepository::open_in_memory().unwrap();
+        repo.save(sample_record("unknown-backing")).await.unwrap();
+        repo.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET execution_json=?1 WHERE runtime_id='unknown-backing'",
+                [r#"{"kind":"joint_v99"}"#],
+            )
+            .unwrap();
+        assert!(repo.get("unknown-backing").await.is_err());
+        assert!(repo.save(sample_record("unknown-backing")).await.is_err());
+        let binding = crate::SessionExecutionBacking::JointV1 {
+            binding: crate::JointBinding {
+                owner_kind: "joint-test".into(),
+                binding_id: "binding-1".into(),
+                configuration_revision: "revision-1".into(),
+            },
+        };
+        repo.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET execution_json=?1 WHERE runtime_id='unknown-backing'",
+                [serde_json::to_string(&binding).unwrap()],
+            )
+            .unwrap();
+        assert!(repo.save(sample_record("unknown-backing")).await.is_err());
+        assert_eq!(
+            repo.get("unknown-backing")
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_backing,
+            binding
+        );
     }
 }

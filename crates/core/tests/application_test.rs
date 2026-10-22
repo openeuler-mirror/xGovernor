@@ -261,6 +261,7 @@ impl SessionRepository for EmptyRepository {
 
 fn test_record() -> SessionRecord {
     SessionRecord {
+        execution_backing: Default::default(),
         runtime_id: "runtime-1".into(),
         conversation_id: "conversation-1".into(),
         sender_id: "sender-1".into(),
@@ -1917,6 +1918,7 @@ fn quota_tenant_ctx(max_sessions: u32) -> SecurityContext {
 
 fn tenant_test_record() -> SessionRecord {
     SessionRecord {
+        execution_backing: Default::default(),
         tenant_id: Some("tenant-a".to_string()),
         ..test_record()
     }
@@ -2867,3 +2869,180 @@ mod cancel_contract;
 
 #[path = "application_test/snapshot_recovery.rs"]
 mod snapshot_recovery;
+
+#[tokio::test]
+async fn persisted_joint_sessions_never_fall_back_to_split_cleanup() {
+    let mut record = test_record();
+    record.execution_backing = SessionExecutionBacking::JointV1 {
+        binding: JointBinding {
+            owner_kind: "joint-test".into(),
+            binding_id: "binding-1".into(),
+            configuration_revision: "revision-1".into(),
+        },
+    };
+    let repository = Arc::new(MemoryRepository(Mutex::new(Some(record.clone()))));
+    let runtime = Arc::new(CompletingRuntime::default());
+    let application = SessionApplication::new(
+        runtime.clone(),
+        test_provider_managers(),
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    let ctx = SecurityContext::admin("joint-test");
+    assert!(application
+        .close(&ctx, &record.runtime_id, Default::default())
+        .await
+        .is_err());
+    assert!(application
+        .check_alive(&ctx, &record.runtime_id)
+        .await
+        .is_err());
+    assert!(!*runtime.stopped.lock().await);
+    assert!(runtime.started.lock().await.is_none());
+    assert_eq!(
+        repository.get(&record.runtime_id).await.unwrap(),
+        Some(record)
+    );
+}
+
+struct JointProjectionRepository(MemoryRepository);
+#[async_trait]
+impl SessionRepository for JointProjectionRepository {
+    fn supports_joint_transactions(&self) -> bool {
+        true
+    }
+    async fn get(&self, id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
+        self.0.get(id).await
+    }
+    async fn save(&self, _: SessionRecord) -> Result<(), SessionDomainError> {
+        panic!("joint terminal must not use split save")
+    }
+    async fn list_active(
+        &self,
+        tenant: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        self.0.list_active(tenant, limit).await
+    }
+}
+struct JointProjectionOwner {
+    unresolved: bool,
+    observed: Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait]
+impl JointSessionLifecycle for JointProjectionOwner {
+    fn owner_kind(&self) -> &str {
+        "joint-test"
+    }
+    fn configuration_revision(&self) -> &str {
+        "revision-1"
+    }
+    async fn submit_turn(
+        &self,
+        _: JointOperationContext,
+        _: SessionRecord,
+        _: SessionTurnRequest,
+        turn_id: String,
+        _: Arc<dyn SessionRepository>,
+    ) -> Result<JointTurnSubmission, SessionDomainError> {
+        let observed = self.observed.clone();
+        let unresolved = self.unresolved;
+        Ok(JointTurnSubmission {
+            turn_id,
+            terminal: Some(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                if unresolved {
+                    return Err(SessionDomainError::Unavailable {
+                        message: "transport EOF".into(),
+                    });
+                }
+                Ok(JointTurnTerminal {
+                    cancelled: false,
+                    execution_invalidated: false,
+                    message_id: Some("private-message".into()),
+                    reply: Some("full reply".into()),
+                    failure: None,
+                    completed_at_ms: 3,
+                })
+            })),
+        })
+    }
+}
+#[tokio::test]
+async fn joint_terminal_projection_survives_subscriber_loss_and_never_invents_usage() {
+    for (unresolved, abandon) in [(false, false), (true, false), (false, true)] {
+        let mut record = test_record();
+        record.execution_backing = SessionExecutionBacking::JointV1 {
+            binding: JointBinding {
+                owner_kind: "joint-test".into(),
+                binding_id: "binding".into(),
+                configuration_revision: "revision-1".into(),
+            },
+        };
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = Arc::new(CompletingRuntime::default());
+        let app = SessionApplication::with_runtime_registry(
+            "test",
+            [RuntimeRegistration::new(
+                runtime.clone(),
+                test_provider_managers(),
+                Arc::new(UnusedEnvironment),
+            )
+            .with_joint_lifecycle(Arc::new(JointProjectionOwner {
+                unresolved,
+                observed: observed.clone(),
+            }))],
+            Arc::new(JointProjectionRepository(MemoryRepository(Mutex::new(
+                Some(record),
+            )))),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+            Arc::new(FixedTurnId),
+        )
+        .unwrap();
+        let request =
+            serde_json::from_value(serde_json::json!({"runtime_id":"runtime-1","text":"hello"}))
+                .unwrap();
+        let submitted = app.submit_turn(&admin_ctx(), request).await.unwrap();
+        assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+        let mut events = submitted.events.unwrap();
+        if abandon {
+            drop(events);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !observed.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            let mut projected = vec![];
+            while let Some(event) = events.recv().await {
+                projected.push(serde_json::to_value(event).unwrap());
+            }
+            assert_eq!(projected.len(), if unresolved { 1 } else { 2 });
+            let terminal = projected.last().unwrap();
+            assert_eq!(
+                terminal["kind"],
+                if unresolved {
+                    "turn_failed"
+                } else {
+                    "turn_completed"
+                }
+            );
+            assert_eq!(terminal["usage"], "unknown");
+            assert!(projected.iter().all(
+                |e| e["runtime_id"] == "runtime-1" && e["turn_id"] == submitted.receipt.turn_id
+            ));
+            assert!(!serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-message"));
+        }
+        assert!(runtime.submitted.lock().await.is_none());
+        assert!(!*runtime.stopped.lock().await);
+    }
+}
