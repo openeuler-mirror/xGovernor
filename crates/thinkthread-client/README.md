@@ -252,3 +252,17 @@ add a `HOME` environment variable. Assemblies using the built-in xiaoO profile
 must explicitly include `HOME` with the selected caller home so that profile
 `${HOME}` templates can resolve. Keep this value in the frozen profile Context
 across preflight, execution and recovery connections.
+
+Idempotent turn submissions can reconnect to the original Message observation or
+replay its persisted terminal through a new event stream. Each stream has one
+terminal; replay keeps the original turn ID and never sends a replacement
+Message. A successful checkpoint settles the workspace boundary but does not
+remove the persistent cancellation history used to block execution after a
+subsequent failed Message.
+
+Existing enrolled repositories can acquire the additive cancellation control
+schema under the deployment holder's object and identity locks. The table
+creation and registration update share one transaction. Unbound connections do
+not migrate an older repository; existing reads remain available, while writes
+and cancellation controls require the holder. Partial control schemas are
+rejected rather than silently repaired.

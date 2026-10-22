@@ -239,6 +239,8 @@ impl DeploymentGuard {
         for object in &objects {
             object.validate()?;
         }
+        // Registration and additive control schema upgrades share the holder's transaction.
+        crate::sqlite_cancel::init(&tx).map_err(|_| unavailable())?;
         tx.execute("INSERT INTO local_deployment VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,'configuration_verified',1) ON CONFLICT(singleton) DO UPDATE SET budget_hash=excluded.budget_hash,budget_policy_ref=excluded.budget_policy_ref,database_path=excluded.database_path,holder_instance_id=excluded.holder_instance_id,boot_id=excluded.boot_id,lock_identity_refs=excluded.lock_identity_refs,status=excluded.status,row_version=local_deployment.row_version+1",
             params![database_identity, deployment_id, namespace.to_string_lossy(), policy_hash,configuration.policy_ref,database_path.to_string_lossy(),uuid::Uuid::new_v4().to_string(),boot_id.trim(),locks])
             .map_err(|_| unavailable())?;
@@ -1928,6 +1930,169 @@ mod guarded_writes {
         eprintln!("sample ordinary writer/shared+separate-ledger/split+intent+checkpoint+ledger=preserved");
     }
 
+    fn cancellation_table_count(path: &Path) -> u32 {
+        rusqlite::Connection::open(path).unwrap().query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('joint_turn_cancels','joint_cancel_boundaries','joint_cancel_checkpoints')",[],|r|r.get(0)).unwrap()
+    }
+    #[tokio::test]
+    async fn enrolled_control_upgrade_is_holder_only_and_transactional() {
+        let f = Fixture::new();
+        let guard = f.guard();
+        drop(guard);
+        let db = rusqlite::Connection::open(&f.database).unwrap();
+        db.execute_batch("DROP TABLE joint_turn_cancels;DROP TABLE joint_cancel_boundaries;DROP TABLE joint_cancel_checkpoints;").unwrap();
+        let before = capacity_tests::business_snapshot(&f.database);
+        let version: i64 = db
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        let reader = SqliteSessionRepository::open(&f.database)
+            .unwrap()
+            .with_joint_transactions();
+        assert!(reader.get("existing-session").await.unwrap().is_some());
+        assert!(reader.pending_joint_operations().await.is_err());
+        assert!(reader
+            .save_operation_intent("unbound", serde_json::json!({}))
+            .await
+            .is_err());
+        assert_eq!(cancellation_table_count(&f.database), 0);
+        assert_eq!(
+            db.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+        assert!(DeploymentGuard::acquire(
+            &f.database,
+            "different-deployment",
+            &f.namespace,
+            &f.resources,
+            &tests::budget(4)
+        )
+        .is_err());
+        assert_eq!(cancellation_table_count(&f.database), 0);
+        db.execute_batch("CREATE TRIGGER reject_registration BEFORE UPDATE ON local_deployment BEGIN SELECT RAISE(ABORT,'injected enrollment failure');END;").unwrap();
+        assert!(DeploymentGuard::acquire(
+            &f.database,
+            "deployment",
+            &f.namespace,
+            &f.resources,
+            &tests::budget(4)
+        )
+        .is_err());
+        assert_eq!(cancellation_table_count(&f.database), 0);
+        assert_eq!(capacity_tests::business_snapshot(&f.database), before);
+        db.execute_batch("DROP TRIGGER reject_registration")
+            .unwrap();
+        let guard = f.guard();
+        assert_eq!(cancellation_table_count(&f.database), 3);
+        let after = capacity_tests::business_snapshot(&f.database)
+            .into_iter()
+            .filter(|(n, _)| before.iter().any(|(old, _)| old == n))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        let bound = guard
+            .repository(tests::budget(4))
+            .unwrap()
+            .with_joint_transactions();
+        assert_eq!(
+            bound.get("existing-session").await.unwrap(),
+            reader.get("existing-session").await.unwrap()
+        );
+        drop(bound);
+        drop(guard);
+        drop(reader);
+        // A partial schema is corruption, rather than an older supported format.
+        db.execute_batch("DROP TABLE joint_cancel_checkpoints")
+            .unwrap();
+        assert!(SqliteSessionRepository::open(&f.database).is_err());
+        assert!(DeploymentGuard::acquire(
+            &f.database,
+            "deployment",
+            &f.namespace,
+            &f.resources,
+            &tests::budget(4)
+        )
+        .is_err());
+        assert_eq!(cancellation_table_count(&f.database), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an enrolled repository fixture produced by the previous binary"]
+    async fn previous_enrolled_repository_recovers_without_reclassifying_history() {
+        let fixture = std::env::var("XGOVERNOR_LEGACY_REPOSITORY_FIXTURE").unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+        let original = PathBuf::from(meta["database"].as_str().unwrap());
+        let namespace = PathBuf::from(meta["namespace"].as_str().unwrap());
+        let resources: Vec<PathBuf> = serde_json::from_value(meta["resources"].clone()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("db");
+        std::fs::copy(original, &database).unwrap();
+        assert_eq!(cancellation_table_count(&database), 0);
+        let before = capacity_tests::business_snapshot(&database);
+        let reader = SqliteSessionRepository::open(&database)
+            .unwrap()
+            .with_joint_transactions();
+        let record = reader.get("existing-session").await.unwrap().unwrap();
+        let pending: Vec<crate::JointPendingOperation> =
+            serde_json::from_value(meta["observations"]["pending"].clone()).unwrap();
+        let history: crate::JointTurnRecord =
+            serde_json::from_value(meta["observations"]["history"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            meta["observations"]["record"]
+        );
+        assert_eq!(
+            history.terminal.as_ref().unwrap().failure.as_deref(),
+            Some("message_failed")
+        );
+        assert!(!history.terminal.as_ref().unwrap().cancelled);
+        assert!(!history.terminal.as_ref().unwrap().execution_invalidated);
+        assert_eq!(pending.len(), 1);
+        let mut cancel = pending[0].request.context.clone();
+        cancel.operation = "cancel".into();
+        assert!(reader
+            .prepare_joint_cancel(cancel, record.clone(), Some("original-turn".into()))
+            .await
+            .is_err());
+        assert_eq!(cancellation_table_count(&database), 0);
+        assert_eq!(capacity_tests::business_snapshot(&database), before);
+        let guard = DeploymentGuard::acquire(
+            &database,
+            meta["deployment_id"].as_str().unwrap(),
+            &namespace,
+            &resources,
+            &tests::budget(4),
+        )
+        .unwrap();
+        let repo = guard
+            .repository(tests::budget(4))
+            .unwrap()
+            .with_joint_transactions();
+        assert_eq!(cancellation_table_count(&database), 3);
+        assert_eq!(repo.get("existing-session").await.unwrap(), Some(record));
+        assert_eq!(
+            serde_json::to_value(repo.pending_joint_operations().await.unwrap()).unwrap(),
+            serde_json::to_value(&pending).unwrap()
+        );
+        assert_eq!(
+            repo.get_joint_turn("existing-session".into(), "historical-key".into())
+                .await
+                .unwrap(),
+            Some(history)
+        );
+        let after = capacity_tests::business_snapshot(&database)
+            .into_iter()
+            .filter(|(n, _)| before.iter().any(|(old, _)| old == n))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before);
+        let mut competing = pending[0].request.clone();
+        competing.context.intent_id = "competing-turn".into();
+        competing.turn.as_mut().unwrap().turn_id = "competing-turn".into();
+        competing.turn.as_mut().unwrap().client_request_id = Some("competing-key".into());
+        competing.native[0].operation_id = uuid::Uuid::new_v4().to_string();
+        assert!(repo.prepare_joint_operation(competing).await.is_err());
+        eprintln!("previous binary fixture: history unchanged, original pending UUID/fence retained, holder upgraded exactly three tables");
+    }
     #[test]
     fn opening_enrolled_databases_never_initializes_an_unbound_ledger_schema() {
         let f = Fixture::new();

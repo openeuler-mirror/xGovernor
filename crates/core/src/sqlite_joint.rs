@@ -67,14 +67,6 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
           id TEXT PRIMARY KEY, request_json TEXT NOT NULL, admission_json TEXT NOT NULL,
           binding_id TEXT NOT NULL REFERENCES joint_bindings(id), tenant_key TEXT NOT NULL,
           stage TEXT NOT NULL, publication_json TEXT);
-        CREATE TABLE IF NOT EXISTS joint_turn_cancels (
-          intent_id TEXT PRIMARY KEY REFERENCES joint_operations(id), context_json TEXT NOT NULL,
-          native_json TEXT, outcome_json TEXT);
-        CREATE TABLE IF NOT EXISTS joint_cancel_boundaries (
-          binding_id TEXT PRIMARY KEY REFERENCES joint_bindings(id), generation INTEGER NOT NULL,
-          cancel_epoch INTEGER NOT NULL, checkpoint_epoch INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS joint_cancel_checkpoints (
-          operation_id TEXT PRIMARY KEY, body TEXT NOT NULL, checkpoint_id TEXT);
         CREATE TABLE IF NOT EXISTS joint_turns (
           runtime_id TEXT NOT NULL, turn_id TEXT NOT NULL, client_request_id TEXT,
           input_digest TEXT NOT NULL, intent_id TEXT NOT NULL UNIQUE REFERENCES joint_operations(id),
@@ -138,7 +130,8 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TRIGGER IF NOT EXISTS joint_checkpoints_update_identity_guard BEFORE UPDATE OF checkpoint_id ON joint_checkpoints
           WHEN EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=NEW.checkpoint_id)
           BEGIN SELECT RAISE(ABORT,'public execution identity conflict'); END;
-    ")
+    ")?;
+    crate::sqlite_cancel::init(conn)
 }
 
 fn validate_request(request: &JointPrepareRequest) -> Result<()> {

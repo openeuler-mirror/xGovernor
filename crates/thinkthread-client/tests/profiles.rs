@@ -49,6 +49,7 @@ struct Fixture {
     guard: Arc<DeploymentGuard>,
     clock: Arc<TestClock>,
     configurations: BTreeMap<String, ManagementConfig>,
+    owner_timeout_ms: u64,
 }
 impl Fixture {
     fn new() -> Self {
@@ -133,6 +134,7 @@ impl Fixture {
             guard,
             clock: Arc::new(TestClock(AtomicU64::new(100))),
             configurations,
+            owner_timeout_ms: 2000,
         }
     }
     fn profile(&self, name: &str) -> ExecutionProfile {
@@ -238,7 +240,7 @@ impl Fixture {
             &self.manifest(&name),
             self.configurations[&name].clone(),
             create,
-            2000,
+            self.owner_timeout_ms,
         )
     }
     fn router(
@@ -1172,7 +1174,14 @@ impl TurnIdGenerator for Ids {
     }
 }
 fn application(f: &Fixture, router: &Arc<ProfileRouter>) -> SessionApplication {
-    let ids = Arc::new(Ids(AtomicU64::new(1)));
+    application_with_ids(f, router, 1)
+}
+fn application_with_ids(
+    f: &Fixture,
+    router: &Arc<ProfileRouter>,
+    first_id: u64,
+) -> SessionApplication {
+    let ids = Arc::new(Ids(AtomicU64::new(first_id)));
     SessionApplication::with_runtime_registry(
         ROOT_RUNTIME_KIND,
         [RuntimeRegistration::new(
@@ -3141,7 +3150,35 @@ async fn checkpoint_observer(
 #[tokio::test]
 async fn checkpoint_boundary_requires_original_success_and_does_not_clear_a_later_cancel() {
     let f = cancel_fixture();
-    let router = f.stored().await;
+    let _original = f.stored().await;
+    let router = ProfileRouter::assemble(
+        f.guard.clone(),
+        budget(),
+        vec![
+            f.revision(f.profile("A")).unwrap(),
+            f.revision(f.profile("B")).unwrap(),
+        ],
+        "B".into(),
+        true,
+        f.clock.clone(),
+    )
+    .unwrap();
+    f.open(&router, "B", "sibling").await.unwrap();
+    let app = application(&f, &router);
+    let sibling = cancel_submit(&app, "sibling", "sibling-active", "sibling-key").await;
+    until_message(&f, 1).await;
+    app.cancel(
+        &SecurityContext::admin("operator"),
+        "sibling",
+        Some(&sibling.receipt.turn_id),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancel_events(sibling).await[0]["outcome"], "cancelled");
+    let sibling_before =
+        cancelled_binding_snapshot(router.repository(), "sibling", "sibling-key").await;
+    assert_eq!(sibling_before["boundary"]["cancel_epoch"], 1);
+    assert_eq!(sibling_before["boundary"]["checkpoint_epoch"], 0);
     let owner = cancel_owner(&f, "A");
     let repo = router.repository();
     let earlier = checkpoint_observer(&f, &router).await;
@@ -3164,22 +3201,23 @@ async fn checkpoint_boundary_requires_original_success_and_does_not_clear_a_late
         "A",
         json!({"checkpoint_error":"NotAtCheckpointBoundary"}),
     );
-    let before = f.trace().len();
+    let before = f.trace();
     let failure = owner
         .observe_checkpoint_boundary(&record, late.clone(), repo.clone())
         .await
         .unwrap_err();
     assert!(failure.to_string().contains("NotAtCheckpointBoundary"));
+    let after = f.trace();
+    let count =
+        |trace: &[Value], method: &str| trace.iter().filter(|r| r["method"] == method).count();
     assert_eq!(
-        f.trace()[before..]
-            .iter()
-            .filter(|r| r["method"] == "operation.get")
-            .count(),
-        1
+        count(&after, "operation.get"),
+        count(&before, "operation.get") + 1
     );
-    assert!(!f.trace()[before..]
-        .iter()
-        .any(|r| r["method"] == "checkpoint.create"));
+    assert_eq!(
+        count(&after, "checkpoint.create"),
+        count(&before, "checkpoint.create")
+    );
     cancel_control(&f, "A", json!({"checkpoint_operation_state":"running"}));
     assert!(owner
         .observe_checkpoint_boundary(&record, late.clone(), repo.clone())
@@ -3226,11 +3264,15 @@ async fn checkpoint_boundary_requires_original_success_and_does_not_clear_a_late
         .await
         .unwrap()
         .unsettled());
+    assert_eq!(
+        cancelled_binding_snapshot(router.repository(), "sibling", "sibling-key").await,
+        sibling_before
+    );
 }
 
 #[tokio::test]
 async fn stopped_and_unknown_roots_keep_failure_or_unknown_without_waiting_for_ready() {
-    for state in ["stopped", "unknown"] {
+    for state in ["stopped", "unknown", "timeout"] {
         let f = cancel_fixture();
         let router = f.stored().await;
         let first = admit_cancel_fixture(&f, &router, "one", "active").await;
@@ -3239,11 +3281,25 @@ async fn stopped_and_unknown_roots_keep_failure_or_unknown_without_waiting_for_r
         let later = admit_cancel_fixture(&f, &router, "two", "active next").await;
         if state == "stopped" {
             cancel_control(&f, "A", json!({"root_state":"Stopped"}));
-        } else {
+        } else if state == "unknown" {
             cancel_control(&f, "A", json!({"root_get_drop":true}));
+        } else {
+            cancel_control(&f, "A", json!({"root_get_delay_ms":5000}));
         }
+        let prior = router.repository().get("existing").await.unwrap().unwrap();
         let start = std::time::Instant::now();
-        assert!(resume_cancel_fixture(&f, &router).await.is_err());
+        let pending = router
+            .repository()
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let owner = RootSessionOwner::new(f.configurations["A"].clone(),serde_json::from_value(json!({"agent":{"kind":"profile","name":"fixture"},"fs":f.configurations["A"].fs_root})).unwrap(),"A".into(),0,0,500).unwrap();
+        assert!(owner
+            .resume_message(pending, router.repository())
+            .await
+            .is_err());
         assert!(start.elapsed() < Duration::from_secs(3));
         let stored = router.repository().get("existing").await.unwrap().unwrap();
         if state == "stopped" {
@@ -3251,6 +3307,23 @@ async fn stopped_and_unknown_roots_keep_failure_or_unknown_without_waiting_for_r
             assert_eq!(
                 stored.last_error.as_deref(),
                 Some("message_execution_invalidated")
+            );
+        } else {
+            assert_eq!(stored, prior);
+            assert_ne!(stored.status, SessionStatus::Failed);
+            assert_ne!(
+                stored.last_error.as_deref(),
+                Some("message_execution_invalidated")
+            );
+            assert_eq!(
+                router
+                    .repository()
+                    .get_joint_binding(later.admission.binding.clone())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .stage,
+                "active"
             );
         }
         assert!(router
@@ -3688,4 +3761,391 @@ async fn cancellation_settlement_outlives_its_public_event_subscriber() {
         .await
         .unwrap()
         .unsettled());
+}
+
+async fn cancelled_binding_snapshot(
+    repo: Arc<dyn SessionRepository>,
+    id: &str,
+    key: &str,
+) -> Value {
+    let session = repo.get(id).await.unwrap().unwrap();
+    let binding = session.execution_backing.joint().unwrap().clone();
+    json!({"session":session,"binding":repo.get_joint_binding(binding.clone()).await.unwrap(),
+        "boundary":repo.joint_workspace_boundary(binding).await.unwrap(),
+        "turn":repo.get_joint_turn(id.into(),key.into()).await.unwrap()})
+}
+
+#[tokio::test]
+async fn failure_after_cancel_and_checkpoint_still_blocks_new_turns() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let ctx = SecurityContext::admin("operator");
+    let first = cancel_submit(&app, "existing", "active", "cancelled").await;
+    until_message(&f, 1).await;
+    app.cancel(&ctx, "existing", Some(&first.receipt.turn_id))
+        .await
+        .unwrap();
+    assert_eq!(cancel_events(first).await[0]["outcome"], "cancelled");
+    let ticket = checkpoint_observer(&f, &router).await;
+    let repo = router.repository();
+    let record = repo.get("existing").await.unwrap().unwrap();
+    assert!(cancel_owner(&f, "A")
+        .observe_checkpoint_boundary(&record, ticket, repo.clone())
+        .await
+        .unwrap());
+    let binding = record.execution_backing.joint().unwrap().clone();
+    let boundary = repo
+        .joint_workspace_boundary(binding.clone())
+        .await
+        .unwrap();
+    assert_eq!(boundary.cancel_epoch, 1);
+    assert_eq!(boundary.checkpoint_epoch, 1);
+    assert!(!boundary.unsettled());
+    cancel_control(&f, "A", json!({"failed_text":"later-fails"}));
+    let second = cancel_submit(&app, "existing", "later-fails", "failure").await;
+    let events = cancel_events(second).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "turn_failed");
+    assert_eq!(events[0]["error"]["code"], "message_failed");
+    let client = f.configurations["A"].connect().await.unwrap();
+    let view = client
+        .thinkthreads()
+        .get(serde_json::from_value(json!({"thinkthreadId":"native-A"})).unwrap())
+        .await
+        .unwrap();
+    assert!(view.state.eq_ignore_ascii_case("running"));
+    assert!(view
+        .session_state
+        .as_deref()
+        .unwrap()
+        .eq_ignore_ascii_case("ready"));
+    client.close().await.unwrap();
+    let failed = repo
+        .get_joint_turn("existing".into(), "failure".into())
+        .await
+        .unwrap()
+        .unwrap()
+        .terminal
+        .unwrap();
+    assert!(failed.execution_invalidated);
+    let old = repo
+        .get_joint_turn("existing".into(), "cancelled".into())
+        .await
+        .unwrap()
+        .unwrap()
+        .terminal
+        .unwrap();
+    assert!(old.cancelled);
+    assert_ne!(old.message_id, failed.message_id);
+    let stored = repo.get("existing").await.unwrap().unwrap();
+    assert_eq!(stored.status, SessionStatus::Failed);
+    assert_eq!(
+        stored.last_error.as_deref(),
+        Some("message_execution_invalidated")
+    );
+    assert_eq!(
+        repo.joint_workspace_boundary(binding).await.unwrap(),
+        boundary
+    );
+    let before = f.trace();
+    assert!(app
+        .submit_turn(
+            &ctx,
+            serde_json::from_value(json!({"runtime_id":"existing","text":"must not send"}))
+                .unwrap()
+        )
+        .await
+        .is_err());
+    assert_eq!(f.trace(), before);
+}
+
+fn assert_public_terminal(events: &[Value], id: &str, outcome: &str) {
+    let terminals: Vec<_> = events
+        .iter()
+        .filter(|e| e["kind"] == "turn_completed" || e["kind"] == "turn_failed")
+        .collect();
+    assert_eq!(terminals.len(), 1, "{events:?}");
+    assert_eq!(terminals[0]["kind"], "turn_completed", "{events:?}");
+    assert_eq!(terminals[0]["outcome"], outcome);
+    assert_eq!(terminals[0]["turn_id"], id);
+    assert!(events.iter().all(|e| e["turn_id"] == id));
+    eprintln!(
+        "public event stream: {}",
+        serde_json::to_string(events).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_public_cancellation_and_reconnected_observers_keep_one_terminal_per_stream() {
+    let mut f = cancel_fixture();
+    f.owner_timeout_ms = 10_000;
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let mut disconnected = cancel_submit(&app, "existing", "active", "original-key").await;
+    let receipt = disconnected.receipt.clone();
+    drop(disconnected.events.take());
+    until_message(&f, 1).await;
+    let second = f.router(f.profile("A"), true).unwrap();
+    let third = f.router(f.profile("A"), true).unwrap();
+    let a = application_with_ids(&f, &second, 1000);
+    let b = application_with_ids(&f, &third, 2000);
+    let left = cancel_submit(&a, "existing", "active", "original-key").await;
+    let right = cancel_submit(&b, "existing", "active", "original-key").await;
+    assert_eq!(left.receipt.turn_id, receipt.turn_id);
+    assert_eq!(right.receipt.turn_id, receipt.turn_id);
+    assert!(left.events.is_some() && right.events.is_some());
+    cancel_control(&f, "A", json!({"cancel_state":"awaiting_reply"}));
+    let ctx = SecurityContext::admin("operator");
+    let (ca, cb) = tokio::join!(
+        a.cancel(&ctx, "existing", Some(&receipt.turn_id)),
+        b.cancel(&ctx, "existing", Some(&receipt.turn_id))
+    );
+    assert!(ca.is_ok() || cb.is_ok());
+    let pending = second
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let held = second
+        .repository()
+        .get_joint_turn("existing".into(), "original-key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(held.terminal.is_none());
+    let owner = cancel_owner(&f, "A");
+    let observation_repo = f
+        .guard
+        .repository(budget())
+        .unwrap()
+        .with_joint_transactions();
+    let observer = tokio::spawn(async move {
+        owner
+            .resume_message(pending, Arc::new(observation_repo))
+            .await
+    });
+    cancel_control(&f, "A", json!({"states":{"message-1":"cancelled"}}));
+    let (le, re) = tokio::join!(cancel_events(left), cancel_events(right));
+    assert_public_terminal(&le, &receipt.turn_id, "cancelled");
+    assert_public_terminal(&re, &receipt.turn_id, "cancelled");
+    assert!(observer.await.unwrap().unwrap().cancelled);
+    let reopened = f.router(f.profile("A"), true).unwrap();
+    let reconnect = application_with_ids(&f, &reopened, 3000);
+    let replay = cancel_submit(&reconnect, "existing", "active", "original-key").await;
+    assert_eq!(replay.receipt.turn_id, receipt.turn_id);
+    let replayed = cancel_events(replay).await;
+    assert_public_terminal(&replayed, &receipt.turn_id, "cancelled");
+    assert_eq!(replayed, le);
+    let turn = reopened
+        .repository()
+        .get_joint_turn("existing".into(), "original-key".into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(turn.terminal.unwrap().cancelled);
+    assert!(reopened
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(reopened
+        .repository()
+        .joint_workspace_boundary(turn.admission.binding)
+        .await
+        .unwrap()
+        .unsettled());
+    for method in ["message.send", "message.cancel"] {
+        assert_eq!(
+            f.trace().iter().filter(|r| r["method"] == method).count(),
+            1
+        );
+    }
+}
+
+async fn accept_wait_gate(listener: &tokio::net::UnixListener) -> tokio::net::UnixStream {
+    use tokio::io::AsyncReadExt;
+    let (mut connection, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), connection.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"wait\n");
+    connection
+}
+
+#[tokio::test]
+async fn old_observations_are_isolated_while_new_turn_runs_and_after_it_finishes() {
+    use tokio::io::AsyncWriteExt;
+    for release_after_finish in [false, true] {
+        let f = cancel_fixture();
+        let router = f.stored().await;
+        let app = application(&f, &router);
+        let old_path = f.root.path().join("old.sock");
+        let new_path = f.root.path().join("new.sock");
+        let old_gate = tokio::net::UnixListener::bind(&old_path).unwrap();
+        let new_gate = tokio::net::UnixListener::bind(&new_path).unwrap();
+        cancel_control(
+            &f,
+            "A",
+            json!({"states":{"message-1":"completed"},"wait_gates":{"message-1":old_path}}),
+        );
+        let old = cancel_submit(&app, "existing", "old-active", "old-key").await;
+        let old_id = old.receipt.turn_id.clone();
+        let mut old_connection = accept_wait_gate(&old_gate).await;
+        cancel_control(&f, "A", json!({}));
+        app.cancel(
+            &SecurityContext::admin("operator"),
+            "existing",
+            Some(&old_id),
+        )
+        .await
+        .unwrap();
+        let committed = resume_cancel_fixture(&f, &router).await.unwrap();
+        assert!(committed.cancelled);
+        cancel_control(
+            &f,
+            "A",
+            json!({"states":{"message-2":"completed"},"wait_gates":{"message-2":new_path}}),
+        );
+        let next = cancel_submit(
+            &app,
+            "existing",
+            "return exactly isolated-next.",
+            "next-key",
+        )
+        .await;
+        let next_id = next.receipt.turn_id.clone();
+        let mut next_connection = accept_wait_gate(&new_gate).await;
+        let running = router
+            .repository()
+            .get_joint_turn("existing".into(), "next-key".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(running.terminal.is_none());
+        let old_events;
+        let next_events;
+        if release_after_finish {
+            next_connection.write_all(b"x").await.unwrap();
+            next_events = cancel_events(next).await;
+            assert!(router
+                .repository()
+                .get_joint_turn("existing".into(), "next-key".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_some());
+            old_connection.write_all(b"x").await.unwrap();
+            old_events = cancel_events(old).await;
+        } else {
+            old_connection.write_all(b"x").await.unwrap();
+            old_events = cancel_events(old).await;
+            assert!(router
+                .repository()
+                .get_joint_turn("existing".into(), "next-key".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_none());
+            next_connection.write_all(b"x").await.unwrap();
+            next_events = cancel_events(next).await;
+        }
+        assert_public_terminal(&old_events, &old_id, "cancelled");
+        assert_public_terminal(&next_events, &next_id, "complete");
+        assert_eq!(old_events.len(), 1);
+        assert_eq!(
+            next_events
+                .iter()
+                .filter(|e| e["kind"] == "output_delta")
+                .count(),
+            1
+        );
+        assert!(next_events.iter().any(|e| e["delta"] == "isolated-next"));
+        assert!(!serde_json::to_string(&next_events)
+            .unwrap()
+            .contains("complete reply"));
+        assert_eq!(
+            router
+                .repository()
+                .joint_turn_result(running.admission)
+                .await
+                .unwrap()
+                .unwrap()
+                .reply
+                .as_deref(),
+            Some("isolated-next")
+        );
+    }
+}
+
+#[tokio::test]
+async fn observation_deadline_keeps_the_fixture_backend_state_readable() {
+    use tokio::io::AsyncReadExt;
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let turn = admit_cancel_fixture(&f, &router, "key", "active").await;
+    let path = f.root.path().join("write.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    cancel_control(&f, "A", json!({"state_write_gate":path}));
+    let pending = router
+        .repository()
+        .pending_joint_operations()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let owner = RootSessionOwner::new(
+        f.configurations["A"].clone(),
+        serde_json::from_value(
+            json!({"agent":{"kind":"profile","name":"fixture"},"fs":f.configurations["A"].fs_root}),
+        )
+        .unwrap(),
+        "A".into(),
+        0,
+        0,
+        500,
+    )
+    .unwrap();
+    let repo = router.repository();
+    let observer = tokio::spawn(async move { owner.resume_message(pending, repo).await });
+    let (mut connection, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut signal = [0u8; 6];
+    connection.read_exact(&mut signal).await.unwrap();
+    assert_eq!(&signal, b"write\n");
+    assert!(observer.await.unwrap().is_err());
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(f.root.path().join("A/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["messages"]["message-1"][0]["state"], "awaiting_reply");
+    cancel_control(&f, "A", json!({}));
+    let client = f.configurations["A"].connect().await.unwrap();
+    client.close().await.unwrap();
+    assert!(router
+        .repository()
+        .joint_turn_result(turn.admission)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        router
+            .repository()
+            .pending_joint_operations()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

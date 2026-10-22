@@ -334,15 +334,16 @@ impl RootSessionOwner {
                 } else {
                     None
                 };
-                let cancelled_workspace = repository
+                let has_cancelled = repository
                     .joint_workspace_boundary(pending.admission.binding.clone())
                     .await?
-                    .unsettled();
+                    .cancel_epoch
+                    > 0;
                 let terminal = JointTurnTerminal {
                     cancelled: message.state == sdk::MessageState::Cancelled,
                     execution_invalidated: !view.state.eq_ignore_ascii_case("running")
                         || view.needs_recovery
-                        || (message.state == sdk::MessageState::Failed && cancelled_workspace),
+                        || (message.state == sdk::MessageState::Failed && has_cancelled),
                     message_id: Some(id),
                     reply: if failure.is_none() && message.state == sdk::MessageState::Completed {
                         message.reply_text

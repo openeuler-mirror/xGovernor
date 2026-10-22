@@ -776,12 +776,7 @@ impl JointSessionLifecycle for RootSessionOwner {
                 repository.clone(),
             )
             .await?;
-        if admitted.identity.turn_id != turn_id {
-            return Ok(JointTurnSubmission {
-                turn_id: admitted.identity.turn_id,
-                terminal: None,
-            });
-        }
+        let turn_id = admitted.identity.turn_id.clone();
         let owner = self.clone();
         Ok(JointTurnSubmission {
             turn_id,

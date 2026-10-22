@@ -11,6 +11,36 @@ pub(crate) fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Older enrolled repositories remain readable without running DDL.
+pub(crate) fn validate_existing_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let present: u32 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('joint_turn_cancels','joint_cancel_boundaries','joint_cancel_checkpoints')",
+        [], |r| r.get(0),
+    )?;
+    match present {
+        0 => Ok(()),
+        3 => validate_schema(conn),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+/// Called during initial setup or inside the deployment holder's transaction.
+pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
+    validate_existing_schema(conn)?;
+    conn.execute_batch(
+        "        CREATE TABLE IF NOT EXISTS joint_turn_cancels (
+          intent_id TEXT PRIMARY KEY REFERENCES joint_operations(id), context_json TEXT NOT NULL,
+          native_json TEXT, outcome_json TEXT);
+        CREATE TABLE IF NOT EXISTS joint_cancel_boundaries (
+          binding_id TEXT PRIMARY KEY REFERENCES joint_bindings(id), generation INTEGER NOT NULL,
+          cancel_epoch INTEGER NOT NULL, checkpoint_epoch INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS joint_cancel_checkpoints (
+          operation_id TEXT PRIMARY KEY, body TEXT NOT NULL, checkpoint_id TEXT);
+",
+    )?;
+    validate_schema(conn)
+}
+
 impl SqliteSessionRepository {
     pub async fn prepare_joint_cancel(
         &self,

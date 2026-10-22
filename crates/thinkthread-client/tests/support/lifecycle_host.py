@@ -145,6 +145,7 @@ while True:
                 "createdByRequestId":"req-"+params["checkpointId"].removeprefix("checkpoint-"),"label":None}
     elif method == "thinkthread.get":
         if cancellation and control.get("root_get_drop"):sys.exit(0)
+        if cancellation and control.get("root_get_delay_ms"):time.sleep(control["root_get_delay_ms"]/1000)
         if scenario.startswith("owner") and state == "Absent":
             data = json.dumps({"protocolVersion": 2, "id": req["id"], "ok": False,
                 "error": {"code": "ThinkThreadNotFound", "message": "absent", "retryable": False, "delivery": "accepted"}}).encode()
@@ -210,14 +211,19 @@ while True:
         if scenario == "not-absent" and params["target"] == "absent": result = {"reached": False, "thinkthreads": [view()]}
     else: sys.exit(2)
     if scenario.startswith("owner") and state_file and (scenario != "owner-concurrent" or method in ("thinkthread.create", "thinkthread.start", "thinkthread.stop", "thinkthread.remove")):
-        target = state_file + "." + str(os.getpid()) if scenario == "owner-concurrent" else state_file
-        with open(target,"w") as sink: json.dump({"state":state,"messages":messages},sink)
-        if scenario == "owner-concurrent": os.replace(target, state_file)
+        target = state_file + "." + str(os.getpid()) if scenario == "owner-concurrent" or cancellation else state_file
+        with open(target,"w") as sink:
+            if cancellation and method == "message.wait" and control.get("state_write_gate"):
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.connect(control["state_write_gate"]);connection.sendall(b"write\n");connection.recv(1)
+            json.dump({"state":state,"messages":messages},sink)
+        if scenario == "owner-concurrent" or cancellation: os.replace(target, state_file)
     if cancellation:
         lock.close()
         if method=="message.cancel" and control.get("drop_cancel"):sys.exit(0)
-        if method=="message.wait" and control.get("wait_gate"):
+        gate = control.get("wait_gates",{}).get(params.get("messageId"),control.get("wait_gate"))
+        if method=="message.wait" and gate:
             with socket.socket(socket.AF_UNIX) as connection:
-                connection.connect(control["wait_gate"]);connection.sendall(b"wait\n");connection.recv(1)
+                connection.connect(gate);connection.sendall(b"wait\n");connection.recv(1)
     if scenario in ("owner-message-drop", "owner-message-partial", "owner-message-unproven") and method == "message.send":sys.exit(0)
     reply(req, result)

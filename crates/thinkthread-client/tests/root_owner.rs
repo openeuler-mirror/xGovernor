@@ -541,6 +541,7 @@ async fn message_journal_recovers_and_settles_without_repeating_admission() {
                 }
             );
             assert!(repo.pending_joint_operations().await.unwrap().is_empty());
+            let trace_before_replay = f.trace();
             let replay = owner
                 .submit_turn(
                     context("replay"),
@@ -552,7 +553,15 @@ async fn message_journal_recovers_and_settles_without_repeating_admission() {
                 .await
                 .unwrap();
             assert_eq!(replay.turn_id, "public-turn");
-            assert!(replay.terminal.is_none());
+            assert_eq!(replay.terminal.unwrap().await.unwrap(), terminal);
+            let trace_after_replay = f.trace();
+            assert_eq!(
+                &trace_after_replay[..trace_before_replay.len()],
+                trace_before_replay.as_slice()
+            );
+            assert!(trace_after_replay[trace_before_replay.len()..]
+                .iter()
+                .all(|r| r["method"] == "handshake" || r["method"] == "context.bind"));
             let old = repo
                 .get_joint_turn("public-session".into(), "request".into())
                 .await
