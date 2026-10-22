@@ -19,6 +19,13 @@ impl LlmPolicy {
         }
     }
 
+    pub fn default_for_mcts() -> Self {
+        Self::new(
+            std::env::var("XGOVERNOR_MCTS_DEFAULT_MODEL")
+                .unwrap_or_else(|_| "DeepSeek-V4-Pro".to_string()),
+        )
+    }
+
     pub fn resolve(&self, explicit_override: Option<&str>) -> String {
         explicit_override
             .map(str::to_string)

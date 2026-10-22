@@ -3460,6 +3460,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "http-body-util",
+ "mcts-plugin-host",
  "provider-protocol",
  "rand 0.8.7",
  "serde",

@@ -10,6 +10,7 @@ pub mod host_cap_service;
 pub mod lifecycle;
 pub mod llm_policy;
 pub mod manifest;
+pub mod mcts_run;
 pub mod process;
 pub mod profile_registry;
 pub mod registry;
@@ -22,6 +23,9 @@ pub use host_cap_service::{FakeApplication, HostApplication, HostCapService};
 pub use lifecycle::PluginSession;
 pub use llm_policy::LlmPolicy;
 pub use manifest::{ModeManifest, PluginManifest, ProfileManifest, PLUGIN_ID};
+pub use mcts_run::{
+    build_launch_command, LlmConfig, MctsRun, MctsRunOutcome, MctsRunRequest, MctsRunStatus,
+};
 pub use process::PluginProcess;
 pub use profile_registry::ProfileRegistry;
 pub use registry::{PluginManager, PluginRegistry, PluginStatus};
