@@ -154,6 +154,33 @@ impl RunMap {
         }
     }
 
+    pub fn require_state_in_run(
+        &self,
+        run_id: &str,
+        state_id: &str,
+    ) -> Result<(), PluginHostError> {
+        self.require_run(run_id)?;
+        let inner = self.inner.read().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        match inner.states.get(state_id) {
+            Some(state) if state.run_id == run_id => Ok(()),
+            Some(_) => Err(PluginHostError::BranchNotFound(format!(
+                "state {state_id} does not belong to run {run_id}"
+            ))),
+            None => Err(PluginHostError::BranchNotFound(format!(
+                "state not found: {state_id}"
+            ))),
+        }
+    }
+
+    pub fn has_states(&self) -> bool {
+        self.inner
+            .read()
+            .map(|inner| !inner.states.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn add_job(&self, run_id: &str, branch_id: &str, job_id: &str) -> Result<(), PluginHostError> {
         self.require_branch_in_run(run_id, branch_id)?;
         let mut inner = self.inner.write().map_err(|_| {

@@ -5,8 +5,10 @@
 //! JSON-RPC framing, lifecycle handshakes and process cleanup.
 
 pub mod error;
+pub mod apply_plan;
 pub mod capability_map;
 pub mod host_cap_service;
+pub mod job_notifier;
 pub mod lifecycle;
 pub mod llm_policy;
 pub mod manifest;
@@ -17,7 +19,9 @@ pub mod registry;
 pub mod run_map;
 pub mod stdio;
 
+pub use apply_plan::ApplyPlanValidator;
 pub use capability_map::{HostCapability, ensure_capability_available, ensure_method_available, map_granted_capabilities};
+pub use job_notifier::JobNotifier;
 pub use error::PluginHostError;
 pub use host_cap_service::{FakeApplication, HostApplication, HostCapService};
 pub use lifecycle::PluginSession;

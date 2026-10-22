@@ -15,11 +15,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
+use crate::apply_plan::ApplyPlanValidator;
 use crate::error::PluginHostError;
 use crate::host_cap_service::{HostApplication, HostCapService};
+use crate::job_notifier::{empty_usage, JobNotifier};
 use crate::llm_policy::LlmPolicy;
 use crate::manifest::PLUGIN_ID;
 use crate::process::PluginProcess;
+use crate::run_map::JobStatus;
 
 pub const DEFAULT_RUN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_WAIT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -394,12 +397,25 @@ async fn request_and_dispatch<A: HostApplication>(
             }
             RpcEnvelope::Request(request) => {
                 let response = host_cap_service
-                    .handle(request.id, request.method, request.params)
+                    .handle(request.id.clone(), request.method.clone(), request.params.clone())
                     .await;
+                send_host_job_events(
+                    process,
+                    host_cap_service,
+                    &request.method,
+                    &request.params,
+                    &response,
+                )
+                .await?;
                 process.send(&RpcEnvelope::Response(response)).await?;
             }
             RpcEnvelope::Notification(notification) => {
-                apply_notification(notification.method, notification.params, progress)?;
+                apply_notification(
+                    notification.method,
+                    notification.params,
+                    progress,
+                    host_cap_service,
+                )?;
             }
         }
     }
@@ -412,10 +428,11 @@ fn id_matches(id: &RpcId, expected: &str) -> bool {
     }
 }
 
-fn apply_notification(
+fn apply_notification<A: HostApplication>(
     method: NotificationName,
     params: Value,
     progress: &mut RunProgress,
+    host_cap_service: &Arc<HostCapService<A>>,
 ) -> Result<(), PluginHostError> {
     match method {
         NotificationName::PluginStarted => {
@@ -427,10 +444,13 @@ fn apply_notification(
         }
         NotificationName::PluginCompleted => {
             let params: PluginCompletedParams = serde_json::from_value(params)?;
+            let result = params.result.clone();
+            ApplyPlanValidator::new()
+                .validate(&result, &params.run_id, &host_cap_service.run_map())?;
             progress.status = MctsRunStatus::Completed;
             progress.sequence = progress.sequence.max(params.sequence);
             progress.summary = Some("completed".to_string());
-            progress.result = Some(params.result);
+            progress.result = Some(result);
         }
         NotificationName::PluginCancelled => {
             let params: PluginCancelledParams = serde_json::from_value(params)?;
@@ -447,6 +467,47 @@ fn apply_notification(
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn send_host_job_events<A: HostApplication>(
+    process: &PluginProcess,
+    host_cap_service: &Arc<HostCapService<A>>,
+    method: &MethodName,
+    request_params: &Value,
+    response: &Response,
+) -> Result<(), PluginHostError> {
+    if !matches!(method, MethodName::HostAgentTurn | MethodName::HostExec) {
+        return Ok(());
+    }
+    let Some(job_id) = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("job_id"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let run_id = request_params
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    process
+        .send(&JobNotifier::started(run_id, job_id, 1))
+        .await?;
+    process
+        .send(&JobNotifier::completed(
+            run_id,
+            job_id,
+            2,
+            "",
+            empty_usage(),
+            Some(0),
+            Some(false),
+        ))
+        .await?;
+    let _ = host_cap_service.run_map().set_job_status(job_id, JobStatus::Completed);
     Ok(())
 }
 
