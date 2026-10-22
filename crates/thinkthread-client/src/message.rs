@@ -38,7 +38,16 @@ impl RootSessionOwner {
         {
             return Err(unsupported_joint("message_profile"));
         }
-        if session.last_error.as_deref() == Some("message_execution_invalidated") {
+        let existing = if let Some(key) = request.client_request_id.as_ref() {
+            repository
+                .get_joint_turn(session.runtime_id.clone(), key.clone())
+                .await?
+        } else {
+            None
+        };
+        if session.last_error.as_deref() == Some("message_execution_invalidated")
+            && existing.as_ref().is_none_or(|turn| turn.terminal.is_none())
+        {
             return Err(unavailable("Message execution requires recovery"));
         }
         let root = self.bound_root(&session, repository.clone()).await?;
@@ -50,22 +59,17 @@ impl RootSessionOwner {
         .map_err(|_| unavailable("Message encoding failed"))?;
         let digest = sdk::operation_digest(client.context(), "message.send", &params)
             .map_err(|_| unavailable("Message digest failed"))?;
-        if let Some(key) = request.client_request_id.as_ref() {
-            if let Some(old) = repository
-                .get_joint_turn(session.runtime_id.clone(), key.clone())
-                .await?
-            {
-                client
-                    .close()
-                    .await
-                    .map_err(|_| unavailable("Management close failed"))?;
-                if old.identity.input_digest != digest {
-                    return Err(SessionDomainError::Conflict {
-                        message: "idempotency key has different Message input".into(),
-                    });
-                }
-                return Ok(old);
+        if let Some(old) = existing {
+            client
+                .close()
+                .await
+                .map_err(|_| unavailable("Management close failed"))?;
+            if old.identity.input_digest != digest {
+                return Err(SessionDomainError::Conflict {
+                    message: "idempotency key has different Message input".into(),
+                });
             }
+            return Ok(old);
         }
         let binding = session
             .execution_backing

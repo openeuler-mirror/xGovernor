@@ -4149,3 +4149,102 @@ async fn observation_deadline_keeps_the_fixture_backend_state_readable() {
         1
     );
 }
+
+#[tokio::test]
+async fn invalidated_sessions_replay_only_persisted_terminals() {
+    let f = cancel_fixture();
+    let router = f.stored().await;
+    let app = application(&f, &router);
+    let ctx = SecurityContext::admin("operator");
+    let first = cancel_submit(&app, "existing", "active", "cancelled").await;
+    let cancelled_id = first.receipt.turn_id.clone();
+    until_message(&f, 1).await;
+    app.cancel(&ctx, "existing", Some(&cancelled_id))
+        .await
+        .unwrap();
+    let cancelled_events = cancel_events(first).await;
+    assert_public_terminal(&cancelled_events, &cancelled_id, "cancelled");
+    let ticket = checkpoint_observer(&f, &router).await;
+    let repo = router.repository();
+    let record = repo.get("existing").await.unwrap().unwrap();
+    assert!(cancel_owner(&f, "A")
+        .observe_checkpoint_boundary(&record, ticket, repo.clone())
+        .await
+        .unwrap());
+    cancel_control(&f, "A", json!({"failed_text":"later-fails"}));
+    let mut failed = cancel_submit(&app, "existing", "later-fails", "failure").await;
+    let failed_id = failed.receipt.turn_id.clone();
+    drop(failed.events.take());
+    let stored_failure = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            if let Some(terminal) = repo
+                .get_joint_turn("existing".into(), "failure".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .terminal
+            {
+                break terminal;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(stored_failure.execution_invalidated);
+    assert_eq!(stored_failure.failure.as_deref(), Some("message_failed"));
+    let stored = repo.get("existing").await.unwrap().unwrap();
+    assert_eq!(stored.status, SessionStatus::Failed);
+    assert_eq!(
+        stored.last_error.as_deref(),
+        Some("message_execution_invalidated")
+    );
+    let boundary = repo
+        .joint_workspace_boundary(stored.execution_backing.joint().unwrap().clone())
+        .await
+        .unwrap();
+    assert_eq!(boundary.cancel_epoch, 1);
+    assert_eq!(boundary.checkpoint_epoch, 1);
+    let reopened = f.router(f.profile("A"), true).unwrap();
+    let reconnect = application_with_ids(&f, &reopened, 1000);
+    let before = owned_snapshot::database(&f.root.path().join("db"));
+    let trace_before = f.trace();
+    let replay = cancel_submit(&reconnect, "existing", "later-fails", "failure").await;
+    assert_eq!(replay.receipt.turn_id, failed_id);
+    let failed_events = cancel_events(replay).await;
+    assert_eq!(failed_events.len(), 1, "{failed_events:?}");
+    assert_eq!(failed_events[0]["kind"], "turn_failed");
+    assert_eq!(failed_events[0]["runtime_id"], "existing");
+    assert_eq!(failed_events[0]["turn_id"], failed_id);
+    assert_eq!(
+        failed_events[0]["error"]["code"],
+        stored_failure.failure.unwrap()
+    );
+    assert_eq!(failed_events[0]["usage"], "unknown");
+    let replay = cancel_submit(&reconnect, "existing", "active", "cancelled").await;
+    assert_eq!(replay.receipt.turn_id, cancelled_id);
+    let replayed_cancel = cancel_events(replay).await;
+    assert_public_terminal(&replayed_cancel, &cancelled_id, "cancelled");
+    assert_eq!(replayed_cancel, cancelled_events);
+    assert!(reconnect
+        .submit_turn(
+            &ctx,
+            serde_json::from_value(json!({"runtime_id":"existing","text":"changed input","client_request_id":"failure"})).unwrap()
+        )
+        .await
+        .is_err());
+    let trace_after_replays = f.trace();
+    assert!(trace_after_replays[trace_before.len()..]
+        .iter()
+        .all(|r| !r["method"].as_str().unwrap().starts_with("message.")));
+    for key in [None, Some("new-key")] {
+        let request = serde_json::from_value(
+            json!({"runtime_id":"existing","text":"must not send","client_request_id":key}),
+        )
+        .unwrap();
+        assert!(reconnect.submit_turn(&ctx, request).await.is_err());
+    }
+    assert_eq!(f.trace(), trace_after_replays);
+    assert_eq!(owned_snapshot::database(&f.root.path().join("db")), before);
+    eprintln!("invalidated replay: failed={failed_events:?}, cancelled={replayed_cancel:?}; zero additional Message operations and unchanged journal");
+}

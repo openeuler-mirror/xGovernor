@@ -219,9 +219,18 @@ registers the original request before an externally issued SDK checkpoint,
 validates its operation, domain outcome and retained metadata, and clears only
 the same binding generation and cancellation epoch. A failed boundary is
 returned without mutation retry. This observer does not expose public candidate
-checkpoint or load capabilities. Existing enrolled databases missing these
-control tables fail opening rather than being migrated by an unbound reader.
+checkpoint or load capabilities. Existing enrolled databases without these
+control tables retain their existing reads. Only the deployment writer holding
+both object and identity locks may create the additive tables in its registration
+transaction. Unbound readers never migrate the database; new cancellation
+controls require the holder and the upgraded schema. Partial control schemas
+are rejected rather than repaired.
 
 Post-cancellation execution failure retains the original Message records and an
 execution-invalidated error. Unknown observations retain their protection;
 verified failure does not create a replacement Root or restart the Session.
+
+Execution invalidation blocks submissions without a persisted terminal. An
+authorized exact retry can still replay its original terminal and turn ID after
+owner, configuration revision and input identity verification, without another
+Message operation.
