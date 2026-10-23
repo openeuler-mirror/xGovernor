@@ -1,18 +1,40 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mcts_protocol::{MethodName, Response, RpcErrorCode, RpcId};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use mcts_protocol::{Failure, MethodName, Response, RpcErrorCode, RpcId};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::PluginHostError;
 use crate::manifest::PLUGIN_ID;
-use crate::run_map::RunMap;
+use crate::run_map::{JobStatus, RunMap};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostJobOutcome {
+    pub status: JobStatus,
+    pub output: String,
+    pub exit_code: Option<i64>,
+    pub usage: BTreeMap<String, u64>,
+    pub failure: Option<Failure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSnapshot {
+    pub state_id: String,
+    pub expires_at: String,
+    /// Internal lease-expiry metadata. Not part of the stdio wire result;
+    /// [`HostCapService`] copies it into [`RunMap`] so `apply_plan`
+    /// validation can enforce freshness.
+    pub expires_at_ms: Option<u64>,
+    pub tenant_id: Option<String>,
+}
 
 #[async_trait]
 pub trait HostApplication: Send + Sync {
-    async fn snapshot(&self, run_id: &str, branch_id: &str) -> Result<String, PluginHostError>;
+    async fn snapshot(&self, run_id: &str, branch_id: &str) -> Result<HostSnapshot, PluginHostError>;
     async fn fork(&self, run_id: &str, parent_state_id: &str) -> Result<String, PluginHostError>;
     async fn agent_turn(
         &self,
@@ -29,13 +51,13 @@ pub trait HostApplication: Send + Sync {
         argv: &[String],
         cwd: &str,
     ) -> Result<String, PluginHostError>;
-    async fn file_read(&self, run_id: &str, branch_id: &str, path: &str) -> Result<String, PluginHostError>;
+    async fn file_read(&self, run_id: &str, branch_id: &str, path: &str) -> Result<Vec<u8>, PluginHostError>;
     async fn file_write(
         &self,
         run_id: &str,
         branch_id: &str,
         path: &str,
-        data: &str,
+        data: &[u8],
     ) -> Result<u64, PluginHostError>;
     async fn heartbeat(
         &self,
@@ -45,6 +67,7 @@ pub trait HostApplication: Send + Sync {
     ) -> Result<(), PluginHostError>;
     async fn diff(&self, run_id: &str, branch_id: &str, base_state_id: &str) -> Result<String, PluginHostError>;
     async fn release(&self, run_id: &str, branch_id: &str) -> Result<(), PluginHostError>;
+    async fn wait_job(&self, run_id: &str, job_id: &str) -> Result<HostJobOutcome, PluginHostError>;
 }
 
 pub struct HostCapService<A: HostApplication> {
@@ -95,11 +118,20 @@ impl<A: HostApplication> HostCapService<A> {
             return error_response(id, error.rpc_code(), error.to_string());
         }
         match self.app.snapshot(&params.run_id, &params.branch_id).await {
-            Ok(state_id) => {
-                if let Err(error) = self.run_map.add_state(&params.run_id, &state_id, &params.branch_id) {
+            Ok(snapshot) => {
+                if let Err(error) = self.run_map.add_state_with_metadata(
+                    &params.run_id,
+                    &snapshot.state_id,
+                    &params.branch_id,
+                    snapshot.expires_at_ms,
+                    snapshot.tenant_id.clone(),
+                ) {
                     return error_response(id, error.rpc_code(), error.to_string());
                 }
-                ok_response(id, json!({"state_id": state_id}))
+                ok_response(
+                    id,
+                    json!({"state_id": snapshot.state_id, "expires_at": snapshot.expires_at}),
+                )
             }
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
@@ -203,8 +235,17 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.file_read(&params.run_id, &params.branch_id, &params.path).await {
-            Ok(content) => ok_response(id, json!({"content": content})),
+        let read_result = self.app.file_read(&params.run_id, &params.branch_id, &params.path).await;
+        if let Err(error) = &read_result {
+            tracing::warn!(
+                branch_id = %params.branch_id,
+                path = %params.path,
+                %error,
+                "host.file_read translated to session read_file failed"
+            );
+        }
+        match read_result {
+            Ok(content) => ok_response(id, json!({"content_base64": BASE64.encode(content)})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
     }
@@ -220,8 +261,18 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.file_write(&params.run_id, &params.branch_id, &params.path, &params.data).await {
-            Ok(bytes_written) => ok_response(id, json!({"bytes_written": bytes_written})),
+        let data = match BASE64.decode(&params.content_base64) {
+            Ok(data) => data,
+            Err(error) => {
+                return error_response(
+                    id,
+                    RpcErrorCode::InvalidParams as i64,
+                    format!("host.file_write content_base64 is not valid base64: {error}"),
+                );
+            }
+        };
+        match self.app.file_write(&params.run_id, &params.branch_id, &params.path, &data).await {
+            Ok(bytes_written) => ok_response(id, json!({"written_bytes": bytes_written})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
     }
@@ -238,7 +289,7 @@ impl<A: HostApplication> HostCapService<A> {
             return error_response(id, error.rpc_code(), error.to_string());
         }
         match self.app.diff(&params.run_id, &params.branch_id, &params.base_state_id).await {
-            Ok(diff) => ok_response(id, json!({"diff": diff})),
+            Ok(diff) => ok_response(id, json!({"content": diff})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
     }
@@ -257,7 +308,7 @@ impl<A: HostApplication> HostCapService<A> {
         match self.app.release(&params.run_id, &params.branch_id).await {
             Ok(()) => {
                 let _ = self.run_map.remove_branch(&params.branch_id);
-                ok_response(id, json!({}))
+                ok_response(id, json!({"released": true}))
             }
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
@@ -305,12 +356,17 @@ impl FakeApplication {
 
 #[async_trait]
 impl HostApplication for FakeApplication {
-    async fn snapshot(&self, _run_id: &str, branch_id: &str) -> Result<String, PluginHostError> {
+    async fn snapshot(&self, _run_id: &str, branch_id: &str) -> Result<HostSnapshot, PluginHostError> {
         self.state
             .lock()
             .map(|mut state| {
                 state.calls.push(format!("snapshot:{branch_id}"));
-                format!("state-{branch_id}")
+                HostSnapshot {
+                    state_id: format!("state-{branch_id}"),
+                    expires_at: "2026-12-31T23:59:59Z".to_string(),
+                    expires_at_ms: None,
+                    tenant_id: None,
+                }
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
@@ -373,12 +429,12 @@ impl HostApplication for FakeApplication {
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
 
-    async fn file_read(&self, _run_id: &str, branch_id: &str, path: &str) -> Result<String, PluginHostError> {
+    async fn file_read(&self, _run_id: &str, branch_id: &str, path: &str) -> Result<Vec<u8>, PluginHostError> {
         self.state
             .lock()
             .map(|mut state| {
                 state.calls.push(format!("file_read:{branch_id}:{path}"));
-                "mock-file-content".to_string()
+                b"mock-file-content".to_vec()
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
@@ -388,14 +444,14 @@ impl HostApplication for FakeApplication {
         _run_id: &str,
         branch_id: &str,
         path: &str,
-        data: &str,
+        data: &[u8],
     ) -> Result<u64, PluginHostError> {
         self.state
             .lock()
             .map(|mut state| {
                 state
                     .calls
-                    .push(format!("file_write:{branch_id}:{path}:{data}"));
+                    .push(format!("file_write:{branch_id}:{path}:{}", data.len()));
                 data.len() as u64
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
@@ -430,6 +486,22 @@ impl HostApplication for FakeApplication {
             .lock()
             .map(|mut state| {
                 state.calls.push(format!("release:{branch_id}"));
+            })
+            .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
+    }
+
+    async fn wait_job(&self, _run_id: &str, job_id: &str) -> Result<HostJobOutcome, PluginHostError> {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state.calls.push(format!("wait_job:{job_id}"));
+                HostJobOutcome {
+                    status: JobStatus::Completed,
+                    output: String::new(),
+                    exit_code: Some(0),
+                    usage: BTreeMap::from([("total_tokens".to_string(), 0)]),
+                    failure: None,
+                }
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
@@ -539,7 +611,8 @@ struct HostFileWriteParams {
     timeout_ms: u64,
     branch_id: String,
     path: String,
-    data: String,
+    content_base64: String,
+    idempotency_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,6 +624,7 @@ struct HostDiffParams {
     timeout_ms: u64,
     branch_id: String,
     base_state_id: String,
+    #[serde(default)]
     idempotency_key: String,
 }
 
@@ -603,8 +677,10 @@ mod tests {
                 json!({"plugin_id":"mcts","run_id":"run-1","timeout_ms":1000,"branch_id":branch_id,"idempotency_key":"k-snap"}),
             )
             .await;
-        let state_id = snapshot.result.unwrap()["state_id"].as_str().unwrap().to_string();
+        let snapshot_result = snapshot.result.unwrap();
+        let state_id = snapshot_result["state_id"].as_str().unwrap().to_string();
         assert!(state_id.starts_with("state-"));
+        assert!(snapshot_result["expires_at"].as_str().is_some());
 
         let agent = service
             .handle(
@@ -640,6 +716,60 @@ mod tests {
         assert!(calls.iter().any(|call| call.starts_with("agent_turn:")));
         assert!(calls.iter().any(|call| call.starts_with("exec:")));
         assert!(calls.iter().any(|call| call.starts_with("release:")));
+    }
+
+    #[tokio::test]
+    async fn file_read_write_use_protocol_wire_names() {
+        let (service, app) = prepare_service();
+        let write = service
+            .handle(
+                RpcId::String("1".into()),
+                MethodName::HostFileWrite,
+                json!({"plugin_id":"mcts","run_id":"run-1","timeout_ms":1000,"branch_id":"root-branch","path":"/workspace/a.txt","content_base64":"aGVsbG8=","idempotency_key":"k-write"}),
+            )
+            .await;
+        let write_result = write.result.unwrap();
+        assert_eq!(write_result["written_bytes"], 5);
+
+        let read = service
+            .handle(
+                RpcId::String("2".into()),
+                MethodName::HostFileRead,
+                json!({"plugin_id":"mcts","run_id":"run-1","timeout_ms":1000,"branch_id":"root-branch","path":"/workspace/a.txt"}),
+            )
+            .await;
+        let read_result = read.result.unwrap();
+        assert_eq!(read_result["content_base64"], "bW9jay1maWxlLWNvbnRlbnQ=");
+        assert!(read_result.get("content").is_none());
+        assert!(app
+            .calls()
+            .iter()
+            .any(|call| call == "file_read:root-branch:/workspace/a.txt"));
+    }
+
+    #[tokio::test]
+    async fn release_uses_released_true_and_diff_uses_content() {
+        let (service, _app) = prepare_service();
+        let diff = service
+            .handle(
+                RpcId::String("1".into()),
+                MethodName::HostDiff,
+                json!({"plugin_id":"mcts","run_id":"run-1","timeout_ms":1000,"branch_id":"root-branch","base_state_id":"state-root"}),
+            )
+            .await;
+        let diff_result = diff.result.unwrap();
+        assert!(diff_result["content"].as_str().is_some());
+        assert!(diff_result.get("diff").is_none());
+
+        let release = service
+            .handle(
+                RpcId::String("2".into()),
+                MethodName::HostRelease,
+                json!({"plugin_id":"mcts","run_id":"run-1","timeout_ms":1000,"branch_id":"root-branch","idempotency_key":"k-release"}),
+            )
+            .await;
+        let release_result = release.result.unwrap();
+        assert_eq!(release_result["released"], true);
     }
 
     #[tokio::test]

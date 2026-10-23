@@ -1,22 +1,29 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::Extension;
 use axum::{Json, Router};
 use mcts_plugin_host::{
-    build_launch_command, FakeApplication, HostCapService, MctsRun, MctsRunOutcome,
-    MctsRunRequest, MctsRunStatus, RunMap,
+    build_launch_command, FakeApplication, HostApplication, HostCapService, MctsRun,
+    MctsRunOutcome, MctsRunRequest, MctsRunStatus, RunMap,
 };
 use serde::{Deserialize, Serialize};
+use xgovernor_core::{SecurityContext, SessionApplication};
+
+use super::mcts_host::RealSessionHostApplication;
 
 #[derive(Clone)]
 pub struct MctsHttpState {
     runs: Arc<Mutex<HashMap<String, MctsRunRecord>>>,
+    cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     config: Arc<MctsLaunchConfig>,
+    session: Option<SessionApplication>,
 }
 
 #[derive(Clone)]
@@ -42,7 +49,18 @@ impl MctsHttpState {
     pub fn new(config: MctsLaunchConfig) -> Self {
         Self {
             runs: Arc::new(Mutex::new(HashMap::new())),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
             config: Arc::new(config),
+            session: None,
+        }
+    }
+
+    pub fn with_session(config: MctsLaunchConfig, session: SessionApplication) -> Self {
+        Self {
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(config),
+            session: Some(session),
         }
     }
 
@@ -78,16 +96,23 @@ struct MctsRunView {
     request: MctsRunRequest,
     outcome: Option<MctsRunOutcome>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_jsonl: Option<String>,
 }
 
 impl From<MctsRunRecord> for MctsRunView {
     fn from(record: MctsRunRecord) -> Self {
+        let protocol_jsonl = record
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.protocol.clone());
         Self {
             run_id: record.run_id,
             status: record.status,
             request: record.request,
             outcome: record.outcome,
             error: record.error,
+            protocol_jsonl,
         }
     }
 }
@@ -117,22 +142,34 @@ pub fn mcts_router(state: MctsHttpState) -> Router {
 
 const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
     "ZSOFT_TASKS_DIR",
+    "ZSOFT_BIN",
+    "ZSOFT_SERVER_URL",
+    "ZSOFT_BENCH_ROOT",
     "PYTHONPATH",
     "ZSOFT_TRIAL_SERVER_URL",
     "XIAOO_MCTS_TOKEN_FUSE_LIMIT",
+    "XIAOO_SUBMISSION_SELECTOR",
 ];
 
 fn collect_plugin_envs() -> Vec<(String, String)> {
     MCTS_PLUGIN_ENV_ALLOWLIST
         .iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_string(), value)))
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| ((*key).to_string(), value))
+        })
         .collect()
 }
 
 async fn create_run(
     State(state): State<MctsHttpState>,
+    context: Option<Extension<SecurityContext>>,
     Json(mut request): Json<MctsRunRequest>,
 ) -> Result<(StatusCode, Json<MctsRunView>), MctsApiError> {
+    let ctx = context
+        .map(|Extension(ctx)| ctx)
+        .unwrap_or_else(|| SecurityContext::admin("system:mcts-worker"));
     if request.plugin_id != "mcts" {
         return Err(MctsApiError {
             status: StatusCode::BAD_REQUEST,
@@ -160,9 +197,11 @@ async fn create_run(
         });
     }
 
-    let host_service = if state.config.spawn_enabled {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if state.config.spawn_enabled {
         let run_map = RunMap::new();
-        if let Err(error) = run_map.register_run(&request.run_id) {
+        let run_tenant_id = ctx.tenant_id().map(str::to_string);
+        if let Err(error) = run_map.register_run_with_tenant(&request.run_id, run_tenant_id) {
             return Err(MctsApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: format!("failed to register MCTS run map: {error}"),
@@ -174,14 +213,53 @@ async fn create_run(
                 message: format!("failed to adopt root state: {error}"),
             });
         }
-        Some(Arc::new(HostCapService::new(FakeApplication::new(), run_map)))
-    } else {
-        None
-    };
 
+        if let Some(session) = state.session.clone() {
+            let application = RealSessionHostApplication::new(
+                session,
+                ctx.clone(),
+                request.mode.clone(),
+                &request.run_id,
+                &state.config.repo_root,
+                None,
+                cancel.clone(),
+            )
+            .map_err(|error| MctsApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to build real MCTS host application: {error}"),
+            })?;
+            spawn_mcts_task(
+                state.clone(),
+                request.clone(),
+                Arc::new(HostCapService::new(application, run_map)),
+                cancel.clone(),
+            );
+        } else {
+            spawn_mcts_task(
+                state.clone(),
+                request.clone(),
+                Arc::new(HostCapService::new(FakeApplication::new(), run_map)),
+                cancel.clone(),
+            );
+        }
+    }
+
+    {
+        let mut cancellations = state.cancellations.lock().map_err(|_| MctsApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "mcts cancellation state lock poisoned".to_string(),
+        })?;
+        cancellations.insert(request.run_id.clone(), cancel);
+    }
+
+    let status = if state.config.spawn_enabled {
+        MctsRunStatus::Running
+    } else {
+        MctsRunStatus::Accepted
+    };
     let record = MctsRunRecord {
         run_id: request.run_id.clone(),
-        status: MctsRunStatus::Accepted,
+        status,
         request: request.clone(),
         outcome: None,
         error: None,
@@ -189,26 +267,24 @@ async fn create_run(
     runs.insert(record.run_id.clone(), record);
     drop(runs);
 
-    if let Some(host_service) = host_service {
-        spawn_mcts_task(state.clone(), request.clone(), host_service);
-    }
-
     Ok((
         StatusCode::CREATED,
         Json(MctsRunView {
             run_id: request.run_id.clone(),
-            status: MctsRunStatus::Accepted,
+            status,
             request,
             outcome: None,
             error: None,
+            protocol_jsonl: None,
         }),
     ))
 }
 
-fn spawn_mcts_task(
+fn spawn_mcts_task<A: HostApplication + 'static>(
     state: MctsHttpState,
     request: MctsRunRequest,
-    host_service: Arc<HostCapService<FakeApplication>>,
+    host_service: Arc<HostCapService<A>>,
+    cancel: Arc<AtomicBool>,
 ) {
     let run_id = request.run_id.clone();
     let command = build_launch_command(
@@ -216,14 +292,19 @@ fn spawn_mcts_task(
         state.config.repo_root.clone(),
         &request,
     );
-    let run = MctsRun::new(command, collect_plugin_envs(), request, host_service);
+    let run =
+        MctsRun::new(command, collect_plugin_envs(), request, host_service).with_cancel(cancel);
     let runs = state.runs.clone();
+    let cancellations = state.cancellations.clone();
 
     tokio::spawn(async move {
         let outcome = run.execute().await;
         if let Ok(mut records) = runs.lock() {
             if let Some(record) = records.get_mut(&run_id) {
                 if record.status == MctsRunStatus::Cancelled {
+                    if let Ok(mut map) = cancellations.lock() {
+                        map.remove(&run_id);
+                    }
                     return;
                 }
                 match outcome {
@@ -237,6 +318,9 @@ fn spawn_mcts_task(
                     }
                 }
             }
+        }
+        if let Ok(mut map) = cancellations.lock() {
+            map.remove(&run_id);
         }
     });
 }
@@ -274,6 +358,11 @@ async fn cancel_run(
     ) {
         record.status = MctsRunStatus::Cancelled;
     }
+    if let Ok(cancellations) = state.cancellations.lock() {
+        if let Some(cancel) = cancellations.get(&run_id) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
     Ok(Json(MctsRunView::from(record.clone())))
 }
 
@@ -295,7 +384,8 @@ mod tests {
             "goal": "fix the websocket issue",
             "content": "content",
             "budget": {
-                "max_nodes": 5,
+                "max_iters": 5,
+                "branching": 3,
                 "max_time_ms": 1800000,
                 "max_tokens": 3000000
             },
@@ -305,11 +395,9 @@ mod tests {
 
     #[test]
     fn plugin_env_allowlist_excludes_llm_credentials() {
-        assert!(
-            MCTS_PLUGIN_ENV_ALLOWLIST
-                .iter()
-                .all(|key| !key.starts_with("XGOVERNOR_LLM_"))
-        );
+        assert!(MCTS_PLUGIN_ENV_ALLOWLIST
+            .iter()
+            .all(|key| !key.starts_with("XGOVERNOR_LLM_")));
     }
 
     fn test_router() -> Router {
@@ -320,7 +408,8 @@ mod tests {
     fn parses_valid_request_schema() {
         let request: MctsRunRequest = serde_json::from_value(request_json()).unwrap();
         assert_eq!(request.plugin_id, "mcts");
-        assert_eq!(request.budget.max_nodes, 5);
+        assert_eq!(request.budget.max_iters, 5);
+        assert_eq!(request.budget.branching, 3);
         assert_eq!(request.granted_capabilities.len(), 3);
     }
 
@@ -413,7 +502,8 @@ mod tests {
             "goal": "http spawn smoke test",
             "content": "content",
             "budget": {
-                "max_nodes": 2,
+                "max_iters": 2,
+                "branching": 1,
                 "max_time_ms": 15000,
                 "max_tokens": 1000
             }
@@ -447,8 +537,14 @@ mod tests {
                 assert!(view.outcome.is_some());
                 return;
             }
-            if matches!(view.status, MctsRunStatus::Failed | MctsRunStatus::Cancelled) {
-                panic!("unexpected terminal status: {:?} {:?}", view.status, view.error);
+            if matches!(
+                view.status,
+                MctsRunStatus::Failed | MctsRunStatus::Cancelled
+            ) {
+                panic!(
+                    "unexpected terminal status: {:?} {:?}",
+                    view.status, view.error
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }

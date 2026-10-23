@@ -1346,6 +1346,7 @@ name = "mcts-plugin-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "mcts-protocol",
  "serde",
  "serde_json",
@@ -3457,6 +3458,7 @@ dependencies = [
  "async-trait",
  "axum",
  "backend",
+ "base64",
  "dirs",
  "futures-util",
  "http-body-util",

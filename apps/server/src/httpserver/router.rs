@@ -1,6 +1,6 @@
 use super::admin_tenants::{admin_tenants_router, TenantAdminState};
 use super::auth::{require_role, security_layer, TokenTable};
-use super::mcts::{mcts_router, MctsHttpState};
+use super::mcts::{mcts_router, MctsHttpState, MctsLaunchConfig};
 use super::session::{session_router, SessionHttpState};
 use axum::{http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
@@ -147,7 +147,10 @@ pub fn create_router(
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
         .merge(session_router(state.clone()))
-        .merge(mcts_router(MctsHttpState::default()));
+        .merge(mcts_router(MctsHttpState::with_session(
+            MctsLaunchConfig::default(),
+            state.application().clone(),
+        )));
     if let Some(tenant_admin_state) = tenant_admin {
         router = router.merge(admin_tenants_router(tenant_admin_state));
     }

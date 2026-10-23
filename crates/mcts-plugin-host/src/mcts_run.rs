@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mcts_protocol::messages::JSONRPC_VERSION;
 use mcts_protocol::methods::{Budget, PluginInitializeParams, PluginStartParams, PluginWaitParams};
@@ -18,7 +19,7 @@ use tokio::process::Command;
 use crate::apply_plan::ApplyPlanValidator;
 use crate::error::PluginHostError;
 use crate::host_cap_service::{HostApplication, HostCapService};
-use crate::job_notifier::{empty_usage, JobNotifier};
+use crate::job_notifier::JobNotifier;
 use crate::lease_keeper::{spawn_lease_keeper, DEFAULT_HEARTBEAT_INTERVAL};
 use crate::llm_policy::LlmPolicy;
 use crate::manifest::PLUGIN_ID;
@@ -84,6 +85,8 @@ pub struct MctsRunOutcome {
     pub summary: Option<String>,
     pub result: Option<CompletionResult>,
     pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +96,7 @@ struct RunProgress {
     summary: Option<String>,
     result: Option<CompletionResult>,
     failure: Option<Failure>,
+    protocol: Option<String>,
 }
 
 impl RunProgress {
@@ -110,6 +114,7 @@ impl RunProgress {
             summary: self.summary,
             result: self.result,
             failure: self.failure,
+            protocol: self.protocol,
         }
     }
 }
@@ -123,6 +128,7 @@ pub struct MctsRun<A: HostApplication> {
     request_timeout: Duration,
     wait_poll_timeout: Duration,
     available_capabilities: BTreeSet<Capability>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl<A: HostApplication> MctsRun<A> {
@@ -141,7 +147,17 @@ impl<A: HostApplication> MctsRun<A> {
             request_timeout: DEFAULT_RUN_REQUEST_TIMEOUT,
             wait_poll_timeout: DEFAULT_WAIT_POLL_TIMEOUT,
             available_capabilities: all_capabilities(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
     }
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
@@ -259,6 +275,11 @@ impl<A: HostApplication> MctsRun<A> {
 
         let mut after_sequence = 0u64;
         while !progress.is_terminal() {
+            if self.is_cancelled() {
+                progress.status = MctsRunStatus::Cancelled;
+                progress.summary = Some("cancelled by host".to_string());
+                break;
+            }
             let wait_response = request_and_dispatch(
                 &process,
                 &self.host_cap_service,
@@ -419,16 +440,14 @@ async fn request_and_dispatch<A: HostApplication>(
         method,
         params,
     });
+    append_protocol(&mut progress.protocol, &request)?;
     process.send(&request).await?;
 
-    let deadline = Instant::now() + timeout;
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(PluginHostError::DeadlineExceeded)?;
-        let message = tokio::time::timeout(remaining, process.next_message())
+        let message = tokio::time::timeout(timeout, process.next_message())
             .await
             .map_err(|_| PluginHostError::DeadlineExceeded)??;
+        append_protocol(&mut progress.protocol, &message)?;
 
         match message {
             RpcEnvelope::Response(response) => {
@@ -438,17 +457,25 @@ async fn request_and_dispatch<A: HostApplication>(
             }
             RpcEnvelope::Request(request) => {
                 let response = host_cap_service
-                    .handle(request.id.clone(), request.method.clone(), request.params.clone())
+                    .handle(
+                        request.id.clone(),
+                        request.method.clone(),
+                        request.params.clone(),
+                    )
                     .await;
+                let response_for_job = response.clone();
+                let response_envelope = RpcEnvelope::Response(response);
+                append_protocol(&mut progress.protocol, &response_envelope)?;
+                process.send(&response_envelope).await?;
                 send_host_job_events(
                     process,
                     host_cap_service,
                     &request.method,
                     &request.params,
-                    &response,
+                    &response_for_job,
+                    &mut progress.protocol,
                 )
                 .await?;
-                process.send(&RpcEnvelope::Response(response)).await?;
             }
             RpcEnvelope::Notification(notification) => {
                 apply_notification(
@@ -486,8 +513,11 @@ fn apply_notification<A: HostApplication>(
         NotificationName::PluginCompleted => {
             let params: PluginCompletedParams = serde_json::from_value(params)?;
             let result = params.result.clone();
-            ApplyPlanValidator::new()
-                .validate(&result, &params.run_id, &host_cap_service.run_map())?;
+            ApplyPlanValidator::new().validate(
+                &result,
+                &params.run_id,
+                &host_cap_service.run_map(),
+            )?;
             progress.status = MctsRunStatus::Completed;
             progress.sequence = progress.sequence.max(params.sequence);
             progress.summary = Some("completed".to_string());
@@ -517,6 +547,7 @@ async fn send_host_job_events<A: HostApplication>(
     method: &MethodName,
     request_params: &Value,
     response: &Response,
+    protocol: &mut Option<String>,
 ) -> Result<(), PluginHostError> {
     if !matches!(method, MethodName::HostAgentTurn | MethodName::HostExec) {
         return Ok(());
@@ -534,21 +565,51 @@ async fn send_host_job_events<A: HostApplication>(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    process
-        .send(&JobNotifier::started(run_id, job_id, 1))
-        .await?;
-    process
-        .send(&JobNotifier::completed(
+    let started = JobNotifier::started(run_id, job_id, 1);
+    append_protocol(protocol, &started)?;
+    process.send(&started).await?;
+
+    let app = host_cap_service.application();
+    let outcome = app.wait_job(run_id, job_id).await?;
+    let terminal = match outcome.status {
+        JobStatus::Completed => JobNotifier::completed(
             run_id,
             job_id,
             2,
-            "",
-            empty_usage(),
-            Some(0),
+            &outcome.output,
+            outcome.usage,
+            outcome.exit_code,
             Some(false),
-        ))
-        .await?;
-    let _ = host_cap_service.run_map().set_job_status(job_id, JobStatus::Completed);
+        ),
+        JobStatus::Failed => {
+            let failure = outcome.failure.unwrap_or_else(|| Failure {
+                code: "host-job-failed".to_string(),
+                message: outcome.output.clone(),
+            });
+            JobNotifier::failed(run_id, job_id, 2, failure, outcome.usage)
+        }
+        JobStatus::Running => {
+            return Err(PluginHostError::InvalidResponse(format!(
+                "host job {job_id} was still running after wait_job()"
+            )));
+        }
+    };
+    append_protocol(protocol, &terminal)?;
+    process.send(&terminal).await?;
+    let _ = host_cap_service
+        .run_map()
+        .set_job_status(job_id, outcome.status);
+    Ok(())
+}
+
+fn append_protocol(
+    protocol: &mut Option<String>,
+    envelope: &RpcEnvelope,
+) -> Result<(), PluginHostError> {
+    let line = serde_json::to_string(envelope)?;
+    let buffer = protocol.get_or_insert_with(String::new);
+    buffer.push_str(&line);
+    buffer.push('\n');
     Ok(())
 }
 
@@ -588,7 +649,7 @@ mod tests {
             "root_state_id": "state-root",
             "goal": "validate lifecycle",
             "content": "content",
-            "budget": {"max_nodes": 2, "max_time_ms": 5000, "max_tokens": 1000}
+            "budget": {"max_iters": 2, "branching": 1, "max_time_ms": 5000, "max_tokens": 1000}
         }))
         .unwrap()
     }

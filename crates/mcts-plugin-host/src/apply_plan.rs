@@ -1,6 +1,7 @@
 //! Server-side validation of a plugin CompletionResult before it is persisted.
 
 use mcts_protocol::CompletionResult;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::PluginHostError;
 use crate::run_map::RunMap;
@@ -22,14 +23,33 @@ impl ApplyPlanValidator {
     ) -> Result<(), PluginHostError> {
         result.validate()?;
         if let Some(plan) = &result.apply_plan {
-            // Day 6 keeps expiry/tenant placeholders on StateRecord but has no
-            // real host lease metadata yet, so do not pseudo-enforce them here.
-            // State ownership is enforceable only once the host has actually
-            // materialized branches/states through host.* calls.  The mock
-            // stdio plugin runs in-process and never registers host states,
-            // so in that no-host-state case protocol validation is sufficient.
+            // The mock stdio plugin runs in-process and never registers host
+            // states, so in that no-host-state case protocol validation is
+            // sufficient. Once real host.* calls have materialized states, the
+            // state must belong to this run and must not be expired/tenant-mismatched.
             if run_map.has_host_states() {
                 run_map.require_state_in_run(run_id, &plan.state_id)?;
+                let state = run_map.state_record(&plan.state_id)?;
+                if let Some(expires_at_ms) = state.expires_at_ms {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    if now_ms >= expires_at_ms {
+                        return Err(PluginHostError::InvalidResponse(format!(
+                            "apply_plan state expired: {}",
+                            plan.state_id
+                        )));
+                    }
+                }
+                if let Some(run_tenant_id) = run_map.run_tenant_id(run_id)? {
+                    if state.tenant_id.as_deref() != Some(run_tenant_id.as_str()) {
+                        return Err(PluginHostError::InvalidResponse(format!(
+                            "apply_plan state tenant mismatch for {}",
+                            plan.state_id
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -97,5 +117,39 @@ mod tests {
         map.register_run("run-2").unwrap();
         let result = valid_result("state-1");
         assert!(ApplyPlanValidator::new().validate(&result, "run-2", &map).is_err());
+    }
+
+    #[test]
+    fn rejects_expired_apply_plan_state() {
+        let map = RunMap::new();
+        map.register_run_with_tenant("run-1", Some("tenant-a".into())).unwrap();
+        map.add_branch("run-1", "root-branch", "state-root").unwrap();
+        map.add_state_with_metadata(
+            "run-1",
+            "state-1",
+            "root-branch",
+            Some(1),
+            Some("tenant-a".into()),
+        )
+        .unwrap();
+        let result = valid_result("state-1");
+        assert!(ApplyPlanValidator::new().validate(&result, "run-1", &map).is_err());
+    }
+
+    #[test]
+    fn rejects_tenant_mismatched_apply_plan_state() {
+        let map = RunMap::new();
+        map.register_run_with_tenant("run-1", Some("tenant-a".into())).unwrap();
+        map.add_branch("run-1", "root-branch", "state-root").unwrap();
+        map.add_state_with_metadata(
+            "run-1",
+            "state-1",
+            "root-branch",
+            Some(u64::MAX),
+            Some("tenant-b".into()),
+        )
+        .unwrap();
+        let result = valid_result("state-1");
+        assert!(ApplyPlanValidator::new().validate(&result, "run-1", &map).is_err());
     }
 }

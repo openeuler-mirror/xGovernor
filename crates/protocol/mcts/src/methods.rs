@@ -79,7 +79,8 @@ impl FromStr for MethodName {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
-    pub max_nodes: u64,
+    pub max_iters: u64,
+    pub branching: u64,
     pub max_time_ms: u64,
     pub max_tokens: u64,
 }

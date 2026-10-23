@@ -21,7 +21,8 @@ async fn drives_real_mcts_mock_process_over_stdio() {
         "goal": "integration smoke test",
         "content": "drive the real MCTS stdio plugin",
         "budget": {
-            "max_nodes": 2,
+            "max_iters": 2,
+            "branching": 1,
             "max_time_ms": 15000,
             "max_tokens": 1000
         }

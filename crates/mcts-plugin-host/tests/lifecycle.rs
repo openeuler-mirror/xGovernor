@@ -53,7 +53,7 @@ async fn completes_initialize_start_wait_shutdown() {
             "root_state_id": "state-day2",
             "goal": "test",
             "content": "test",
-            "budget": {"max_nodes": 1, "max_time_ms": 1000, "max_tokens": 1000},
+            "budget": {"max_iters": 1, "branching": 1, "max_time_ms": 1000, "max_tokens": 1000},
             "granted_capabilities": []
         }))
         .await

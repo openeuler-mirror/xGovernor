@@ -35,6 +35,7 @@ pub struct JobRecord {
 #[derive(Default)]
 struct RunMapInner {
     runs: BTreeSet<String>,
+    run_tenants: BTreeMap<String, Option<String>>,
     branches: BTreeMap<String, BranchRecord>,
     states: BTreeMap<String, StateRecord>,
     jobs: BTreeMap<String, JobRecord>,
@@ -51,10 +52,19 @@ impl RunMap {
     }
 
     pub fn register_run(&self, run_id: &str) -> Result<(), PluginHostError> {
+        self.register_run_with_tenant(run_id, None)
+    }
+
+    pub fn register_run_with_tenant(
+        &self,
+        run_id: &str,
+        tenant_id: Option<String>,
+    ) -> Result<(), PluginHostError> {
         let mut inner = self.inner.write().map_err(|_| {
             PluginHostError::Manifest("run map lock poisoned".to_string())
         })?;
         if inner.runs.insert(run_id.to_string()) {
+            inner.run_tenants.insert(run_id.to_string(), tenant_id);
             Ok(())
         } else {
             Err(PluginHostError::IdempotencyConflict(format!(
@@ -67,7 +77,9 @@ impl RunMap {
         let mut inner = self.inner.write().map_err(|_| {
             PluginHostError::Manifest("run map lock poisoned".to_string())
         })?;
-        inner.runs.insert(run_id.to_string());
+        if inner.runs.insert(run_id.to_string()) {
+            inner.run_tenants.insert(run_id.to_string(), None);
+        }
         Ok(())
     }
 
@@ -80,6 +92,14 @@ impl RunMap {
         } else {
             Err(PluginHostError::RunNotFound(run_id.to_string()))
         }
+    }
+
+    pub fn run_tenant_id(&self, run_id: &str) -> Result<Option<String>, PluginHostError> {
+        self.require_run(run_id)?;
+        let inner = self.inner.read().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        Ok(inner.run_tenants.get(run_id).cloned().flatten())
     }
 
     pub fn add_branch(
@@ -153,6 +173,17 @@ impl RunMap {
         state_id: &str,
         branch_id: &str,
     ) -> Result<(), PluginHostError> {
+        self.add_state_with_metadata(run_id, state_id, branch_id, None, None)
+    }
+
+    pub fn add_state_with_metadata(
+        &self,
+        run_id: &str,
+        state_id: &str,
+        branch_id: &str,
+        expires_at_ms: Option<u64>,
+        tenant_id: Option<String>,
+    ) -> Result<(), PluginHostError> {
         self.require_branch_in_run(run_id, branch_id)?;
         let mut inner = self.inner.write().map_err(|_| {
             PluginHostError::Manifest("run map lock poisoned".to_string())
@@ -162,8 +193,8 @@ impl RunMap {
             StateRecord {
                 run_id: run_id.to_string(),
                 branch_id: branch_id.to_string(),
-                expires_at_ms: None,
-                tenant_id: None,
+                expires_at_ms,
+                tenant_id,
             },
         );
         Ok(())
@@ -226,6 +257,17 @@ impl RunMap {
                 "state not found: {state_id}"
             ))),
         }
+    }
+
+    pub fn state_record(&self, state_id: &str) -> Result<StateRecord, PluginHostError> {
+        let inner = self.inner.read().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        inner
+            .states
+            .get(state_id)
+            .cloned()
+            .ok_or_else(|| PluginHostError::BranchNotFound(format!("state not found: {state_id}")))
     }
 
     pub fn has_states(&self) -> bool {

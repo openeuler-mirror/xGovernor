@@ -25,13 +25,14 @@ pub use capability_map::{HostCapability, ensure_capability_available, ensure_met
 pub use job_notifier::JobNotifier;
 pub use lease_keeper::{spawn_lease_keeper, LeaseKeeperGuard, DEFAULT_HEARTBEAT_INTERVAL};
 pub use error::PluginHostError;
-pub use host_cap_service::{FakeApplication, HostApplication, HostCapService};
+pub use host_cap_service::{FakeApplication, HostApplication, HostCapService, HostJobOutcome, HostSnapshot};
 pub use lifecycle::PluginSession;
 pub use llm_policy::LlmPolicy;
 pub use manifest::{ModeManifest, PluginManifest, ProfileManifest, PLUGIN_ID};
 pub use mcts_run::{
     build_launch_command, LlmConfig, MctsRun, MctsRunOutcome, MctsRunRequest, MctsRunStatus,
 };
+pub use mcts_protocol::messages::Failure;
 pub use process::PluginProcess;
 pub use profile_registry::ProfileRegistry;
 pub use registry::{PluginManager, PluginRegistry, PluginStatus};

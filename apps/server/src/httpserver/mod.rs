@@ -9,6 +9,7 @@
 pub mod admin_tenants;
 pub mod auth;
 pub mod mcts;
+pub mod mcts_host;
 pub mod response;
 pub mod router;
 pub mod session;
