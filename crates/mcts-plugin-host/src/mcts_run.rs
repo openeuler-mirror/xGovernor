@@ -68,7 +68,8 @@ pub struct MctsRunRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<String>,
     pub run_id: String,
-    pub root_state_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_state_id: Option<String>,
     pub goal: String,
     pub content: String,
     pub budget: Budget,
@@ -198,7 +199,13 @@ impl<A: HostApplication> MctsRun<A> {
         let run_id = self.request.run_id.clone();
         let run_map = self.host_cap_service.run_map();
         run_map.ensure_run(&run_id)?;
-        run_map.register_root_state(&run_id, &self.request.root_state_id)?;
+        let root_state_id = self
+            .request
+            .root_state_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| PluginHostError::Manifest("root_state_id must not be empty".to_string()))?;
+        run_map.register_root_state(&run_id, root_state_id)?;
         let client_id = format!("mcts-run:{run_id}");
         let lease_keeper = spawn_lease_keeper(
             run_id.clone(),
@@ -258,7 +265,11 @@ impl<A: HostApplication> MctsRun<A> {
                 run_id: run_id.clone(),
                 session_id: format!("{run_id}-session"),
                 turn_id: format!("{run_id}-turn"),
-                root_state_id: self.request.root_state_id.clone(),
+                root_state_id: self
+                    .request
+                    .root_state_id
+                    .clone()
+                    .unwrap_or_default(),
                 goal: self.request.goal.clone(),
                 content: self.request.content.clone(),
                 budget: self.request.budget.clone(),
@@ -428,10 +439,13 @@ fn validate_request(request: &MctsRunRequest) -> Result<(), PluginHostError> {
             "run_id must not be empty".to_string(),
         ));
     }
-    if request.root_state_id.trim().is_empty() {
-        return Err(PluginHostError::Manifest(
-            "root_state_id must not be empty".to_string(),
-        ));
+    match request.root_state_id.as_deref() {
+        Some(root_state_id) if !root_state_id.trim().is_empty() => {}
+        _ => {
+            return Err(PluginHostError::Manifest(
+                "root_state_id must not be empty".to_string(),
+            ));
+        }
     }
     Ok(())
 }

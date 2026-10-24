@@ -14,9 +14,11 @@ use mcts_plugin_host::{
     MctsRunOutcome, MctsRunRequest, MctsRunStatus, RunMap,
 };
 use serde::{Deserialize, Serialize};
+use session_protocol::{SessionCheckpointDeleteRequest, SessionLeaseClaim};
 use xgovernor_core::{SecurityContext, SessionApplication};
 
 use super::mcts_host::RealSessionHostApplication;
+use super::mcts_root_state::prepare_native_root_state;
 
 #[derive(Clone)]
 pub struct MctsHttpState {
@@ -31,6 +33,8 @@ pub struct MctsLaunchConfig {
     python_bin: String,
     repo_root: PathBuf,
     spawn_enabled: bool,
+    base_url: String,
+    root_state_token: Option<String>,
 }
 
 impl Default for MctsLaunchConfig {
@@ -41,6 +45,9 @@ impl Default for MctsLaunchConfig {
                 .unwrap_or_else(|_| ".".to_string())
                 .into(),
             spawn_enabled: true,
+            base_url: std::env::var("XGOVERNOR_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
+            root_state_token: std::env::var("XGOVERNOR_ADMIN_TOKEN").ok(),
         }
     }
 }
@@ -83,6 +90,10 @@ struct MctsRunRecord {
     run_id: String,
     status: MctsRunStatus,
     request: MctsRunRequest,
+    #[serde(default)]
+    root_state_prepared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_state_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     outcome: Option<MctsRunOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,6 +105,8 @@ struct MctsRunView {
     run_id: String,
     status: MctsRunStatus,
     request: MctsRunRequest,
+    root_state_prepared: bool,
+    root_state_id: Option<String>,
     outcome: Option<MctsRunOutcome>,
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +123,8 @@ impl From<MctsRunRecord> for MctsRunView {
             run_id: record.run_id,
             status: record.status,
             request: record.request,
+            root_state_prepared: record.root_state_prepared,
+            root_state_id: record.root_state_id,
             outcome: record.outcome,
             error: record.error,
             protocol_jsonl,
@@ -142,6 +157,7 @@ pub fn mcts_router(state: MctsHttpState) -> Router {
 
 const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
     "ZSOFT_TASKS_DIR",
+    "ZSOFT_BUNDLE_DIR",
     "ZSOFT_BIN",
     "ZSOFT_SERVER_URL",
     "ZSOFT_BENCH_ROOT",
@@ -185,19 +201,49 @@ async fn create_run(
         request.run_id = uuid::Uuid::new_v4().to_string();
     }
 
-    let mut runs = state.runs.lock().map_err(|_| MctsApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: "mcts state lock poisoned".to_string(),
-    })?;
-    if runs.contains_key(&request.run_id) {
-        return Err(MctsApiError {
-            status: StatusCode::CONFLICT,
-            message: format!("run already exists: {}", request.run_id),
-        });
+    {
+        let runs = state.runs.lock().map_err(|_| MctsApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "mcts state lock poisoned".to_string(),
+        })?;
+        if runs.contains_key(&request.run_id) {
+            return Err(MctsApiError {
+                status: StatusCode::CONFLICT,
+                message: format!("run already exists: {}", request.run_id),
+            });
+        }
+    }
+
+    let mut root_state_prepared = false;
+    if state.config.spawn_enabled && request.root_state_id.is_none() {
+        let task_id = request.task_id.as_deref().ok_or_else(|| MctsApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "task_id is required when xg prepares the root state".to_string(),
+        })?;
+        let prepared = prepare_native_root_state(
+            &state.config.python_bin,
+            &state.config.repo_root,
+            &state.config.base_url,
+            state.config.root_state_token.as_deref(),
+            &request.mode,
+            task_id,
+            &request.run_id,
+        )
+        .await
+        .map_err(|error| MctsApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("native root-state preparation failed: {error}"),
+        })?;
+        request.root_state_id = Some(prepared.root_state_id);
+        root_state_prepared = true;
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
     if state.config.spawn_enabled {
+        let root_state_id = request.root_state_id.as_deref().ok_or_else(|| MctsApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "root_state_id must not be empty".to_string(),
+        })?;
         let run_map = RunMap::new();
         let run_tenant_id = ctx.tenant_id().map(str::to_string);
         if let Err(error) = run_map.register_run_with_tenant(&request.run_id, run_tenant_id) {
@@ -206,7 +252,7 @@ async fn create_run(
                 message: format!("failed to register MCTS run map: {error}"),
             });
         }
-        if let Err(error) = run_map.register_root_state(&request.run_id, &request.root_state_id) {
+        if let Err(error) = run_map.register_root_state(&request.run_id, root_state_id) {
             return Err(MctsApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: format!("failed to adopt root state: {error}"),
@@ -256,15 +302,23 @@ async fn create_run(
     } else {
         MctsRunStatus::Accepted
     };
+    let root_state_id = request.root_state_id.clone();
     let record = MctsRunRecord {
         run_id: request.run_id.clone(),
         status,
         request: request.clone(),
+        root_state_prepared,
+        root_state_id: request.root_state_id.clone(),
         outcome: None,
         error: None,
     };
-    runs.insert(record.run_id.clone(), record);
-    drop(runs);
+    {
+        let mut runs = state.runs.lock().map_err(|_| MctsApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "mcts state lock poisoned".to_string(),
+        })?;
+        runs.insert(record.run_id.clone(), record);
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -272,6 +326,8 @@ async fn create_run(
             run_id: request.run_id.clone(),
             status,
             request,
+            root_state_prepared,
+            root_state_id,
             outcome: None,
             error: None,
             protocol_jsonl: None,
@@ -298,30 +354,56 @@ fn spawn_mcts_task<A: HostApplication + 'static>(
 
     tokio::spawn(async move {
         let outcome = run.execute().await;
+        let mut prepared_state_id = None;
         if let Ok(mut records) = runs.lock() {
             if let Some(record) = records.get_mut(&run_id) {
-                if record.status == MctsRunStatus::Cancelled {
-                    if let Ok(mut map) = cancellations.lock() {
-                        map.remove(&run_id);
-                    }
-                    return;
+                if record.root_state_prepared {
+                    prepared_state_id = record.root_state_id.clone();
                 }
-                match outcome {
-                    Ok(mcts_outcome) => {
-                        record.status = mcts_outcome.status;
-                        record.outcome = Some(mcts_outcome);
-                    }
-                    Err(error) => {
-                        record.status = MctsRunStatus::Failed;
-                        record.error = Some(error.to_string());
+                if record.status != MctsRunStatus::Cancelled {
+                    match outcome {
+                        Ok(mcts_outcome) => {
+                            record.status = mcts_outcome.status;
+                            record.outcome = Some(mcts_outcome);
+                        }
+                        Err(error) => {
+                            record.status = MctsRunStatus::Failed;
+                            record.error = Some(error.to_string());
+                        }
                     }
                 }
             }
+        }
+        if let (Some(state_id), Some(session)) = (prepared_state_id, state.session.clone()) {
+            cleanup_prepared_root_state(&session, &run_id, &state_id).await;
         }
         if let Ok(mut map) = cancellations.lock() {
             map.remove(&run_id);
         }
     });
+}
+
+async fn cleanup_prepared_root_state(
+    session: &SessionApplication,
+    run_id: &str,
+    state_id: &str,
+) {
+    let result = session
+        .delete_checkpoint(
+            &SecurityContext::admin("system:mcts-worker"),
+            SessionCheckpointDeleteRequest {
+                checkpoint_id: state_id.to_string(),
+                lease: SessionLeaseClaim {
+                    client_id: Some(format!("mcts-run:{run_id}")),
+                    client_pid: None,
+                    client_hostname: None,
+                },
+            },
+        )
+        .await;
+    if let Err(error) = result {
+        tracing::warn!(run_id, state_id, error = %error, "MCTS prepared root state cleanup failed");
+    }
 }
 
 async fn get_run(
@@ -412,6 +494,36 @@ mod tests {
         assert_eq!(request.granted_capabilities.len(), 3);
     }
 
+    #[test]
+    fn parses_request_without_root_state_id() {
+        let mut body = request_json();
+        body.as_object_mut().unwrap().remove("root_state_id");
+        let request: MctsRunRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(request.root_state_id, None);
+    }
+
+    #[tokio::test]
+    async fn creates_run_without_root_state_id_when_spawn_disabled() {
+        let router = test_router();
+        let mut body = request_json();
+        body.as_object_mut().unwrap().remove("root_state_id");
+
+        let response = router
+            .oneshot(
+                Request::post("/api/v1/mcts/runs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let view: MctsRunView = serde_json::from_slice(&bytes).unwrap();
+        assert!(!view.root_state_prepared);
+        assert!(view.root_state_id.is_none());
+    }
+
     #[tokio::test]
     async fn creates_gets_and_cancels_run() {
         let router = test_router();
@@ -490,6 +602,8 @@ mod tests {
             python_bin,
             repo_root: repo_root.into(),
             spawn_enabled: true,
+            base_url: "http://127.0.0.1:8787".to_string(),
+            root_state_token: None,
         });
         let router = mcts_router(state);
         let run_id = format!("run-http-real-{}", std::process::id());
