@@ -211,6 +211,7 @@ impl<A: HostApplication> MctsRun<A> {
         let result = self.run_loop().await;
         lease_keeper.shutdown().await;
         let _ = self.cleanup_branches().await;
+        let _ = self.cleanup_states().await;
         result
     }
 
@@ -330,6 +331,24 @@ impl<A: HostApplication> MctsRun<A> {
                 );
             }
             let _ = run_map.remove_branch(&branch_id);
+        }
+        Ok(())
+    }
+
+    async fn cleanup_states(&self) -> Result<(), PluginHostError> {
+        let run_id = &self.request.run_id;
+        let run_map = self.host_cap_service.run_map();
+        let app = self.host_cap_service.application();
+        for state_id in run_map.list_run_host_states(run_id) {
+            if let Err(error) = app.delete_snapshot(run_id, &state_id).await {
+                tracing::warn!(
+                    run_id,
+                    state_id,
+                    error = %error,
+                    "MCTS snapshot delete failed during cleanup"
+                );
+            }
+            let _ = run_map.remove_state(&state_id);
         }
         Ok(())
     }

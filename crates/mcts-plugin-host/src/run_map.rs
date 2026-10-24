@@ -142,6 +142,24 @@ impl RunMap {
             .unwrap_or_default()
     }
 
+    /// Snapshot states produced through ``host.snapshot`` are owned by the run
+    /// for its whole lifetime. They are enumerated here so the run's terminal
+    /// cleanup can delete them. The adopted external root state has an empty
+    /// ``branch_id`` and is deliberately excluded.
+    pub fn list_run_host_states(&self, run_id: &str) -> Vec<String> {
+        self.inner
+            .read()
+            .map(|inner| {
+                inner
+                    .states
+                    .iter()
+                    .filter(|(_, state)| state.run_id == run_id && !state.branch_id.is_empty())
+                    .map(|(state_id, _)| state_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn remove_branch(&self, branch_id: &str) -> Result<(), PluginHostError> {
         let mut inner = self.inner.write().map_err(|_| {
             PluginHostError::Manifest("run map lock poisoned".to_string())
@@ -150,6 +168,19 @@ impl RunMap {
             Ok(())
         } else {
             Err(PluginHostError::BranchNotFound(branch_id.to_string()))
+        }
+    }
+
+    pub fn remove_state(&self, state_id: &str) -> Result<(), PluginHostError> {
+        let mut inner = self.inner.write().map_err(|_| {
+            PluginHostError::Manifest("run map lock poisoned".to_string())
+        })?;
+        if inner.states.remove(state_id).is_some() {
+            Ok(())
+        } else {
+            Err(PluginHostError::BranchNotFound(format!(
+                "state not found: {state_id}"
+            )))
         }
     }
 
@@ -355,6 +386,20 @@ mod tests {
         map.register_run("run-1").unwrap();
         map.add_branch("run-1", "branch-1", "state-root").unwrap();
         assert!(map.add_branch("run-1", "branch-1", "state-root").is_err());
+    }
+
+    #[test]
+    fn lists_host_owned_states_but_not_external_root_state() {
+        let map = RunMap::new();
+        map.register_run("run-1").unwrap();
+        map.register_root_state("run-1", "state-root").unwrap();
+        map.add_branch("run-1", "branch-1", "state-root").unwrap();
+        map.add_state("run-1", "state-1", "branch-1").unwrap();
+
+        let states = map.list_run_host_states("run-1");
+        assert_eq!(states, vec!["state-1".to_string()]);
+        assert!(map.remove_state("state-1").is_ok());
+        assert!(map.remove_state("state-1").is_err());
     }
 
     #[test]

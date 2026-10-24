@@ -65,6 +65,7 @@ pub trait HostApplication: Send + Sync {
         branch_id: &str,
         client_id: &str,
     ) -> Result<(), PluginHostError>;
+    async fn delete_snapshot(&self, run_id: &str, state_id: &str) -> Result<(), PluginHostError>;
     async fn diff(&self, run_id: &str, branch_id: &str, base_state_id: &str) -> Result<String, PluginHostError>;
     async fn release(&self, run_id: &str, branch_id: &str) -> Result<(), PluginHostError>;
     async fn wait_job(&self, run_id: &str, job_id: &str) -> Result<HostJobOutcome, PluginHostError>;
@@ -119,11 +120,16 @@ impl<A: HostApplication> HostCapService<A> {
         }
         match self.app.snapshot(&params.run_id, &params.branch_id).await {
             Ok(snapshot) => {
+                // Plugin-produced snapshots are immutable, run-owned artifacts.
+                // They must remain usable for the duration of the run (official
+                // evaluation and the final apply_plan happen after the source
+                // branch has been released), so do not propagate the source
+                // session's short lease expiry. Terminal cleanup deletes them.
                 if let Err(error) = self.run_map.add_state_with_metadata(
                     &params.run_id,
                     &snapshot.state_id,
                     &params.branch_id,
-                    snapshot.expires_at_ms,
+                    None,
                     snapshot.tenant_id.clone(),
                 ) {
                     return error_response(id, error.rpc_code(), error.to_string());
@@ -364,7 +370,10 @@ impl HostApplication for FakeApplication {
                 HostSnapshot {
                     state_id: format!("state-{branch_id}"),
                     expires_at: "2026-12-31T23:59:59Z".to_string(),
-                    expires_at_ms: None,
+                    // The fake host emulates the real session lease expiry.
+                    // The service must discard it and store the snapshot as a
+                    // run-owned, non-expiring artifact.
+                    expires_at_ms: Some(123),
                     tenant_id: None,
                 }
             })
@@ -467,6 +476,15 @@ impl HostApplication for FakeApplication {
             .lock()
             .map(|mut state| {
                 state.calls.push(format!("heartbeat:{branch_id}:{client_id}"));
+            })
+            .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
+    }
+
+    async fn delete_snapshot(&self, _run_id: &str, state_id: &str) -> Result<(), PluginHostError> {
+        self.state
+            .lock()
+            .map(|mut state| {
+                state.calls.push(format!("delete_snapshot:{state_id}"));
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
@@ -681,6 +699,12 @@ mod tests {
         let state_id = snapshot_result["state_id"].as_str().unwrap().to_string();
         assert!(state_id.starts_with("state-"));
         assert!(snapshot_result["expires_at"].as_str().is_some());
+        assert!(service
+            .run_map()
+            .state_record(&state_id)
+            .unwrap()
+            .expires_at_ms
+            .is_none());
 
         let agent = service
             .handle(

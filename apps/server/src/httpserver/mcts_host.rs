@@ -15,10 +15,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
 use session_protocol::{
     LlmApi, LlmOverrideRequest, SessionCapabilityRequest, SessionCheckpointRequest,
-    SessionCheckpointScope, SessionEntryContext, SessionEvent, SessionExecRequest,
-    SessionExtensions, SessionFileReadRequest, SessionFileWriteRequest, SessionLeaseClaim,
-    SessionLoadRequest, SessionRuntimeCapability, SessionSandboxCapability, SessionTurnRequest,
-    SessionUsage,
+    SessionCheckpointDeleteRequest, SessionCheckpointScope, SessionEntryContext, SessionEvent,
+    SessionExecRequest, SessionExtensions, SessionFileReadRequest, SessionFileWriteRequest,
+    SessionLeaseClaim, SessionLoadRequest, SessionRuntimeCapability, SessionSandboxCapability,
+    SessionTurnRequest, SessionUsage,
 };
 use xgovernor_core::{SecurityContext, SessionApplication, SessionDomainError};
 
@@ -475,6 +475,24 @@ impl HostApplication for RealSessionHostApplication {
     ) -> Result<(), PluginHostError> {
         self.session
             .heartbeat(&self.ctx, branch_id, self.lease())
+            .await
+            .map_err(Self::session_error)?;
+        Ok(())
+    }
+
+    async fn delete_snapshot(
+        &self,
+        _run_id: &str,
+        state_id: &str,
+    ) -> Result<(), PluginHostError> {
+        self.session
+            .delete_checkpoint(
+                &self.ctx,
+                SessionCheckpointDeleteRequest {
+                    checkpoint_id: state_id.to_string(),
+                    lease: self.lease(),
+                },
+            )
             .await
             .map_err(Self::session_error)?;
         Ok(())
