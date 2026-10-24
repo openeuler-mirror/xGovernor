@@ -204,7 +204,9 @@ impl<A: HostApplication> MctsRun<A> {
             .root_state_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| PluginHostError::Manifest("root_state_id must not be empty".to_string()))?;
+            .ok_or_else(|| {
+                PluginHostError::Manifest("root_state_id must not be empty".to_string())
+            })?;
         run_map.register_root_state(&run_id, root_state_id)?;
         let client_id = format!("mcts-run:{run_id}");
         let lease_keeper = spawn_lease_keeper(
@@ -265,11 +267,7 @@ impl<A: HostApplication> MctsRun<A> {
                 run_id: run_id.clone(),
                 session_id: format!("{run_id}-session"),
                 turn_id: format!("{run_id}-turn"),
-                root_state_id: self
-                    .request
-                    .root_state_id
-                    .clone()
-                    .unwrap_or_default(),
+                root_state_id: self.request.root_state_id.clone().unwrap_or_default(),
                 goal: self.request.goal.clone(),
                 content: self.request.content.clone(),
                 budget: self.request.budget.clone(),

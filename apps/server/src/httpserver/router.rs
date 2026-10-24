@@ -102,6 +102,7 @@ async fn operation_timeout(
         | "/api/v1/sessions/load"
         | "/api/v1/sessions/checkpoint"
         | "/api/v1/sessions/fork" => Duration::from_secs(900),
+        "/api/v1/mcts/runs" => Duration::from_secs(900),
         _ => REQUEST_TIMEOUT,
     };
     match tokio::time::timeout(budget, next.run(request)).await {

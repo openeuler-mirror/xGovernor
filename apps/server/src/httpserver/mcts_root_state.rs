@@ -7,9 +7,12 @@
 //! single JSON object so the host can parse it without scraping diagnostics.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::Command;
+
+const ROOT_STATE_PREPARE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedRootState {
@@ -59,9 +62,9 @@ pub(crate) async fn prepare_native_root_state(
         command.arg("--token").arg(token);
     }
 
-    let output = command
-        .output()
+    let output = tokio::time::timeout(ROOT_STATE_PREPARE_TIMEOUT, command.output())
         .await
+        .map_err(|_| "root-state prepare CLI timed out".to_string())?
         .map_err(|error| format!("failed to launch root-state prepare CLI: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

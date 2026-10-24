@@ -240,10 +240,13 @@ async fn create_run(
 
     let cancel = Arc::new(AtomicBool::new(false));
     if state.config.spawn_enabled {
-        let root_state_id = request.root_state_id.as_deref().ok_or_else(|| MctsApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "root_state_id must not be empty".to_string(),
-        })?;
+        let root_state_id = request
+            .root_state_id
+            .as_deref()
+            .ok_or_else(|| MctsApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "root_state_id must not be empty".to_string(),
+            })?;
         let run_map = RunMap::new();
         let run_tenant_id = ctx.tenant_id().map(str::to_string);
         if let Err(error) = run_map.register_run_with_tenant(&request.run_id, run_tenant_id) {
@@ -383,11 +386,7 @@ fn spawn_mcts_task<A: HostApplication + 'static>(
     });
 }
 
-async fn cleanup_prepared_root_state(
-    session: &SessionApplication,
-    run_id: &str,
-    state_id: &str,
-) {
+async fn cleanup_prepared_root_state(session: &SessionApplication, run_id: &str, state_id: &str) {
     let result = session
         .delete_checkpoint(
             &SecurityContext::admin("system:mcts-worker"),
