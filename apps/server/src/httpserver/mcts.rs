@@ -148,7 +148,6 @@ const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
     "PYTHONPATH",
     "ZSOFT_TRIAL_SERVER_URL",
     "XIAOO_MCTS_TOKEN_FUSE_LIMIT",
-    "XIAOO_SUBMISSION_SELECTOR",
 ];
 
 fn collect_plugin_envs() -> Vec<(String, String)> {

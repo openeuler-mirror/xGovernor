@@ -15,6 +15,11 @@
           "owner": "xgovernor",
           "source": "res/task_plugins/zsoft/prompts/prompt_author_step.txt"
         },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_solver_init.txt"
+        },
         "solver-step": {
           "role": "solver_step",
           "owner": "xgovernor",
@@ -44,6 +49,11 @@
           "role": "author_step",
           "owner": "xgovernor",
           "source": "res/task_plugins/sweverified/prompts/prompt_author_step.txt"
+        },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/sweverified/prompts/prompt_solver_init.txt"
         },
         "solver-step": {
           "role": "solver_step",
