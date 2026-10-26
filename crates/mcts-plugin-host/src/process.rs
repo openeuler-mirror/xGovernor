@@ -75,6 +75,10 @@ impl PluginProcess {
         self.transport.send(message).await
     }
 
+    pub fn transport(&self) -> Arc<StdioTransport> {
+        self.transport.clone()
+    }
+
     pub async fn next_message(&self) -> Result<RpcEnvelope, PluginHostError> {
         self.transport.next_message().await
     }

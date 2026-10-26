@@ -15,6 +15,8 @@ use mcts_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 
 use crate::apply_plan::ApplyPlanValidator;
 use crate::error::PluginHostError;
@@ -25,9 +27,13 @@ use crate::llm_policy::LlmPolicy;
 use crate::manifest::PLUGIN_ID;
 use crate::process::PluginProcess;
 use crate::run_map::JobStatus;
+use crate::stdio::StdioTransport;
 
 pub const DEFAULT_RUN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_WAIT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+type ProtocolBuffer = Arc<Mutex<Option<String>>>;
+type BackgroundError = Arc<Mutex<Option<PluginHostError>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,7 +138,7 @@ pub struct MctsRun<A: HostApplication> {
     cancel: Arc<AtomicBool>,
 }
 
-impl<A: HostApplication> MctsRun<A> {
+impl<A: HostApplication + 'static> MctsRun<A> {
     pub fn new(
         command: Command,
         envs: Vec<(String, String)>,
@@ -239,6 +245,9 @@ impl<A: HostApplication> MctsRun<A> {
             status: MctsRunStatus::Accepted,
             ..RunProgress::default()
         };
+        let protocol: ProtocolBuffer = Arc::new(Mutex::new(None));
+        let background_error: BackgroundError = Arc::new(Mutex::new(None));
+        let mut background_jobs = JoinSet::new();
 
         let initialize_response = request_and_dispatch(
             &process,
@@ -253,6 +262,9 @@ impl<A: HostApplication> MctsRun<A> {
             })?,
             self.request_timeout,
             &mut progress,
+            &protocol,
+            &background_error,
+            &mut background_jobs,
         )
         .await?;
         ensure_response_ok(&initialize_response)?;
@@ -275,6 +287,9 @@ impl<A: HostApplication> MctsRun<A> {
             })?,
             self.request_timeout,
             &mut progress,
+            &protocol,
+            &background_error,
+            &mut background_jobs,
         )
         .await?;
         ensure_response_ok(&start_response)?;
@@ -303,6 +318,9 @@ impl<A: HostApplication> MctsRun<A> {
                 })?,
                 self.request_timeout,
                 &mut progress,
+                &protocol,
+                &background_error,
+                &mut background_jobs,
             )
             .await?;
             ensure_response_ok(&wait_response)?;
@@ -322,7 +340,14 @@ impl<A: HostApplication> MctsRun<A> {
             }
         }
 
+        let background_error = background_error.lock().await.take();
+        background_jobs.abort_all();
+        while background_jobs.join_next().await.is_some() {}
         let _ = process.shutdown().await;
+        if let Some(error) = background_error {
+            return Err(error);
+        }
+        progress.protocol = protocol.lock().await.take();
         Ok(progress.into_outcome())
     }
 
@@ -456,7 +481,7 @@ struct WaitSnapshot {
     sequence: u64,
 }
 
-async fn request_and_dispatch<A: HostApplication>(
+async fn request_and_dispatch<A: HostApplication + 'static>(
     process: &PluginProcess,
     host_cap_service: &Arc<HostCapService<A>>,
     id: &str,
@@ -464,6 +489,9 @@ async fn request_and_dispatch<A: HostApplication>(
     params: Value,
     timeout: Duration,
     progress: &mut RunProgress,
+    protocol: &ProtocolBuffer,
+    background_error: &BackgroundError,
+    background_jobs: &mut JoinSet<()>,
 ) -> Result<Response, PluginHostError> {
     let request = RpcEnvelope::Request(Request {
         jsonrpc: JSONRPC_VERSION.to_string(),
@@ -471,14 +499,17 @@ async fn request_and_dispatch<A: HostApplication>(
         method,
         params,
     });
-    append_protocol(&mut progress.protocol, &request)?;
+    append_protocol(protocol, &request).await?;
     process.send(&request).await?;
 
     loop {
+        if let Some(error) = background_error.lock().await.take() {
+            return Err(error);
+        }
         let message = tokio::time::timeout(timeout, process.next_message())
             .await
             .map_err(|_| PluginHostError::DeadlineExceeded)??;
-        append_protocol(&mut progress.protocol, &message)?;
+        append_protocol(protocol, &message).await?;
 
         match message {
             RpcEnvelope::Response(response) => {
@@ -496,17 +527,31 @@ async fn request_and_dispatch<A: HostApplication>(
                     .await;
                 let response_for_job = response.clone();
                 let response_envelope = RpcEnvelope::Response(response);
-                append_protocol(&mut progress.protocol, &response_envelope)?;
+                append_protocol(protocol, &response_envelope).await?;
                 process.send(&response_envelope).await?;
-                send_host_job_events(
-                    process,
-                    host_cap_service,
-                    &request.method,
-                    &request.params,
-                    &response_for_job,
-                    &mut progress.protocol,
-                )
-                .await?;
+                let transport = process.transport();
+                let host_cap_service = host_cap_service.clone();
+                let protocol = protocol.clone();
+                let background_error = background_error.clone();
+                let request_method = request.method.clone();
+                let request_params = request.params.clone();
+                background_jobs.spawn(async move {
+                    if let Err(error) = send_host_job_events(
+                        &transport,
+                        &host_cap_service,
+                        &request_method,
+                        &request_params,
+                        &response_for_job,
+                        &protocol,
+                    )
+                    .await
+                    {
+                        let mut slot = background_error.lock().await;
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                    }
+                });
             }
             RpcEnvelope::Notification(notification) => {
                 apply_notification(
@@ -573,12 +618,12 @@ fn apply_notification<A: HostApplication>(
 }
 
 async fn send_host_job_events<A: HostApplication>(
-    process: &PluginProcess,
+    transport: &Arc<StdioTransport>,
     host_cap_service: &Arc<HostCapService<A>>,
     method: &MethodName,
     request_params: &Value,
     response: &Response,
-    protocol: &mut Option<String>,
+    protocol: &ProtocolBuffer,
 ) -> Result<(), PluginHostError> {
     if !matches!(method, MethodName::HostAgentTurn | MethodName::HostExec) {
         return Ok(());
@@ -597,8 +642,8 @@ async fn send_host_job_events<A: HostApplication>(
         .unwrap_or_default();
 
     let started = JobNotifier::started(run_id, job_id, 1);
-    append_protocol(protocol, &started)?;
-    process.send(&started).await?;
+    append_protocol(protocol, &started).await?;
+    transport.send(&started).await?;
 
     let app = host_cap_service.application();
     let outcome = app.wait_job(run_id, job_id).await?;
@@ -625,20 +670,21 @@ async fn send_host_job_events<A: HostApplication>(
             )));
         }
     };
-    append_protocol(protocol, &terminal)?;
-    process.send(&terminal).await?;
+    append_protocol(protocol, &terminal).await?;
+    transport.send(&terminal).await?;
     let _ = host_cap_service
         .run_map()
         .set_job_status(job_id, outcome.status);
     Ok(())
 }
 
-fn append_protocol(
-    protocol: &mut Option<String>,
+async fn append_protocol(
+    protocol: &ProtocolBuffer,
     envelope: &RpcEnvelope,
 ) -> Result<(), PluginHostError> {
     let line = serde_json::to_string(envelope)?;
-    let buffer = protocol.get_or_insert_with(String::new);
+    let mut guard = protocol.lock().await;
+    let buffer = guard.get_or_insert_with(String::new);
     buffer.push_str(&line);
     buffer.push('\n');
     Ok(())

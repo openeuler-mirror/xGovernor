@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -7,6 +9,7 @@ use mcts_protocol::{Failure, MethodName, Response, RpcErrorCode, RpcId};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::time::timeout;
 
 use crate::error::PluginHostError;
 use crate::manifest::PLUGIN_ID;
@@ -118,7 +121,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.snapshot(&params.run_id, &params.branch_id).await {
+        match with_timeout(params.timeout_ms, self.app.snapshot(&params.run_id, &params.branch_id)).await {
             Ok(snapshot) => {
                 // Plugin-produced snapshots are immutable, run-owned artifacts.
                 // They must remain usable for the duration of the run (official
@@ -154,7 +157,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_state(&params.parent_state_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.fork(&params.run_id, &params.parent_state_id).await {
+        match with_timeout(params.timeout_ms, self.app.fork(&params.run_id, &params.parent_state_id)).await {
             Ok(branch_id) => {
                 if let Err(error) = self.run_map.add_branch(&params.run_id, &branch_id, &params.parent_state_id) {
                     return error_response(id, error.rpc_code(), error.to_string());
@@ -176,10 +179,12 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self
-            .app
-            .agent_turn(&params.run_id, &params.branch_id, &params.input, params.profile.as_deref())
-            .await
+        match with_timeout(
+            params.timeout_ms,
+            self.app
+                .agent_turn(&params.run_id, &params.branch_id, &params.input, params.profile.as_deref()),
+        )
+        .await
         {
             Ok(job_id) => {
                 if let Err(error) = self.run_map.add_job(&params.run_id, &params.branch_id, &job_id) {
@@ -202,7 +207,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.inspect(&params.run_id, &params.branch_id, &params.view).await {
+        match with_timeout(params.timeout_ms, self.app.inspect(&params.run_id, &params.branch_id, &params.view)).await {
             Ok(content) => ok_response(id, json!({"content": content})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
@@ -219,7 +224,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.exec(&params.run_id, &params.branch_id, &params.argv, &params.cwd).await {
+        match with_timeout(params.timeout_ms, self.app.exec(&params.run_id, &params.branch_id, &params.argv, &params.cwd)).await {
             Ok(job_id) => {
                 if let Err(error) = self.run_map.add_job(&params.run_id, &params.branch_id, &job_id) {
                     return error_response(id, error.rpc_code(), error.to_string());
@@ -241,7 +246,11 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        let read_result = self.app.file_read(&params.run_id, &params.branch_id, &params.path).await;
+        let read_result = with_timeout(
+            params.timeout_ms,
+            self.app.file_read(&params.run_id, &params.branch_id, &params.path),
+        )
+        .await;
         if let Err(error) = &read_result {
             tracing::warn!(
                 branch_id = %params.branch_id,
@@ -277,7 +286,7 @@ impl<A: HostApplication> HostCapService<A> {
                 );
             }
         };
-        match self.app.file_write(&params.run_id, &params.branch_id, &params.path, &data).await {
+        match with_timeout(params.timeout_ms, self.app.file_write(&params.run_id, &params.branch_id, &params.path, &data)).await {
             Ok(bytes_written) => ok_response(id, json!({"written_bytes": bytes_written})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
@@ -294,7 +303,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.diff(&params.run_id, &params.branch_id, &params.base_state_id).await {
+        match with_timeout(params.timeout_ms, self.app.diff(&params.run_id, &params.branch_id, &params.base_state_id)).await {
             Ok(diff) => ok_response(id, json!({"content": diff})),
             Err(error) => error_response(id, error.rpc_code(), error.to_string()),
         }
@@ -311,7 +320,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_branch_in_run(&params.run_id, &params.branch_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match self.app.release(&params.run_id, &params.branch_id).await {
+        match with_timeout(params.timeout_ms, self.app.release(&params.run_id, &params.branch_id)).await {
             Ok(()) => {
                 let _ = self.run_map.remove_branch(&params.branch_id);
                 ok_response(id, json!({"released": true}))
@@ -522,6 +531,16 @@ impl HostApplication for FakeApplication {
                 }
             })
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
+    }
+}
+
+async fn with_timeout<T, F>(timeout_ms: u64, future: F) -> Result<T, PluginHostError>
+where
+    F: Future<Output = Result<T, PluginHostError>>,
+{
+    match timeout(Duration::from_millis(timeout_ms.max(1)), future).await {
+        Ok(result) => result,
+        Err(_) => Err(PluginHostError::DeadlineExceeded),
     }
 }
 
@@ -794,6 +813,21 @@ mod tests {
             .await;
         let release_result = release.result.unwrap();
         assert_eq!(release_result["released"], true);
+    }
+
+    #[tokio::test]
+    async fn with_timeout_returns_deadline_exceeded() {
+        use std::time::Duration;
+
+        let result: Result<(), PluginHostError> = with_timeout(
+            1,
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(PluginHostError::DeadlineExceeded)));
     }
 
     #[tokio::test]
