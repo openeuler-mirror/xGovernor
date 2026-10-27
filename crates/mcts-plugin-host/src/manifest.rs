@@ -9,6 +9,10 @@ pub const PLUGIN_ID: &str = "mcts";
 pub const PROFILE_OWNER: &str = "xgovernor";
 pub const TASK_PLUGIN_PREFIX: &str = "res/task_plugins/";
 
+fn default_true() -> bool {
+    true
+}
+
 fn ensure_task_plugins_path(value: &str) -> Result<String, PluginHostError> {
     let normalized = value.replace('\\', "/");
     let path = Path::new(&normalized);
@@ -71,6 +75,8 @@ pub struct ProfileManifest {
     pub role: String,
     pub owner: String,
     pub source: String,
+    #[serde(default = "default_true")]
+    pub tools_enabled: bool,
 }
 
 impl PluginManifest {
@@ -185,5 +191,33 @@ mod tests {
         manifest.modes.get_mut("zsoft").unwrap()
             .profiles.get_mut("solver-step").unwrap().owner = "plugin".into();
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn defaults_tools_enabled_to_true() {
+        assert!(valid_manifest().profile("zsoft", "solver-step").unwrap().tools_enabled);
+    }
+
+    #[test]
+    fn accepts_explicit_tools_disabled() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "plugin_id": "mcts",
+            "resource_root": "testcases_union",
+            "modes": {
+                "zsoft": {
+                    "task_plugin_root": "res/task_plugins/zsoft",
+                    "profiles": {
+                        "memory-merge": {
+                            "role": "memory_merge",
+                            "owner": "xgovernor",
+                            "source": "res/task_plugins/common/prompts/prompt_memory_merge.txt",
+                            "tools_enabled": false
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(!manifest.profile("zsoft", "memory-merge").unwrap().tools_enabled);
     }
 }

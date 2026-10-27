@@ -165,6 +165,7 @@ const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
     "ZSOFT_TRIAL_SERVER_URL",
     "XIAOO_MCTS_TOKEN_FUSE_LIMIT",
     "XIAOO_MCTS_MAX_CONCURRENT",
+    "XIAOO_MCTS_MEMORY_POOL",
 ];
 
 fn collect_plugin_envs() -> Vec<(String, String)> {

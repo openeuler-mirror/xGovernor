@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::error::PluginHostError;
-use crate::manifest::PluginManifest;
+use crate::manifest::{PluginManifest, ProfileManifest};
 
 pub struct ProfileRegistry {
     manifest: PluginManifest,
@@ -22,6 +22,10 @@ impl ProfileRegistry {
         let path = self.manifest.resolve_profile_path(mode, profile, &self.repo_root)?;
         let template = std::fs::read_to_string(path)?;
         Ok(render_template(&template, payload))
+    }
+
+    pub fn profile(&self, mode: &str, profile: &str) -> Result<&ProfileManifest, PluginHostError> {
+        self.manifest.profile(mode, profile)
     }
 
     pub fn template_path(&self, mode: &str, profile: &str) -> Result<PathBuf, PluginHostError> {

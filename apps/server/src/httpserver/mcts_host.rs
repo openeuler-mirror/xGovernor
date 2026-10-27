@@ -157,12 +157,13 @@ impl RealSessionHostApplication {
     ) -> Result<SessionTurnRequest, PluginHostError> {
         let mut ext = SessionExtensions::new();
         if let Some(profile) = profile {
+            let profile_manifest = self.profile_registry.profile(&self.mode, profile)?;
             let system_prompt = self
                 .profile_registry
                 .resolve(&self.mode, profile, &json!({}))?;
             ext.insert(
                 "runtime_pi".to_string(),
-                json!({"system_prompt": system_prompt, "tools_enabled": true}),
+                json!({"system_prompt": system_prompt, "tools_enabled": profile_manifest.tools_enabled}),
             );
         }
         Ok(SessionTurnRequest {
