@@ -168,10 +168,25 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
         return;
     }
 
-    if message == "trigger-interaction" {
+    if message == "trigger-hung-turn" {
+        run_hung_scenario();
+    } else if message == "trigger-interaction" {
         run_interaction_scenario(&id, rx);
     } else {
         run_cancellable_scenario(&message, rx);
+    }
+}
+
+/// Models a half-dead upstream LLM: the prompt was accepted, the process is
+/// healthy, but the model stream never produces another event and the `abort`
+/// command is ignored. Only killing the worker tree can end this turn.
+fn run_hung_scenario() {
+    emit(serde_json::json!({
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "waiting for a dead upstream"}
+    }));
+    loop {
+        thread::sleep(Duration::from_secs(60));
     }
 }
 
