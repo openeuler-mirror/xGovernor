@@ -578,6 +578,39 @@ async fn handle_native_message(native: &NativePi, message: Value) {
         "tool_execution_start" => handle_tool_start(native, &message).await,
         "tool_execution_end" => handle_tool_end(native, &message).await,
         "extension_ui_request" => handle_interaction(native, &message).await,
+        "extension_error" => {
+            // Native Pi may keep its RPC process alive without agent_settled
+            // after an extension fails. Surface the error on the worker
+            // protocol; the supervisor retires this worker before forwarding
+            // the failed terminal, preventing late events from reaching a
+            // subsequent turn.
+            native.active_turn.lock().await.take();
+            native.pending_responses.lock().await.clear();
+            // Startup has no registered supervisor instance yet, so also stop
+            // the native child here rather than leaving it alive on Ready failure.
+            let _ = native.child.lock().await.start_kill();
+            emit_error(
+                native,
+                RuntimeError::WorkerUnavailable {
+                    message: format!(
+                        "Pi extension '{}' failed during '{}': {}",
+                        message
+                            .get("extensionPath")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        message
+                            .get("event")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        message
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown extension error")
+                    ),
+                    retryable: true,
+                },
+            );
+        }
         "agent_settled" => handle_settled(native, &message).await,
         _ => {}
     }

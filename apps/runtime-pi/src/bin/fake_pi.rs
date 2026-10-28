@@ -154,6 +154,18 @@ fn handle_prompt(command: &serde_json::Value, rx: &mpsc::Receiver<serde_json::Va
         std::process::exit(23);
     }
 
+    if message == "trigger-extension-error" {
+        // Pi can report an extension failure without agent_settled and keep
+        // its RPC process alive. The adapter must not wait forever for EOF.
+        emit(serde_json::json!({
+            "type": "extension_error",
+            "extensionPath": "synthetic-extension",
+            "event": "before_agent_start",
+            "error": "synthetic extension failure"
+        }));
+        return;
+    }
+
     if message == "trigger-multiple-responses" {
         for _ in 0..2 {
             emit(serde_json::json!({

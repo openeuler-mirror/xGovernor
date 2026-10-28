@@ -1901,6 +1901,64 @@ async fn gate_is_released_after_a_stream_closes_without_a_terminal_event() {
     submit_when_gate_frees(&application, plain_turn_request(None)).await;
 }
 
+struct FullDiskRepository;
+
+#[async_trait]
+impl SessionRepository for FullDiskRepository {
+    async fn get(&self, _runtime_id: &str) -> Result<Option<SessionRecord>, SessionDomainError> {
+        Ok(Some(test_record()))
+    }
+    async fn save(&self, _record: SessionRecord) -> Result<(), SessionDomainError> {
+        Err(SessionDomainError::Internal {
+            message: "sqlite save failed: database or disk is full".into(),
+            source: None,
+        })
+    }
+    async fn list_active(
+        &self,
+        _tenant_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<SessionListPage, SessionDomainError> {
+        Ok(SessionListPage {
+            sessions: Vec::new(),
+            total_active: 0,
+        })
+    }
+}
+
+#[tokio::test]
+async fn accepted_turn_reports_failed_terminal_when_disk_full_prevents_state_persistence() {
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        test_provider_managers(),
+        Arc::new(FullDiskRepository),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    // Disk failure must neither swallow the terminal nor strand the turn gate.
+    for _ in 0..2 {
+        let submission = application
+            .submit_turn(&admin_ctx(), plain_turn_request(None))
+            .await
+            .unwrap();
+        let mut events = submission.events.unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match terminal {
+            SessionEvent::TurnFailed { error, .. } => {
+                assert_eq!(error.code, "runtime_state_persist_failed");
+                assert!(error.message.contains("database or disk is full"));
+            }
+            other => panic!("unpersisted completion must fail: {other:?}"),
+        }
+        assert!(events.recv().await.is_none());
+    }
+}
+
 // -- Phase 3: quota admission (§7 step 4) --------------------------------
 
 fn quota_tenant_ctx(max_sessions: u32) -> SecurityContext {
