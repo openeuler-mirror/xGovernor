@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::process::Command;
 
-const ROOT_STATE_PREPARE_TIMEOUT: Duration = Duration::from_secs(600);
+const ROOT_STATE_PREPARE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedRootState {

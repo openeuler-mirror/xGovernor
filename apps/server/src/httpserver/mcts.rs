@@ -166,6 +166,9 @@ const MCTS_PLUGIN_ENV_ALLOWLIST: &[&str] = &[
     "XIAOO_MCTS_TOKEN_FUSE_LIMIT",
     "XIAOO_MCTS_MAX_CONCURRENT",
     "XIAOO_MCTS_MEMORY_POOL",
+    "HF_ENDPOINT",
+    "HF_HOME",
+    "HF_DATASETS_CACHE",
 ];
 
 fn collect_plugin_envs() -> Vec<(String, String)> {
@@ -218,10 +221,15 @@ async fn create_run(
 
     let mut root_state_prepared = false;
     if state.config.spawn_enabled && request.root_state_id.is_none() {
-        let task_id = request.task_id.as_deref().ok_or_else(|| MctsApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "task_id is required when xg prepares the root state".to_string(),
-        })?;
+        let task_id = request
+            .task_id
+            .as_deref()
+            .or_else(|| request.instance_id.as_deref())
+            .ok_or_else(|| MctsApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "task_id or instance_id is required when xg prepares the root state"
+                    .to_string(),
+            })?;
         let prepared = prepare_native_root_state(
             &state.config.python_bin,
             &state.config.repo_root,

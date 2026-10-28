@@ -73,6 +73,8 @@ pub struct MctsRunRequest {
     pub instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testbench: Option<String>,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_state_id: Option<String>,
@@ -438,6 +440,9 @@ pub fn build_launch_command(
             }
             if let Some(split) = request.split.as_deref() {
                 command.arg("--split").arg(split);
+            }
+            if let Some(testbench) = request.testbench.as_deref() {
+                command.arg("--testbench").arg(testbench);
             }
         }
         _ => {}
