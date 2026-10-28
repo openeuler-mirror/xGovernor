@@ -1,0 +1,787 @@
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use mcts_protocol::messages::JSONRPC_VERSION;
+use mcts_protocol::methods::{Budget, PluginInitializeParams, PluginStartParams, PluginWaitParams};
+use mcts_protocol::notifications::{
+    PluginCancelledParams, PluginCompletedParams, PluginFailedParams,
+};
+use mcts_protocol::{
+    Capability, CompletionResult, Failure, MethodName, NotificationName, Request, Response,
+    RpcEnvelope, RpcId,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::process::Command;
+use tokio::sync::Mutex;
+use tokio::task::JoinSet;
+
+use crate::apply_plan::ApplyPlanValidator;
+use crate::error::PluginHostError;
+use crate::host_cap_service::{HostApplication, HostCapService};
+use crate::job_notifier::JobNotifier;
+use crate::lease_keeper::{spawn_lease_keeper, DEFAULT_HEARTBEAT_INTERVAL};
+use crate::llm_policy::LlmPolicy;
+use crate::manifest::PLUGIN_ID;
+use crate::process::PluginProcess;
+use crate::run_map::JobStatus;
+use crate::stdio::StdioTransport;
+
+pub const DEFAULT_RUN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_WAIT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
+type ProtocolBuffer = Arc<Mutex<Option<String>>>;
+type BackgroundError = Arc<Mutex<Option<PluginHostError>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MctsRunStatus {
+    Accepted,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Default for MctsRunStatus {
+    fn default() -> Self {
+        Self::Accepted
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MctsRunRequest {
+    pub plugin_id: String,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub testbench: Option<String>,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_state_id: Option<String>,
+    pub goal: String,
+    pub content: String,
+    pub budget: Budget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmConfig>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub granted_capabilities: BTreeSet<Capability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MctsRunOutcome {
+    pub status: MctsRunStatus,
+    pub sequence: u64,
+    pub summary: Option<String>,
+    pub result: Option<CompletionResult>,
+    pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RunProgress {
+    status: MctsRunStatus,
+    sequence: u64,
+    summary: Option<String>,
+    result: Option<CompletionResult>,
+    failure: Option<Failure>,
+    protocol: Option<String>,
+}
+
+impl RunProgress {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            MctsRunStatus::Completed | MctsRunStatus::Failed | MctsRunStatus::Cancelled
+        )
+    }
+
+    fn into_outcome(self) -> MctsRunOutcome {
+        MctsRunOutcome {
+            status: self.status,
+            sequence: self.sequence,
+            summary: self.summary,
+            result: self.result,
+            failure: self.failure,
+            protocol: self.protocol,
+        }
+    }
+}
+
+pub struct MctsRun<A: HostApplication> {
+    command: Command,
+    envs: Vec<(String, String)>,
+    request: MctsRunRequest,
+    host_cap_service: Arc<HostCapService<A>>,
+    llm_policy: LlmPolicy,
+    request_timeout: Duration,
+    wait_poll_timeout: Duration,
+    available_capabilities: BTreeSet<Capability>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl<A: HostApplication + 'static> MctsRun<A> {
+    pub fn new(
+        command: Command,
+        envs: Vec<(String, String)>,
+        request: MctsRunRequest,
+        host_cap_service: Arc<HostCapService<A>>,
+    ) -> Self {
+        Self {
+            command,
+            envs,
+            request,
+            host_cap_service,
+            llm_policy: LlmPolicy::default_for_mcts(),
+            request_timeout: DEFAULT_RUN_REQUEST_TIMEOUT,
+            wait_poll_timeout: DEFAULT_WAIT_POLL_TIMEOUT,
+            available_capabilities: all_capabilities(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    pub fn with_wait_poll_timeout(mut self, timeout: Duration) -> Self {
+        self.wait_poll_timeout = timeout;
+        self
+    }
+
+    pub fn with_available_capabilities(mut self, capabilities: BTreeSet<Capability>) -> Self {
+        self.available_capabilities = capabilities;
+        self
+    }
+
+    pub fn with_llm_policy(mut self, llm_policy: LlmPolicy) -> Self {
+        self.llm_policy = llm_policy;
+        self
+    }
+
+    pub fn resolved_llm(&self) -> String {
+        self.llm_policy.resolve(
+            self.request
+                .llm
+                .as_ref()
+                .and_then(|llm| llm.model.as_deref()),
+        )
+    }
+
+    pub async fn execute(mut self) -> Result<MctsRunOutcome, PluginHostError>
+    where
+        A: 'static,
+    {
+        validate_request(&self.request)?;
+
+        let run_id = self.request.run_id.clone();
+        let run_map = self.host_cap_service.run_map();
+        run_map.ensure_run(&run_id)?;
+        let root_state_id = self
+            .request
+            .root_state_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                PluginHostError::Manifest("root_state_id must not be empty".to_string())
+            })?;
+        run_map.register_root_state(&run_id, root_state_id)?;
+        let client_id = format!("mcts-run:{run_id}");
+        let lease_keeper = spawn_lease_keeper(
+            run_id.clone(),
+            run_map.clone(),
+            self.host_cap_service.application(),
+            client_id,
+            DEFAULT_HEARTBEAT_INTERVAL,
+        );
+
+        let result = self.run_loop().await;
+        lease_keeper.shutdown().await;
+        let _ = self.cleanup_branches().await;
+        let _ = self.cleanup_states().await;
+        result
+    }
+
+    async fn run_loop(&mut self) -> Result<MctsRunOutcome, PluginHostError> {
+        let plugin_id = self.request.plugin_id.clone();
+        let run_id = self.request.run_id.clone();
+
+        let envs: Vec<(&str, &str)> = self
+            .envs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        self.llm_policy.validate_env(&envs)?;
+        let process = PluginProcess::spawn_isolated(&mut self.command, &envs).await?;
+        let mut progress = RunProgress {
+            status: MctsRunStatus::Accepted,
+            ..RunProgress::default()
+        };
+        let protocol: ProtocolBuffer = Arc::new(Mutex::new(None));
+        let background_error: BackgroundError = Arc::new(Mutex::new(None));
+        let mut background_jobs = JoinSet::new();
+
+        let initialize_response = request_and_dispatch(
+            &process,
+            &self.host_cap_service,
+            "mcts-run-initialize",
+            MethodName::PluginInitialize,
+            serde_json::to_value(PluginInitializeParams {
+                plugin_id: plugin_id.clone(),
+                supported_api_versions: vec!["mcts.rpc.v1".to_string()],
+                host_version: "xgovernor-dev".to_string(),
+                available_capabilities: self.available_capabilities.clone(),
+            })?,
+            self.request_timeout,
+            &mut progress,
+            &protocol,
+            &background_error,
+            &mut background_jobs,
+        )
+        .await?;
+        ensure_response_ok(&initialize_response)?;
+
+        let start_response = request_and_dispatch(
+            &process,
+            &self.host_cap_service,
+            "mcts-run-start",
+            MethodName::PluginStart,
+            serde_json::to_value(PluginStartParams {
+                plugin_id: plugin_id.clone(),
+                run_id: run_id.clone(),
+                session_id: format!("{run_id}-session"),
+                turn_id: format!("{run_id}-turn"),
+                root_state_id: self.request.root_state_id.clone().unwrap_or_default(),
+                goal: self.request.goal.clone(),
+                content: self.request.content.clone(),
+                budget: self.request.budget.clone(),
+                granted_capabilities: self.request.granted_capabilities.clone(),
+            })?,
+            self.request_timeout,
+            &mut progress,
+            &protocol,
+            &background_error,
+            &mut background_jobs,
+        )
+        .await?;
+        ensure_response_ok(&start_response)?;
+
+        if progress.status == MctsRunStatus::Accepted {
+            progress.status = MctsRunStatus::Running;
+        }
+
+        let mut after_sequence = 0u64;
+        while !progress.is_terminal() {
+            if self.is_cancelled() {
+                progress.status = MctsRunStatus::Cancelled;
+                progress.summary = Some("cancelled by host".to_string());
+                break;
+            }
+            let wait_response = request_and_dispatch(
+                &process,
+                &self.host_cap_service,
+                "mcts-run-wait",
+                MethodName::PluginWait,
+                serde_json::to_value(PluginWaitParams {
+                    plugin_id: plugin_id.clone(),
+                    run_id: run_id.clone(),
+                    after_sequence,
+                    timeout_ms: self.wait_poll_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                })?,
+                self.request_timeout,
+                &mut progress,
+                &protocol,
+                &background_error,
+                &mut background_jobs,
+            )
+            .await?;
+            ensure_response_ok(&wait_response)?;
+
+            let snapshot: WaitSnapshot =
+                serde_json::from_value(wait_response.result.clone().ok_or_else(|| {
+                    PluginHostError::InvalidResponse("missing wait result".to_string())
+                })?)?;
+            after_sequence = after_sequence.max(snapshot.sequence);
+
+            if snapshot.status == "completed" {
+                progress.status = MctsRunStatus::Completed;
+            } else if snapshot.status == "failed" {
+                progress.status = MctsRunStatus::Failed;
+            } else if snapshot.status == "cancelled" {
+                progress.status = MctsRunStatus::Cancelled;
+            }
+        }
+
+        let background_error = background_error.lock().await.take();
+        background_jobs.abort_all();
+        while background_jobs.join_next().await.is_some() {}
+        let _ = process.shutdown().await;
+        if let Some(error) = background_error {
+            return Err(error);
+        }
+        progress.protocol = protocol.lock().await.take();
+        Ok(progress.into_outcome())
+    }
+
+    async fn cleanup_branches(&self) -> Result<(), PluginHostError> {
+        let run_id = &self.request.run_id;
+        let run_map = self.host_cap_service.run_map();
+        let app = self.host_cap_service.application();
+        for branch_id in run_map.list_run_branches(run_id) {
+            if let Err(error) = app.release(run_id, &branch_id).await {
+                tracing::warn!(
+                    run_id,
+                    branch_id,
+                    error = %error,
+                    "MCTS branch release failed during cleanup"
+                );
+            }
+            let _ = run_map.remove_branch(&branch_id);
+        }
+        Ok(())
+    }
+
+    async fn cleanup_states(&self) -> Result<(), PluginHostError> {
+        let run_id = &self.request.run_id;
+        let run_map = self.host_cap_service.run_map();
+        let app = self.host_cap_service.application();
+        for state_id in run_map.list_run_host_states(run_id) {
+            if let Err(error) = app.delete_snapshot(run_id, &state_id).await {
+                tracing::warn!(
+                    run_id,
+                    state_id,
+                    error = %error,
+                    "MCTS snapshot delete failed during cleanup"
+                );
+            }
+            let _ = run_map.remove_state(&state_id);
+        }
+        Ok(())
+    }
+}
+
+fn all_capabilities() -> BTreeSet<Capability> {
+    [
+        Capability::Snapshot,
+        Capability::Fork,
+        Capability::AgentTurn,
+        Capability::Inspect,
+        Capability::Exec,
+        Capability::FileRead,
+        Capability::FileWrite,
+        Capability::Diff,
+        Capability::Release,
+    ]
+    .into_iter()
+    .collect()
+}
+
+pub fn build_launch_command(
+    python_bin: impl AsRef<std::ffi::OsStr>,
+    repo_root: impl AsRef<std::path::Path>,
+    request: &MctsRunRequest,
+) -> Command {
+    let mut command = Command::new(python_bin);
+    match request.mode.as_str() {
+        "mock" => {
+            command
+                .arg("-m")
+                .arg("testcases_union.core.main")
+                .arg("--mock");
+        }
+        "zsoft" => {
+            command
+                .arg("-m")
+                .arg("testcases_union.core.main")
+                .arg("--mode")
+                .arg("zsoft");
+            if let Some(task_id) = request.task_id.as_deref() {
+                command.arg("--task-id").arg(task_id);
+            }
+        }
+        "sweverified" => {
+            command
+                .arg("-m")
+                .arg("testcases_union.core.main")
+                .arg("--mode")
+                .arg("sweverified");
+            if let Some(instance_id) = request.instance_id.as_deref() {
+                command.arg("--instance-id").arg(instance_id);
+            }
+            if let Some(split) = request.split.as_deref() {
+                command.arg("--split").arg(split);
+            }
+            if let Some(testbench) = request.testbench.as_deref() {
+                command.arg("--testbench").arg(testbench);
+            }
+        }
+        _ => {}
+    }
+    command.current_dir(repo_root);
+    command
+}
+
+fn validate_request(request: &MctsRunRequest) -> Result<(), PluginHostError> {
+    if request.plugin_id != PLUGIN_ID {
+        return Err(PluginHostError::Manifest(format!(
+            "request plugin_id must be {PLUGIN_ID}"
+        )));
+    }
+    if request.mode.trim().is_empty() {
+        return Err(PluginHostError::Manifest(
+            "mode must not be empty".to_string(),
+        ));
+    }
+    if request.run_id.trim().is_empty() {
+        return Err(PluginHostError::Manifest(
+            "run_id must not be empty".to_string(),
+        ));
+    }
+    match request.root_state_id.as_deref() {
+        Some(root_state_id) if !root_state_id.trim().is_empty() => {}
+        _ => {
+            return Err(PluginHostError::Manifest(
+                "root_state_id must not be empty".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitSnapshot {
+    #[allow(dead_code)]
+    run_id: String,
+    status: String,
+    sequence: u64,
+}
+
+async fn request_and_dispatch<A: HostApplication + 'static>(
+    process: &PluginProcess,
+    host_cap_service: &Arc<HostCapService<A>>,
+    id: &str,
+    method: MethodName,
+    params: Value,
+    timeout: Duration,
+    progress: &mut RunProgress,
+    protocol: &ProtocolBuffer,
+    background_error: &BackgroundError,
+    background_jobs: &mut JoinSet<()>,
+) -> Result<Response, PluginHostError> {
+    let request = RpcEnvelope::Request(Request {
+        jsonrpc: JSONRPC_VERSION.to_string(),
+        id: RpcId::String(id.to_string()),
+        method,
+        params,
+    });
+    append_protocol(protocol, &request).await?;
+    process.send(&request).await?;
+
+    loop {
+        if let Some(error) = background_error.lock().await.take() {
+            return Err(error);
+        }
+        let message = tokio::time::timeout(timeout, process.next_message())
+            .await
+            .map_err(|_| PluginHostError::DeadlineExceeded)??;
+        append_protocol(protocol, &message).await?;
+
+        match message {
+            RpcEnvelope::Response(response) => {
+                if id_matches(&response.id, id) {
+                    return Ok(response);
+                }
+            }
+            RpcEnvelope::Request(request) => {
+                let response = host_cap_service
+                    .handle(
+                        request.id.clone(),
+                        request.method.clone(),
+                        request.params.clone(),
+                    )
+                    .await;
+                let response_for_job = response.clone();
+                let response_envelope = RpcEnvelope::Response(response);
+                append_protocol(protocol, &response_envelope).await?;
+                process.send(&response_envelope).await?;
+                let transport = process.transport();
+                let host_cap_service = host_cap_service.clone();
+                let protocol = protocol.clone();
+                let background_error = background_error.clone();
+                let request_method = request.method.clone();
+                let request_params = request.params.clone();
+                background_jobs.spawn(async move {
+                    if let Err(error) = send_host_job_events(
+                        &transport,
+                        &host_cap_service,
+                        &request_method,
+                        &request_params,
+                        &response_for_job,
+                        &protocol,
+                    )
+                    .await
+                    {
+                        let mut slot = background_error.lock().await;
+                        if slot.is_none() {
+                            *slot = Some(error);
+                        }
+                    }
+                });
+            }
+            RpcEnvelope::Notification(notification) => {
+                apply_notification(
+                    notification.method,
+                    notification.params,
+                    progress,
+                    host_cap_service,
+                )?;
+            }
+        }
+    }
+}
+
+fn id_matches(id: &RpcId, expected: &str) -> bool {
+    match id {
+        RpcId::String(value) => value == expected,
+        RpcId::Number(value) => value.to_string() == expected,
+    }
+}
+
+fn apply_notification<A: HostApplication>(
+    method: NotificationName,
+    params: Value,
+    progress: &mut RunProgress,
+    host_cap_service: &Arc<HostCapService<A>>,
+) -> Result<(), PluginHostError> {
+    match method {
+        NotificationName::PluginStarted => {
+            let params: mcts_protocol::notifications::PluginStartedParams =
+                serde_json::from_value(params)?;
+            progress.status = MctsRunStatus::Running;
+            progress.sequence = progress.sequence.max(params.sequence);
+            progress.summary = params.summary;
+        }
+        NotificationName::PluginCompleted => {
+            let params: PluginCompletedParams = serde_json::from_value(params)?;
+            let result = params.result.clone();
+            ApplyPlanValidator::new().validate(
+                &result,
+                &params.run_id,
+                &host_cap_service.run_map(),
+            )?;
+            progress.status = MctsRunStatus::Completed;
+            progress.sequence = progress.sequence.max(params.sequence);
+            progress.summary = Some("completed".to_string());
+            progress.result = Some(result);
+        }
+        NotificationName::PluginCancelled => {
+            let params: PluginCancelledParams = serde_json::from_value(params)?;
+            progress.status = MctsRunStatus::Cancelled;
+            progress.sequence = progress.sequence.max(params.sequence);
+            progress.summary = Some(params.summary);
+        }
+        NotificationName::PluginFailed => {
+            let params: PluginFailedParams = serde_json::from_value(params)?;
+            progress.status = MctsRunStatus::Failed;
+            progress.sequence = progress.sequence.max(params.sequence);
+            progress.summary = Some(params.summary);
+            progress.failure = Some(params.failure);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn send_host_job_events<A: HostApplication>(
+    transport: &Arc<StdioTransport>,
+    host_cap_service: &Arc<HostCapService<A>>,
+    method: &MethodName,
+    request_params: &Value,
+    response: &Response,
+    protocol: &ProtocolBuffer,
+) -> Result<(), PluginHostError> {
+    if !matches!(method, MethodName::HostAgentTurn | MethodName::HostExec) {
+        return Ok(());
+    }
+    let Some(job_id) = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("job_id"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let run_id = request_params
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let started = JobNotifier::started(run_id, job_id, 1);
+    append_protocol(protocol, &started).await?;
+    transport.send(&started).await?;
+
+    let app = host_cap_service.application();
+    let outcome = app.wait_job(run_id, job_id).await?;
+    let terminal = match outcome.status {
+        JobStatus::Completed => JobNotifier::completed(
+            run_id,
+            job_id,
+            2,
+            &outcome.output,
+            outcome.usage,
+            outcome.exit_code,
+            Some(false),
+        ),
+        JobStatus::Failed => {
+            let failure = outcome.failure.unwrap_or_else(|| Failure {
+                code: "host-job-failed".to_string(),
+                message: outcome.output.clone(),
+            });
+            JobNotifier::failed(run_id, job_id, 2, failure, outcome.usage)
+        }
+        JobStatus::Running => {
+            return Err(PluginHostError::InvalidResponse(format!(
+                "host job {job_id} was still running after wait_job()"
+            )));
+        }
+    };
+    append_protocol(protocol, &terminal).await?;
+    transport.send(&terminal).await?;
+    let _ = host_cap_service
+        .run_map()
+        .set_job_status(job_id, outcome.status);
+    Ok(())
+}
+
+async fn append_protocol(
+    protocol: &ProtocolBuffer,
+    envelope: &RpcEnvelope,
+) -> Result<(), PluginHostError> {
+    let line = serde_json::to_string(envelope)?;
+    let mut guard = protocol.lock().await;
+    let buffer = guard.get_or_insert_with(String::new);
+    buffer.push_str(&line);
+    buffer.push('\n');
+    Ok(())
+}
+
+fn ensure_response_ok(response: &Response) -> Result<(), PluginHostError> {
+    if response.error.is_some() {
+        Err(PluginHostError::InvalidResponse(
+            "plugin returned a JSON-RPC error".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_cap_service::FakeApplication;
+    use crate::run_map::RunMap;
+    use serde_json::json;
+
+    fn stub_command() -> Command {
+        let test_binary = std::env::current_exe().expect("current test binary");
+        let stub_binary = test_binary
+            .parent()
+            .expect("target/deps directory")
+            .parent()
+            .expect("target directory")
+            .join("stub-plugin");
+        Command::new(stub_binary)
+    }
+
+    fn request() -> MctsRunRequest {
+        serde_json::from_value(json!({
+            "plugin_id": "mcts",
+            "mode": "mock",
+            "run_id": "run-mcts-day4",
+            "root_state_id": "state-root",
+            "goal": "validate lifecycle",
+            "content": "content",
+            "budget": {"max_iters": 2, "branching": 1, "max_time_ms": 5000, "max_tokens": 1000}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn resolves_default_llm_and_builds_mock_command() {
+        let mut request = request();
+        request.mode = "mock".to_string();
+        let run = MctsRun::new(
+            Command::new("python"),
+            vec![],
+            request.clone(),
+            host_service(),
+        );
+        assert_eq!(run.resolved_llm(), "DeepSeek-V4-Pro");
+
+        let command = build_launch_command("python3", "/repo", &request);
+        assert!(command
+            .as_std()
+            .get_program()
+            .to_string_lossy()
+            .contains("python3"));
+    }
+
+    fn host_service() -> Arc<HostCapService<FakeApplication>> {
+        let run_map = RunMap::new();
+        let service = HostCapService::new(FakeApplication::new(), run_map);
+        Arc::new(service)
+    }
+
+    #[tokio::test]
+    async fn runs_initialize_start_wait_and_reaches_terminal() {
+        let run = MctsRun::new(stub_command(), vec![], request(), host_service())
+            .with_wait_poll_timeout(Duration::from_millis(100));
+        let outcome = run.execute().await.unwrap();
+        assert_eq!(outcome.status, MctsRunStatus::Completed);
+        assert!(outcome.sequence >= 1);
+    }
+
+    #[test]
+    fn rejects_non_mcts_plugin_request() {
+        let mut bad = request();
+        bad.plugin_id = "other".to_string();
+        assert!(validate_request(&bad).is_err());
+    }
+
+    #[test]
+    fn llm_config_has_stable_defaults() {
+        let llm: LlmConfig = serde_json::from_value(json!({})).unwrap();
+        assert!(llm.provider.is_none());
+        assert!(llm.model.is_none());
+    }
+}

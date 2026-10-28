@@ -13,6 +13,7 @@ path = "src/main.rs"
 arc-swap.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 futures-util.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -30,6 +31,7 @@ uuid.workspace = true
 session-protocol = { path = "../../crates/protocol/session" }
 agent-runtime-protocol = { path = "../../crates/protocol/runtime" }
 provider-protocol = { path = "../../crates/protocol/provider" }
+mcts-plugin-host = { path = "../../crates/mcts-plugin-host" }
 backend = { path = "../../crates/backend" }
 xgovernor-core = { path = "../../crates/core" }
 xgovernor-manager = { path = "../../crates/manager" }

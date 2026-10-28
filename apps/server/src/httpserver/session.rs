@@ -77,6 +77,10 @@ impl SessionHttpState {
 
     /// Configure how long an unclaimed turn event stream is retained.
     /// The default is 30 seconds; the sweeper checks every 10 seconds.
+    pub fn application(&self) -> &SessionApplication {
+        &self.application
+    }
+
     pub fn with_stream_entry_ttl(mut self, ttl: Duration) -> Self {
         assert!(!ttl.is_zero(), "stream entry TTL must be positive");
         self.stream_entry_ttl = ttl;
