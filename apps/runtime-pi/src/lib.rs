@@ -1442,6 +1442,19 @@ fn extract_usage(message: &Value) -> SessionUsage {
     }
 }
 
+/// A worker reporting an infrastructure failure is no longer safe to reuse.
+/// Reap its entire process tree before exposing the terminal event, so a new
+/// turn can lazily restore a fresh worker without consuming stale RPC output.
+async fn retire_failed_worker(instance: &PiInstance) {
+    #[cfg(unix)]
+    if instance.pgid > 0 {
+        backend::process_group::send_sigkill_to_group(instance.pgid);
+    }
+    let mut child = instance.child.lock().await;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 async fn read_worker_turn(
     instance: Arc<PiInstance>,
     turn_id: String,
@@ -1471,7 +1484,12 @@ async fn read_worker_turn(
 
         let event = match response {
             Ok(WorkerResponse::Event { event }) => Some(event),
-            Ok(WorkerResponse::Error { error }) => Some(worker_error_event(error)),
+            Ok(WorkerResponse::Error { error }) => {
+                if matches!(&error, RuntimeError::WorkerUnavailable { .. }) {
+                    retire_failed_worker(&instance).await;
+                }
+                Some(worker_error_event(error))
+            }
             Ok(WorkerResponse::Ready | WorkerResponse::State { .. } | WorkerResponse::Unknown) => {
                 None
             }
@@ -1489,6 +1507,7 @@ async fn read_worker_turn(
                         usage: SessionUsage::default(),
                     })
                 } else {
+                    retire_failed_worker(&instance).await;
                     Some(worker_error_event(error))
                 }
             }

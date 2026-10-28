@@ -521,6 +521,98 @@ async fn native_pi_crash_is_reported_as_worker_unavailable() {
     runtime.stop("runtime-1").await.ok();
 }
 
+#[tokio::test]
+async fn native_extension_error_without_settled_fails_the_turn_and_retires_the_worker() {
+    let workspace = TempDir::new().unwrap();
+    let runtime = started_runtime(workspace.path().to_str().unwrap()).await;
+    let request = |id: &str, text: &str| RuntimeTurnInput {
+        runtime_id: "runtime-1".into(),
+        turn_id: id.into(),
+        text: text.into(),
+        entry: Default::default(),
+        llm: None,
+        reasoning_effort: None,
+        ext: Default::default(),
+    };
+    let mut events = runtime
+        .submit_turn(request("failed", "trigger-extension-error"))
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+    if received.is_err() {
+        runtime.stop("runtime-1").await.ok();
+    }
+    match received
+        .expect("extension errors must not wait for agent_settled or EOF")
+        .unwrap()
+    {
+        RuntimeEvent::Failed { error, .. } => {
+            assert_eq!(error.code, "worker_unavailable");
+            assert!(error.message.contains("synthetic extension failure"));
+        }
+        other => panic!("extension error must fail the turn: {other:?}"),
+    }
+    assert!(events.recv().await.is_none(), "exactly one terminal event");
+    let mut next = runtime
+        .submit_turn(request("next", "hello after extension failure"))
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = next.recv().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("replacement worker closed without a terminal event");
+    })
+    .await;
+    runtime.stop("runtime-1").await.ok();
+    assert!(matches!(completed.unwrap(), RuntimeEvent::Completed { .. }));
+}
+
+#[tokio::test]
+async fn turn_context_write_failure_is_terminal_and_recoverable() {
+    let workspace = TempDir::new().unwrap();
+    let runtime = started_runtime(workspace.path().to_str().unwrap()).await;
+    let state = runtime.export_state("runtime-1").await.unwrap();
+    let session_dir = std::path::PathBuf::from(state.state["pi_session_dir"].as_str().unwrap());
+    // A directory at the atomic-write target deterministically fails the
+    // worker's filesystem write without filling the developer's real disk.
+    let pending = session_dir.join("xgovernor-turn.pending");
+    std::fs::create_dir(&pending).unwrap();
+    let request = |id: &str| RuntimeTurnInput {
+        runtime_id: "runtime-1".into(),
+        turn_id: id.into(),
+        text: "hello".into(),
+        entry: Default::default(),
+        llm: None,
+        reasoning_effort: None,
+        ext: Default::default(),
+    };
+    let mut events = runtime.submit_turn(request("write-failed")).await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+    if received.is_err() {
+        runtime.stop("runtime-1").await.ok();
+    }
+    assert!(
+        matches!(received.unwrap(), Some(RuntimeEvent::Failed { error, .. }) if error.code == "worker_unavailable")
+    );
+    assert!(events.recv().await.is_none());
+    std::fs::remove_dir(&pending).unwrap();
+    let mut next = runtime.submit_turn(request("recovered")).await.unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = next.recv().await {
+            if event.is_terminal() {
+                return event;
+            }
+        }
+        panic!("replacement worker closed without a terminal event");
+    })
+    .await;
+    runtime.stop("runtime-1").await.ok();
+    assert!(matches!(completed.unwrap(), RuntimeEvent::Completed { .. }));
+}
+
 /// Pins down `AgentRuntime::cancel`'s "real interrupt semantics" contract
 /// against a real subprocess: calling `cancel` must make the fake pi process
 /// actually stop short, not just eventually report `Cancelled` after
