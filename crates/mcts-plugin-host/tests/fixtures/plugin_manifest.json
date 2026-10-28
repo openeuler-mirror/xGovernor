@@ -30,16 +30,16 @@
           "owner": "xgovernor",
           "source": "res/task_plugins/zsoft/prompts/prompt_submission_selector.txt"
         },
+        "trial-assessor": {
+          "role": "trial_assessor",
+          "owner": "xgovernor",
+          "source": "res/task_plugins/zsoft/prompts/prompt_trial_assessor.txt"
+        },
         "memory-merge": {
           "role": "memory_merge",
           "owner": "xgovernor",
           "source": "res/task_plugins/common/prompts/prompt_memory_merge.txt",
           "tools_enabled": false
-        },
-        "trial-assessor": {
-          "role": "trial_assessor",
-          "owner": "xgovernor",
-          "source": "res/task_plugins/zsoft/prompts/prompt_trial_assessor.txt"
         }
       }
     },
