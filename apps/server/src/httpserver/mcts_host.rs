@@ -18,7 +18,7 @@ use session_protocol::{
     SessionCheckpointDeleteRequest, SessionCheckpointScope, SessionEntryContext, SessionEvent,
     SessionExecRequest, SessionExtensions, SessionFileReadRequest, SessionFileWriteRequest,
     SessionLeaseClaim, SessionLoadRequest, SessionRuntimeCapability, SessionSandboxCapability,
-    SessionTurnRequest, SessionUsage,
+    SessionTurnRequest, SessionUsageReport,
 };
 use xgovernor_core::{SecurityContext, SessionApplication, SessionDomainError};
 
@@ -269,7 +269,10 @@ fn rfc3339_from_unix_ms(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
-fn usage_to_map(usage: SessionUsage) -> BTreeMap<String, u64> {
+fn usage_to_map(usage: SessionUsageReport) -> BTreeMap<String, u64> {
+    let SessionUsageReport::Known(usage) = usage else {
+        return BTreeMap::new();
+    };
     let mut map = BTreeMap::new();
     map.insert("input_tokens".to_string(), usage.input_tokens);
     map.insert("output_tokens".to_string(), usage.output_tokens);

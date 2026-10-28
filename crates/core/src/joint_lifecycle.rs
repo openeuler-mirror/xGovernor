@@ -265,7 +265,7 @@ pub(crate) fn context(
         owner_ref: ctx.owner_ref(),
         principal: ctx.principal.clone(),
         actor_role: ctx.role,
-        quota: ctx.quota,
+        quota: ctx.quota.clone(),
         runtime_kind: runtime_kind.into(),
         configuration_revision: revision.into(),
         source_runtime_id: source.map(str::to_owned),

@@ -125,6 +125,7 @@ fn request(
             actor_role: Role::Tenant,
             quota: TenantQuota {
                 max_sessions: Some(3),
+                max_sandboxes: Default::default(),
                 max_requests_per_minute: None,
             },
             runtime_kind: "local-mock".into(),
