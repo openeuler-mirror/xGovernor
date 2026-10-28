@@ -34,6 +34,20 @@ fn failure(message: &str) -> OperationError {
         message: message.into(),
     }
 }
+
+/// When enabled, a supervised process whose cleanup is "unconfirmed" does not
+/// fence the turn forever: the turn is released with a warning. This is useful
+/// for long-running plugin workloads (for example MCTS) that legitimately
+/// interrupt tool processes via timeouts, cancels, or client disconnects.
+/// Defaults to the upstream strict behavior unless
+/// `XGOVERNOR_E2B_LENIENT_CLEANUP=1` is set.
+fn lenient_cleanup() -> bool {
+    matches!(
+        std::env::var("XGOVERNOR_E2B_LENIENT_CLEANUP").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 impl E2bExecutionControl {
     pub(crate) fn check_context(&self) -> Result<(), OperationError> {
         if let Ok(context) = OPERATION_CONTEXT.try_with(Clone::clone) {
@@ -123,6 +137,18 @@ impl E2bExecutionControl {
                     let s = flight.status.lock().unwrap();
                     s.done && !s.clean
                 }) {
+                    if lenient_cleanup() {
+                        tracing::warn!(
+                            "E2B process cleanup is unconfirmed; releasing turn under lenient cleanup policy"
+                        );
+                        if finish {
+                            state
+                                .flights
+                                .retain(|_, flight| flight.context.turn_id != turn);
+                            state.turn = None;
+                        }
+                        return Ok(());
+                    }
                     return Err(failure(
                         "E2B process cleanup is unconfirmed; turn remains blocked",
                     ));
