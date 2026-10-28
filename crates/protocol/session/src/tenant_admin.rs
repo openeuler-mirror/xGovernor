@@ -6,12 +6,26 @@
 //! for the handlers that produce/consume these types.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
+
+/// Backend IDs supported by the server's tenant sandbox policy. Unknown
+/// names are rejected so a typo cannot silently remove a quota override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    Local,
+    E2b,
+    Docker,
+}
+
+pub type SandboxLimits = BTreeMap<SandboxBackend, u32>;
 
 /// `POST /api/v1/admin/tenants` request. `tenant_id` must not collide with
 /// an existing `[[tenant]]` block. `principal` defaults to `"tenant"` when
 /// omitted — the same default `tenants.toml` itself uses for a block with no
-/// `principal` key. Quota fields default to unlimited (`None`) when omitted,
-/// also matching the file's own defaults. The bearer token itself is never
+/// `principal` key. Session/rate quotas default to unlimited (`None`). Sandbox
+/// entries override each backend's default; omitted entries inherit it.
+/// The bearer token itself is never
 /// part of this request — see [`TenantCreateResponse::token`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +35,8 @@ pub struct TenantCreateRequest {
     pub principal: Option<String>,
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    #[serde(default)]
+    pub max_sandboxes: SandboxLimits,
     #[serde(default)]
     pub max_requests_per_minute: Option<u32>,
 }
@@ -39,11 +55,13 @@ pub struct TenantCreateResponse {
     #[serde(default)]
     pub max_sessions: Option<u32>,
     #[serde(default)]
+    pub max_sandboxes: SandboxLimits,
+    #[serde(default)]
     pub max_requests_per_minute: Option<u32>,
 }
 
 /// `PATCH /api/v1/admin/tenants/{tenant_id}` request — partial-update
-/// semantics for the two quota fields. A field absent from the request body
+/// semantics for quota fields. A field absent from the request body
 /// leaves the tenant's current value untouched; present as JSON `null`
 /// clears it to unlimited; present with a number sets it. Plain
 /// `Option<u32>` can't distinguish "absent" from "null" (both deserialize to
@@ -52,6 +70,9 @@ pub struct TenantCreateResponse {
 /// the JSON object, and wraps whatever `Option<u32>` it produces (`None` for
 /// `null`, `Some(v)` for a number) in an outer `Some(..)`. `#[serde(default)]`
 /// supplies the outer `None` when the key is missing entirely.
+/// `max_sandboxes` merges backend entries: a number sets that backend's
+/// limit, a null entry restores its default, and a top-level null clears all
+/// sandbox overrides. An omitted map or backend leaves its value unchanged.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TenantPatchRequest {
@@ -61,6 +82,12 @@ pub struct TenantPatchRequest {
         deserialize_with = "deserialize_present_field"
     )]
     pub max_sessions: Option<Option<u32>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_field"
+    )]
+    pub max_sandboxes: Option<Option<BTreeMap<SandboxBackend, Option<u32>>>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -83,6 +110,8 @@ pub struct TenantPatchResponse {
     pub principal: String,
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    #[serde(default)]
+    pub max_sandboxes: SandboxLimits,
     #[serde(default)]
     pub max_requests_per_minute: Option<u32>,
 }

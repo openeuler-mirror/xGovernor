@@ -151,6 +151,7 @@ async fn create_tenant_impl(
         tokens: vec![token.clone()],
         principal: principal.clone(),
         max_sessions: request.max_sessions,
+        max_sandboxes: request.max_sandboxes.clone(),
         max_requests_per_minute: request.max_requests_per_minute,
     });
 
@@ -164,6 +165,7 @@ async fn create_tenant_impl(
         token,
         principal,
         max_sessions: request.max_sessions,
+        max_sandboxes: request.max_sandboxes,
         max_requests_per_minute: request.max_requests_per_minute,
     })
 }
@@ -203,12 +205,30 @@ async fn patch_tenant_impl(
     if let Some(max_sessions) = request.max_sessions {
         section.max_sessions = max_sessions;
     }
+    if let Some(overrides) = request.max_sandboxes {
+        match overrides {
+            None => section.max_sandboxes.clear(),
+            Some(overrides) => {
+                for (backend, limit) in overrides {
+                    match limit {
+                        Some(limit) => {
+                            section.max_sandboxes.insert(backend, limit);
+                        }
+                        None => {
+                            section.max_sandboxes.remove(&backend);
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(max_requests_per_minute) = request.max_requests_per_minute {
         section.max_requests_per_minute = max_requests_per_minute;
     }
 
     let principal = section.principal.clone();
     let max_sessions = section.max_sessions;
+    let max_sandboxes = section.max_sandboxes.clone();
     let max_requests_per_minute = section.max_requests_per_minute;
 
     let entries = into_entries(file.clone()).map_err(config_error_to_wire)?;
@@ -220,6 +240,7 @@ async fn patch_tenant_impl(
         tenant_id: tenant_id.to_string(),
         principal,
         max_sessions,
+        max_sandboxes,
         max_requests_per_minute,
     })
 }

@@ -113,7 +113,7 @@
 
 启动加载 + SIGHUP 热重载。租户数上百、需要自助开通时再考虑数据库与管理 API——现在建即是过度工程。
 
-> 2026-08 后续更新：本节的启动加载 + SIGHUP 热重载已实现，但 schema 做了刻意收窄——只落地表格里当前真有强制点的字段（tokens、role、max_sessions、max_requests_per_minute），`allowed_workspace_kinds`/`git_host_allowlist`/`capability_ceiling`/`min_isolation_boundary`/`allowed_runtimes`/`max_concurrent_turns`/`max_sandboxes` 均**未**收进 `tenants.toml`——加一个没有消费者的 TOML 字段只是死配置，等某处代码真正读它时再补。实现：`apps/server/src/httpserver/tenant_config.rs`（schema/解析/校验，`#[serde(deny_unknown_fields)]`，拒绝重复 token/重复 tenant_id/空 tokens 列表）+ `apps/server/src/httpserver/auth.rs`（`TokenTable.entries` 改为 `Arc<ArcSwap<..>>`，新增 `reload()`，删除旧 `from_env()`/`TenantTokenEntry`）+ `apps/server/src/main.rs`（`XGOVERNOR_TENANTS_CONFIG_PATH`，默认 `$XGOVERNOR_DATA_DIR/tenants.toml`；`SIGHUP` 触发重载，reload 失败或产出空表**永不**应用，保留最后一份好的配置）。这是本文原定的"启动加载 + SIGHUP 热重载"目标的落地，取代了 §7 步骤 1/4 提到的 `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON` 环境变量通道（已删除，无兼容路径）。
+> 2026-08 后续更新：本节的启动加载 + SIGHUP 热重载已实现，但 schema 做了刻意收窄——只落地表格里当前真有强制点的字段（tokens、role、max_sessions、max_sandboxes、max_requests_per_minute），`allowed_workspace_kinds`/`git_host_allowlist`/`capability_ceiling`/`min_isolation_boundary`/`allowed_runtimes`/`max_concurrent_turns` 均**未**收进 `tenants.toml`——加一个没有消费者的 TOML 字段只是死配置，等某处代码真正读它时再补。实现：`apps/server/src/httpserver/tenant_config.rs`（schema/解析/校验，`#[serde(deny_unknown_fields)]`，拒绝重复 token/重复 tenant_id/空 tokens 列表）+ `apps/server/src/httpserver/auth.rs`（`TokenTable.entries` 改为 `Arc<ArcSwap<..>>`，新增 `reload()`，删除旧 `from_env()`/`TenantTokenEntry`）+ `apps/server/src/main.rs`（`XGOVERNOR_TENANTS_CONFIG_PATH`，默认 `$XGOVERNOR_DATA_DIR/tenants.toml`；`SIGHUP` 触发重载，reload 失败或产出空表**永不**应用，保留最后一份好的配置）。这是本文原定的"启动加载 + SIGHUP 热重载"目标的落地，取代了 §7 步骤 1/4 提到的 `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON` 环境变量通道（已删除，无兼容路径）。
 >
 > 2026-08 再更新（租户自助查询 API，v1）：本节末句提到的"留给未来讨论"的自助查询/管理 API 现已落地一个刻意收窄的 v1——`GET /api/v1/sessions`（[http_api.md](./http_api.md) §3"会话列表 / 配额自助查询"）。范围明确排除：不含历史/已关闭会话（只返回 `opening/idle/running/paused`）、不含审计日志、不做真正分页（固定上限 + `has_more` 布尔，不是游标/offset）。机制上复用既有"共用路由 + 身份自动过滤"模式，不是独立的 admin-only 端点：`ctx.tenant_id()` 直接传给新增的 `SessionRepository::list_active(tenant_id, limit)`，`None`（admin）= 无过滤看全局，`Some(id)`（tenant）= 只看自己——与 owner_ref 推导同一套 `ctx.tenant_id()` passthrough，没有另开一条 admin 专用分支。配额快照的 `active_sessions` 计数刻意从这条新 SQL 查询取真实值，**没有**去统一 `open()` 准入路径当前用的内存计数器（`tenant_sessions`）——那个计数器在 daemon 重启后会漂移，是已知行为；统一两者是本次范围之外的下一步，明确搁置。实现：`crates/protocol/session/src/control.rs`（`SessionSummary`/`TenantQuotaSnapshot`/`SessionListResponse` 三个 DTO）+ `crates/core/src/application.rs`（`SessionRepository` trait 新增 `list_active` 必需方法，全仓库 11 处实现同步补齐；`SessionApplication::list_sessions` 复用既有 `audit_log` 包装）+ `crates/core/src/sqlite_repository.rs`（`list_active` 用 `status IN (...)` + `tenant_id = ?1 OR ?1 IS NULL` 两条查询）+ `apps/server/src/httpserver/session.rs`（`GET /api/v1/sessions` 路由 + handler，复用 `Extension<SecurityContext>` 模式）。
 >
@@ -233,7 +233,7 @@ match (role, workspace_spec, provider):
    的 workspace_spec 扩展、跨监听器 SSE 共享（如需要）。
 3. **沙箱内 clone 与 runtime 路由**：`SessionApplication` 按 `runtime_kind` 注册 `AgentRuntime`、provider manager 和 `SessionEnvironmentNormalizer`。normalizer 将 git intent 归一化为完整的 workspace facts；Application 先通过 `InstanceManager` 创建 Local/E2B provider，再把 `OperationBackend` 注入 runtime。runtime 不持有 provider manager。E2B 的 git clone 通过注入的 operation backend 在沙箱内执行；失败时 Application 回滚 provider 与 runtime。
 4. **配额准入与 429**：租户三级配额 + QuotaExceeded 错误码。
-  **落地状态：窄切片已实现（仅 `max_sessions` 一级）。** §4 原定三级配额（`max_sessions`/`max_concurrent_turns`/`max_sandboxes`）
+  **落地状态：`max_sessions` 与按 backend 的 `max_sandboxes` 已实现。** §4 原定三级配额（`max_sessions`/`max_concurrent_turns`/`max_sandboxes`）
    落地时用户当场收窄范围："active turn 限制没必要，只要活跃 session 数就行"——`max_concurrent_turns` 因此不实现（活跃 session 数
    已经界定了租户的总体 footprint。`owner_ref` 由 `SecurityContext::owner_ref()` 机械推导：tenant 使用 `tenant/{tenant_id}`，admin 使用 `ADMIN_OWNER_REF`。该值只传给 `InstanceManager`/provider lifecycle，不进入 runtime protocol，也不从客户端 `ext` 读取。provider 配额因此按可信 owner 生效。
 
@@ -251,6 +251,17 @@ match (role, workspace_spec, provider):
    `fork_counts_against_the_same_tenant_session_quota` 等锁定"open 占额、close 放额、fork 与 open 共享同一计数"。
 
    `max_sessions` 从 `tenants.toml` 的 tenant schema 读取；可选字段缺省为不限制。
+
+   `max_sandboxes` 由每个 `[[tenant]]` 按 backend 配置，例如 `max_sandboxes = { e2b = 3, docker = 5, local = 0 }`；也可写作该 tenant 的 `[tenant.max_sandboxes]` 表。各 backend 分别计数，同一租户的多个 token 共享计数。省略某个 backend 表示继承它的默认值，显式整数替代默认值（允许高于 20），0 禁止该 backend 新建实例；未知 backend、负数或超过 u32 范围的值会被拒绝。`max_sessions` 继续限制跨 backend 的活跃 session 总量。
+
+   `TenantQuota` / `SecurityContext` 携带按 backend 的映射，Application 在 open 时根据目标 backend、在 load/fork 时根据持久化的来源 backend 选择覆盖值，再通过独立 `owner_limit` 参数交给 manager，不能从客户端 ext/provider options 读取配额。manager 在同一把锁内检查并预占 owner 和 global 配额，创建失败回滚、close 释放；admin 绕过两级检查但仍计入共享总量。调低额度保留存量，只限制后续创建；已受理请求可按原配额完成。
+
+   管理员 POST/PATCH 接口复用现有原子写盘和认证表热更新链路；PATCH 的 `max_sandboxes` 按 backend 合并：缺席保留，数字设置，某个 backend 为 null 删除该覆盖值，整个字段为 null 清空全部覆盖。手工修改文件后发送 `SIGHUP`。`GET /api/v1/sessions` 的 `quota.max_sandboxes` 返回配置映射（空对象表示全部继承），不是用量计数或容量预留。
+
+   local/E2B 默认每租户 20、manager 共享总量 1024，管理员可通过 `XGOVERNOR_LOCAL_MAX_SANDBOXES_PER_OWNER` / `XGOVERNOR_LOCAL_MAX_SANDBOXES_GLOBAL`、`XGOVERNOR_E2B_MAX_SANDBOXES_PER_OWNER` / `XGOVERNOR_E2B_MAX_SANDBOXES_GLOBAL` 调整缺省值和总量，重启生效；接受 1–4294967295 的整数，已启用 backend 的非法配置拒绝启动。Docker 的缺省值和共享总量来自 `XGOVERNOR_DOCKER_MAX_CONTAINERS`（默认 2），因此租户配置 Docker 上限 3 时，还需相应提高 Docker 共享容量。
+
+   租户额度不是资源预留。E2B project 的平台并发额度独立生效；xG 不按 API key/project 分池、不自动发现平台额度、不跨 server 进程共享 manager 总量，也不统计外部客户端创建的实例。
+
 5. **审计日志**。
   **落地状态：已实现。** `crates/core/src/application.rs` 新增 `audit_log<T>(ctx, operation, runtime_id, result)` 自由函数：
    每次调用发一条 `tracing::info!(target: "audit", principal, tenant, operation, runtime_id, result = "ok"/"error", [error])`——

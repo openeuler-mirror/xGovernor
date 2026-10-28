@@ -11,16 +11,33 @@
 //! is structurally impossible.
 
 use serde::{Deserialize, Serialize};
+use session_protocol::{SandboxBackend, SandboxLimits};
 
 /// admin 百无禁忌
 pub const ADMIN_OWNER_REF: &str = "admin";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantQuota {
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    /// Per-backend instance ceilings. Missing entries inherit backend defaults;
+    /// zero blocks new instances. Admin owners remain exempt.
+    #[serde(default)]
+    pub max_sandboxes: SandboxLimits,
     #[serde(default)]
     pub max_requests_per_minute: Option<u32>,
+}
+
+impl TenantQuota {
+    pub fn sandbox_limit(&self, backend_id: &str) -> Option<u32> {
+        let backend = match backend_id {
+            "local" => SandboxBackend::Local,
+            "e2b" => SandboxBackend::E2b,
+            "docker" => SandboxBackend::Docker,
+            _ => return None,
+        };
+        self.max_sandboxes.get(&backend).copied()
+    }
 }
 
 /// The two trust worlds of `docs/tenancy_design.md` §0.
@@ -53,8 +70,9 @@ pub struct SecurityContext {
     /// (`docs/tenancy_design.md` §6) — never used for authorization
     /// decisions.
     pub principal: String,
-    /// `docs/tenancy_design.md` §7 step 4. Unlimited (`TenantQuota::default()`)
-    /// unless set via [`SecurityContext::with_quota`] — admission checks in
+    /// `docs/tenancy_design.md` §7 step 4. Session/rate quotas default to
+    /// unlimited; sandbox quotas inherit backend defaults. Set via
+    /// [`SecurityContext::with_quota`] — admission checks in
     /// `SessionApplication` always compare against this, but `is_admin()`
     /// bypasses them regardless of what this field holds (§0: admin is
     /// "百无禁忌").
@@ -82,8 +100,7 @@ impl SecurityContext {
 
     /// Attach a quota ceiling. Opt-in builder (mirrors `SessionApplication::
     /// with_lease_table`) so every existing `admin(..)`/`tenant(..)` call
-    /// site keeps its current unlimited behavior unless it explicitly asks
-    /// for a limit.
+    /// site keeps its current defaults unless it explicitly asks for a limit.
     pub fn with_quota(mut self, quota: TenantQuota) -> Self {
         self.quota = quota;
         self

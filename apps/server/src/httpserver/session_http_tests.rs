@@ -778,6 +778,186 @@ async fn close_session_sweeps_any_unclaimed_stream_for_that_runtime_id() {
     );
 }
 
+async fn quota_http_json(
+    app: &Router,
+    method: axum::http::Method,
+    path: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn admin_backend_quota_updates_merge_persist_and_reload_for_tenants() {
+    use crate::httpserver::{create_router, load_tenants_file, TenantAdminState, TokenTable};
+    use axum::http::Method;
+    use serde_json::{json, Value};
+    use xgovernor_core::Role;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("tenants.toml");
+    std::fs::write(&path, "[admin]\ntokens = ['admin']\n").unwrap();
+    let table = TokenTable::new(load_tenants_file(&path).unwrap());
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime),
+        std::collections::HashMap::new(),
+        Arc::new(EmptyRepository),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    let admin_app = create_router(
+        SessionHttpState::new(application.clone()),
+        Some(table.clone()),
+        Some(Role::Admin),
+        Some(TenantAdminState::new(
+            table.clone(),
+            path.clone(),
+            application.clone(),
+        )),
+    );
+    let tenant_app = create_router(
+        SessionHttpState::new(application),
+        Some(table),
+        Some(Role::Tenant),
+        None,
+    );
+    let mut tokens = Vec::new();
+    for (tenant, limits) in [
+        ("a", json!({"e2b": 3, "docker": 5, "local": 0})),
+        ("b", json!({"e2b": 50})),
+        ("c", json!({})),
+    ] {
+        let mut body = json!({"tenant_id": tenant, "max_sessions": 10});
+        if tenant != "c" {
+            body["max_sandboxes"] = limits.clone();
+        }
+        let (status, created) = quota_http_json(
+            &admin_app,
+            Method::POST,
+            "/api/v1/admin/tenants",
+            "admin",
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["max_sandboxes"], limits);
+        let token = created["token"].as_str().unwrap().to_string();
+        let (status, listed) = quota_http_json(
+            &tenant_app,
+            Method::GET,
+            "/api/v1/sessions",
+            &token,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["quota"]["max_sandboxes"], limits);
+        tokens.push(token);
+    }
+    let tenant_a = &tokens[0];
+    let patch_path = "/api/v1/admin/tenants/a";
+    for (patch, expected) in [
+        (
+            json!({"max_sessions": 15}),
+            json!({"e2b": 3, "docker": 5, "local": 0}),
+        ),
+        (
+            json!({"max_sandboxes": {"e2b": 1}}),
+            json!({"e2b": 1, "docker": 5, "local": 0}),
+        ),
+        (
+            json!({"max_sandboxes": {"docker": 3}}),
+            json!({"e2b": 1, "docker": 3, "local": 0}),
+        ),
+        (
+            json!({"max_sandboxes": {"e2b": null}}),
+            json!({"docker": 3, "local": 0}),
+        ),
+        (
+            json!({"max_sandboxes": {}}),
+            json!({"docker": 3, "local": 0}),
+        ),
+        (json!({"max_sandboxes": null}), json!({})),
+        (
+            json!({"max_sandboxes": {"e2b": 3, "docker": 3}}),
+            json!({"e2b": 3, "docker": 3}),
+        ),
+    ] {
+        let (status, patched) =
+            quota_http_json(&admin_app, Method::PATCH, patch_path, "admin", patch).await;
+        assert_eq!(status, StatusCode::OK, "{patched}");
+        assert_eq!(patched["max_sandboxes"], expected);
+        assert_eq!(patched["max_sessions"], 15);
+        assert!(patched.get("token").is_none());
+        let (_, listed) = quota_http_json(
+            &tenant_app,
+            Method::GET,
+            "/api/v1/sessions",
+            tenant_a,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(listed["quota"]["max_sandboxes"], expected);
+        let entries = load_tenants_file(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&entries[tenant_a].quota.max_sandboxes).unwrap(),
+            expected
+        );
+        assert_eq!(entries[&tokens[1]].quota.sandbox_limit("e2b"), Some(50));
+        assert!(entries[&tokens[2]].quota.max_sandboxes.is_empty());
+    }
+    let before = std::fs::read(&path).unwrap();
+    let (status, _) = quota_http_json(
+        &admin_app,
+        Method::PATCH,
+        patch_path,
+        tenant_a,
+        json!({"max_sandboxes": {"e2b": 100}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for invalid in [
+        json!(3),
+        json!({"e2bb": 3}),
+        json!({"e2b": -1}),
+        json!({"docker": 4294967296_u64}),
+        json!({"local": 1.5}),
+        json!({"e2b": "3"}),
+    ] {
+        let (status, _) = quota_http_json(
+            &admin_app,
+            Method::PATCH,
+            patch_path,
+            "admin",
+            json!({"max_sandboxes": invalid}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
 #[tokio::test]
 async fn stream_registration_is_rejected_once_the_global_cap_is_reached() {
     let streams: Mutex<HashMap<String, HashMap<String, StreamEntry>>> = Mutex::new(HashMap::new());

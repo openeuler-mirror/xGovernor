@@ -6,10 +6,8 @@
 //! `git_host_allowlist`, `capability_ceiling`, `min_isolation_boundary`,
 //! `allowed_runtimes`, ...). This file only implements the fields that have an
 //! actual enforcement point in the codebase today — credentials, role, and the
-//! two [`xgovernor_core::TenantQuota`] fields (`max_sessions`,
-//! `max_requests_per_minute`) — mirroring exactly what the old
-//! `XGOVERNOR_BEARER_TOKEN`/`XGOVERNOR_TENANT_TOKENS_JSON` env-var pair
-//! configured. Adding a TOML field with no consumer would just be dead config;
+//! [`xgovernor_core::TenantQuota`] fields (`max_sessions`, `max_sandboxes`,
+//! `max_requests_per_minute`). Adding a TOML field with no consumer would just be dead config;
 //! the remaining §4 fields land here once something actually reads them.
 //!
 //! Example file:
@@ -23,6 +21,7 @@
 //! tokens = ["acme-token-a", "acme-token-b"]
 //! principal = "acme-ops"          # optional, defaults to "tenant"
 //! max_sessions = 20               # optional, defaults to unlimited
+//! max_sandboxes = { e2b = 3, docker = 5 } # omitted backend inherits its default; 0 blocks new instances
 //! max_requests_per_minute = 120   # optional, defaults to unlimited
 //!
 //! [[tenant]]
@@ -73,6 +72,8 @@ pub(crate) struct TenantSection {
     pub(crate) principal: String,
     #[serde(default)]
     pub(crate) max_sessions: Option<u32>,
+    #[serde(default)]
+    pub(crate) max_sandboxes: session_protocol::SandboxLimits,
     #[serde(default)]
     pub(crate) max_requests_per_minute: Option<u32>,
 }
@@ -204,11 +205,12 @@ pub(crate) fn into_entries(
         }
         let quota = TenantQuota {
             max_sessions: tenant.max_sessions,
+            max_sandboxes: tenant.max_sandboxes,
             max_requests_per_minute: tenant.max_requests_per_minute,
         };
         for token in tenant.tokens {
             let ctx = SecurityContext::tenant(tenant.tenant_id.clone(), tenant.principal.clone())
-                .with_quota(quota);
+                .with_quota(quota.clone());
             if entries.insert(token.clone(), ctx).is_some() {
                 return Err(TenantConfigError::DuplicateToken(token));
             }
@@ -324,6 +326,57 @@ mod tests {
         );
         let error = load_tenants_file(&path).unwrap_err();
         assert!(matches!(error, TenantConfigError::DuplicateToken(t) if t == "shared-token"));
+    }
+
+    #[test]
+    fn sandbox_limits_are_per_backend_per_tenant_and_shared_by_tokens() {
+        let path = write_temp_toml(
+            r#"
+            [[tenant]]
+            tenant_id = "a"
+            tokens = ["a1", "a2"]
+            max_sandboxes = { e2b = 3, docker = 5, local = 0 }
+            [[tenant]]
+            tenant_id = "b"
+            tokens = ["b"]
+            [tenant.max_sandboxes]
+            e2b = 50
+            [[tenant]]
+            tenant_id = "c"
+            tokens = ["c"]
+        "#,
+        );
+        let file = read_tenants_file_raw(&path).unwrap();
+        write_tenants_file_atomically(&path, &file).unwrap();
+        let entries = load_tenants_file(&path).unwrap();
+        for token in ["a1", "a2"] {
+            assert_eq!(entries[token].quota.sandbox_limit("e2b"), Some(3));
+            assert_eq!(entries[token].quota.sandbox_limit("docker"), Some(5));
+            assert_eq!(entries[token].quota.sandbox_limit("local"), Some(0));
+        }
+        assert_eq!(entries["b"].quota.sandbox_limit("e2b"), Some(50));
+        assert_eq!(entries["b"].quota.sandbox_limit("docker"), None);
+        assert!(entries["c"].quota.max_sandboxes.is_empty());
+    }
+
+    #[test]
+    fn invalid_backend_sandbox_limits_are_rejected() {
+        for value in [
+            "3",
+            "{ e2bb = 3 }",
+            "{ e2b = -1 }",
+            "{ docker = 4294967296 }",
+            "{ local = 1.5 }",
+            "{ e2b = '3' }",
+        ] {
+            let path = write_temp_toml(&format!(
+                "[[tenant]]\ntenant_id = 'a'\ntokens = ['a']\nmax_sandboxes = {value}\n"
+            ));
+            assert!(matches!(
+                load_tenants_file(&path),
+                Err(TenantConfigError::Parse(_))
+            ));
+        }
     }
 
     #[test]

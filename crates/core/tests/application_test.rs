@@ -23,8 +23,14 @@ struct SnapshotLifecycle {
 impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
     async fn create(
         &self,
-        request: provider_protocol::ProviderCreateRequest,
+        mut request: provider_protocol::ProviderCreateRequest,
     ) -> Result<provider_protocol::ProviderInstance, provider_protocol::ProviderControlError> {
+        // Use local test resources even when exercising E2B backend routing.
+        request
+            .provider_options
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_internet_access");
         let mut instance = self.local.create(request).await?;
         instance
             .capabilities
@@ -151,6 +157,7 @@ async fn start_test_provider(providers: &HashMap<String, Arc<InstanceManager>>, 
             serde_json::json!({
                 "workspace_root": std::env::current_dir().unwrap().to_string_lossy()
             }),
+            None,
         )
         .await
         .expect("start test provider instance");
@@ -370,6 +377,11 @@ impl SessionEnvironmentNormalizer for SnapshotTestEnvironment {
         request: &SessionOpenRequest,
     ) -> Result<NormalizedSessionEnvironment, SessionDomainError> {
         let mut normalized = TestEnvironment.normalize(ctx, request).await?;
+        normalized.isolation.metadata = request
+            .ext
+            .get("test")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"backend_id": "local"}));
         normalized
             .sandbox_capabilities
             .insert(SandboxCapability::Snapshot);
@@ -1040,7 +1052,7 @@ impl AgentRuntime for ForkableRuntime {
 
     async fn export_state(&self, _runtime_id: &str) -> Result<OpaqueRuntimeState, RuntimeError> {
         Ok(OpaqueRuntimeState {
-            runtime_kind: "forkable".into(),
+            runtime_kind: self.runtime_kind().into(),
             schema_version: 1,
             state: serde_json::json!({"turns": 3}),
         })
@@ -1898,6 +1910,165 @@ fn quota_tenant_ctx(max_sessions: u32) -> SecurityContext {
     })
 }
 
+fn backend_quota_ctx(tenant: &str, limits: serde_json::Value) -> SecurityContext {
+    SecurityContext::tenant(tenant, "test").with_quota(TenantQuota {
+        max_sandboxes: serde_json::from_value(limits).unwrap(),
+        ..Default::default()
+    })
+}
+
+fn sandbox_request(id: &str, backend: &str) -> SessionOpenRequest {
+    let mut request = open_request(Default::default());
+    request.runtime_id = Some(id.into());
+    request
+        .ext
+        .insert("test".into(), serde_json::json!({"backend_id": backend}));
+    request
+}
+
+fn backend_test_managers() -> HashMap<String, Arc<InstanceManager>> {
+    ["local", "e2b", "docker"]
+        .into_iter()
+        .map(|backend| {
+            let manager = snapshot_provider_managers(false).remove("local").unwrap();
+            (backend.to_string(), manager)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sandbox_quotas_are_selected_by_backend_without_cross_tenant_interference() {
+    let providers = backend_test_managers();
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        providers.clone(),
+        Arc::new(MapRepository::default()),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(SnapshotTestEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    let a = backend_quota_ctx("a", serde_json::json!({"e2b": 1, "docker": 2, "local": 0}));
+    for (id, backend) in [
+        ("a-e2b", "e2b"),
+        ("a-docker-1", "docker"),
+        ("a-docker-2", "docker"),
+    ] {
+        application
+            .open(&a, sandbox_request(id, backend))
+            .await
+            .unwrap();
+    }
+    for (backend, limit) in [("e2b", 1), ("docker", 2), ("local", 0)] {
+        assert!(matches!(
+            application.open(&a, sandbox_request(&format!("rejected-{backend}"), backend)).await,
+            Err(SessionDomainError::QuotaExceeded { scope, limit: actual })
+                if scope == "provider containers" && actual == limit
+        ));
+    }
+    let b = backend_quota_ctx("b", serde_json::json!({"e2b": 3}));
+    for id in ["b-e2b-1", "b-e2b-2", "b-e2b-3"] {
+        application
+            .open(&b, sandbox_request(id, "e2b"))
+            .await
+            .unwrap();
+    }
+    // An omitted backend inherits its own default rather than another entry.
+    application
+        .open(&b, sandbox_request("b-local", "local"))
+        .await
+        .unwrap();
+    assert_eq!(providers["e2b"].active_count("tenant/a"), 1);
+    assert_eq!(providers["e2b"].active_count("tenant/b"), 3);
+    assert_eq!(providers["docker"].active_count("tenant/a"), 2);
+    assert_eq!(providers["local"].active_count("tenant/a"), 0);
+    application
+        .close(&a, "a-e2b", Default::default())
+        .await
+        .unwrap();
+    application
+        .open(&a, sandbox_request("a-e2b-reused", "e2b"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_load_and_fork_use_the_source_backend_quota_and_rollback_failures() {
+    let repository = Arc::new(SqliteSessionRepository::open_in_memory().unwrap());
+    let mut checkpoint = checkpoint_manager_record();
+    checkpoint.isolation.metadata = serde_json::json!({"backend_id": "e2b"});
+    repository.save_checkpoint(checkpoint).await.unwrap();
+    let providers = backend_test_managers();
+    let application = SessionApplication::new(
+        Arc::new(ForkableRuntime::default()),
+        providers.clone(),
+        repository,
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(SnapshotTestEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    let mut ctx = backend_quota_ctx(
+        "tenant-a",
+        serde_json::json!({"e2b": 0, "docker": 0, "local": 0}),
+    );
+    ctx.quota.max_sessions = Some(2);
+    assert!(matches!(
+        application
+            .open(&ctx, sandbox_request("runtime-1", "e2b"))
+            .await,
+        Err(SessionDomainError::QuotaExceeded { limit: 0, .. })
+    ));
+    ctx.quota.max_sandboxes.insert(SandboxBackend::E2b, 1);
+    application
+        .open(&ctx, sandbox_request("runtime-1", "e2b"))
+        .await
+        .unwrap();
+    let load = || SessionLoadRequest {
+        checkpoint_id: "checkpoint-1".into(),
+        runtime_id: Some("loaded".into()),
+        conversation_id: None,
+        sender_id: None,
+        requested_capabilities: Default::default(),
+        deployment: Default::default(),
+        lease: Default::default(),
+        llm: None,
+    };
+    let fork = || SessionForkRequest {
+        parent_runtime_id: "runtime-1".into(),
+        runtime_id: Some("forked".into()),
+        conversation_id: None,
+        sender_id: None,
+        workspace: None,
+        deployment: None,
+        requested_capabilities: Default::default(),
+        lease: Default::default(),
+    };
+    for result in [
+        application.load_checkpoint(&ctx, load()).await,
+        application.fork(&ctx, fork()).await,
+    ] {
+        assert!(matches!(result,
+            Err(SessionDomainError::QuotaExceeded { scope, limit: 1 }) if scope == "provider containers"
+        ));
+    }
+    assert_eq!(providers["e2b"].active_count("tenant/tenant-a"), 1);
+    ctx.quota.max_sandboxes.insert(SandboxBackend::E2b, 2);
+    application.load_checkpoint(&ctx, load()).await.unwrap();
+    assert_eq!(providers["e2b"].active_count("tenant/tenant-a"), 2);
+    ctx.quota.max_sandboxes.insert(SandboxBackend::E2b, 0);
+    // Lowered quotas retain existing resources and do not block closing them.
+    application
+        .close(&ctx, "loaded", Default::default())
+        .await
+        .unwrap();
+    ctx.quota.max_sandboxes.insert(SandboxBackend::E2b, 2);
+    application.fork(&ctx, fork()).await.unwrap();
+    assert_eq!(providers["e2b"].active_count("tenant/tenant-a"), 2);
+    assert_eq!(providers["docker"].global_active_count(), 0);
+    assert_eq!(providers["local"].global_active_count(), 0);
+}
+
 fn tenant_test_record() -> SessionRecord {
     SessionRecord {
         tenant_id: Some("tenant-a".to_string()),
@@ -2674,6 +2845,7 @@ async fn external_operations_roundtrip_bytes_and_enforce_identity_lease_and_capa
             provider_protocol::BackendId("local".into()),
             "test".into(),
             serde_json::json!({"workspace_root":dir.path()}),
+            None,
         )
         .await
         .unwrap();

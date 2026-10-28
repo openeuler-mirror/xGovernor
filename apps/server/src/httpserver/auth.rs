@@ -335,6 +335,7 @@ mod tests {
             "limited-tenant-token".to_string(),
             SecurityContext::tenant("tenant-a", "alice").with_quota(TenantQuota {
                 max_sessions: None,
+                max_sandboxes: Default::default(),
                 max_requests_per_minute: Some(2),
             }),
         );

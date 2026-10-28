@@ -28,6 +28,24 @@ const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_SANDBOXES_PER_OWNER: usize = 20;
 const DEFAULT_MAX_SANDBOXES_GLOBAL: usize = 1024;
 
+fn configured_sandbox_limit(name: &str, default: usize) -> usize {
+    let invalid = || {
+        eprintln!(
+            "refusing to start: {name} must be an integer between 1 and {}",
+            u32::MAX
+        );
+        std::process::exit(1);
+    };
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(limit) if limit > 0 => limit as usize,
+            _ => invalid(),
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => invalid(),
+    }
+}
+
 fn configured_duration_secs(name: &str, default_secs: u64) -> Duration {
     match std::env::var(name) {
         Ok(value) => match value.parse::<u64>() {
@@ -61,11 +79,24 @@ fn open_provider_ledger(db_path: &Path, backend_id: &str) -> Arc<dyn ProviderIns
 }
 
 fn build_instance_manager(db_path: &Path, backend_id: &str) -> Arc<InstanceManager> {
-    let ledger = open_provider_ledger(db_path, backend_id);
+    let prefix = format!("XGOVERNOR_{}", backend_id.to_ascii_uppercase());
     let config = InstanceManagerConfig::new(
-        DEFAULT_MAX_SANDBOXES_PER_OWNER,
-        DEFAULT_MAX_SANDBOXES_GLOBAL,
+        configured_sandbox_limit(
+            &format!("{prefix}_MAX_SANDBOXES_PER_OWNER"),
+            DEFAULT_MAX_SANDBOXES_PER_OWNER,
+        ),
+        configured_sandbox_limit(
+            &format!("{prefix}_MAX_SANDBOXES_GLOBAL"),
+            DEFAULT_MAX_SANDBOXES_GLOBAL,
+        ),
     );
+    tracing::info!(
+        backend_id,
+        default_max_sandboxes_per_owner = config.max_sandboxes_per_owner,
+        max_sandboxes_global = config.max_sandboxes_global,
+        "configured sandbox limits"
+    );
+    let ledger = open_provider_ledger(db_path, backend_id);
     match backend_id {
         "local" => {
             let provider = Arc::new(LocalProvider::new());

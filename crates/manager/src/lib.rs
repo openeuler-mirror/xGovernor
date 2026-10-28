@@ -52,6 +52,7 @@ impl Default for RetryPolicy {
 
 #[derive(Debug, Clone)]
 pub struct InstanceManagerConfig {
+    /// Default owner ceiling, replaced by a trusted per-request override.
     pub max_sandboxes_per_owner: usize,
     pub max_sandboxes_global: usize,
     pub max_concurrent_creates: usize,
@@ -250,16 +251,23 @@ impl InstanceManager {
     /// surface for this one crate's benefit. See
     /// `docs/protocol_boundaries.md`'s updated architecture note for this
     /// tradeoff spelled out explicitly.
-    fn reserve(&self, owner_ref: &str) -> Result<(), ProviderControlError> {
+    fn reserve(
+        &self,
+        owner_ref: &str,
+        owner_limit: Option<u32>,
+    ) -> Result<(), ProviderControlError> {
         let mut state = self.quota_state()?;
         let current = state.counts.get(owner_ref).copied().unwrap_or(0);
+        let max_per_owner = owner_limit
+            .map(|limit| limit as usize)
+            .unwrap_or(self.config.max_sandboxes_per_owner);
         if owner_ref != ADMIN_OWNER_REF {
-            if current >= self.config.max_sandboxes_per_owner {
+            if current >= max_per_owner {
                 return Err(ProviderControlError::ResourceLimitExceeded {
                     provider: self.kind.clone(),
                     owner_ref: owner_ref.to_string(),
                     current,
-                    max: self.config.max_sandboxes_per_owner,
+                    max: max_per_owner,
                 });
             }
             if state.total >= self.config.max_sandboxes_global {
@@ -404,17 +412,26 @@ impl InstanceManager {
     /// session (never reused for two different logical sessions), so a
     /// second concurrent `start_instance` for the same id is definitionally
     /// a bug in the caller, not a legitimate retry to coalesce.
+    /// `owner_limit` comes from trusted server policy, never provider options.
+    /// None inherits the configured default; Some(0) blocks new instances.
     pub async fn start_instance(
         &self,
         runtime_id: String,
         backend_id: BackendId,
         owner_ref: String,
         provider_options: Value,
+        owner_limit: Option<u32>,
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
         let lock = self.get_runtime_lock(&runtime_id);
         let guard = lock.clone().lock_owned().await;
         let result = self
-            .start_instance_locked(&runtime_id, backend_id, owner_ref, provider_options)
+            .start_instance_locked(
+                &runtime_id,
+                backend_id,
+                owner_ref,
+                provider_options,
+                owner_limit,
+            )
             .await;
         drop(guard);
         self.release_runtime_lock(&runtime_id, lock);
@@ -511,6 +528,7 @@ impl InstanceManager {
         owner_ref: String,
         snapshot_id: provider_protocol::ProviderSnapshotId,
         provider_options: Value,
+        owner_limit: Option<u32>,
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
         let lock = self.get_runtime_lock(&runtime_id);
         let guard = lock.clone().lock_owned().await;
@@ -521,6 +539,7 @@ impl InstanceManager {
                 owner_ref,
                 snapshot_id,
                 provider_options,
+                owner_limit,
             )
             .await;
         drop(guard);
@@ -535,6 +554,7 @@ impl InstanceManager {
         owner_ref: String,
         snapshot_id: provider_protocol::ProviderSnapshotId,
         provider_options: Value,
+        owner_limit: Option<u32>,
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
         if self
             .instances
@@ -548,7 +568,7 @@ impl InstanceManager {
                 ),
             });
         }
-        self.reserve(&owner_ref)?;
+        self.reserve(&owner_ref, owner_limit)?;
         let instance = match self
             .lifecycle
             .load(ProviderLoadRequest {
@@ -605,6 +625,7 @@ impl InstanceManager {
         backend_id: BackendId,
         owner_ref: String,
         provider_options: Value,
+        owner_limit: Option<u32>,
     ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
         if self
             .instances
@@ -620,7 +641,7 @@ impl InstanceManager {
             });
         }
 
-        self.reserve(&owner_ref)?;
+        self.reserve(&owner_ref, owner_limit)?;
 
         let instance = match self
             .create_with_retry(backend_id, owner_ref.clone(), provider_options)
