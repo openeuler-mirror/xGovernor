@@ -926,6 +926,7 @@ impl SessionApplication {
                 provider_protocol::BackendId(provider_id.clone()),
                 ctx.owner_ref(),
                 provider_options(&normalized.workspace, &normalized.isolation, &provider_id),
+                ctx.quota.sandbox_limit(&provider_id),
             )
             .await
             .map_err(map_provider_error)
@@ -2482,6 +2483,7 @@ impl SessionApplication {
                 ctx.owner_ref(),
                 provider_protocol::ProviderSnapshotId(checkpoint.provider_snapshot_id.clone()),
                 provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id),
+                ctx.quota.sandbox_limit(&provider_id),
             )
             .await
             .map_err(map_provider_error)
@@ -2853,6 +2855,7 @@ impl SessionApplication {
                 ctx.owner_ref(),
                 snapshot.snapshot_id.clone(),
                 provider_options(&parent.workspace, &parent.isolation, &provider_id),
+                ctx.quota.sandbox_limit(&provider_id),
             )
             .await
             .map_err(map_provider_error);
@@ -3252,6 +3255,7 @@ impl SessionApplication {
             has_more,
             quota: TenantQuotaSnapshot {
                 max_sessions: ctx.quota.max_sessions,
+                max_sandboxes: ctx.quota.max_sandboxes.clone(),
                 active_sessions: page.total_active,
                 max_requests_per_minute: ctx.quota.max_requests_per_minute,
             },

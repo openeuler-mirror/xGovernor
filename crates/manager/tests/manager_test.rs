@@ -349,14 +349,132 @@ async fn start(
     runtime_id: &str,
     owner_ref: &str,
 ) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
+    start_with_limit(manager, runtime_id, owner_ref, None).await
+}
+
+async fn start_with_limit(
+    manager: &InstanceManager,
+    runtime_id: &str,
+    owner_ref: &str,
+    owner_limit: Option<u32>,
+) -> Result<Arc<dyn OperationBackend>, ProviderControlError> {
     manager
         .start_instance(
             runtime_id.to_string(),
             BackendId("fake".to_string()),
             owner_ref.to_string(),
             Value::Null,
+            owner_limit,
         )
         .await
+}
+
+#[tokio::test]
+async fn explicit_owner_limits_replace_the_default_and_preserve_usage_when_changed() {
+    let (manager, lifecycle, _) = manager_with(1, 100);
+    for id in ["a1", "a2", "a3"] {
+        start_with_limit(&manager, id, "tenant/a", Some(3))
+            .await
+            .unwrap();
+    }
+    for limit in [Some(0), Some(1), None, Some(3)] {
+        assert!(matches!(
+            expect_err(start_with_limit(&manager, "a4", "tenant/a", limit).await),
+            ProviderControlError::ResourceLimitExceeded { current: 3, .. }
+        ));
+    }
+    assert_eq!(manager.active_count("tenant/a"), 3);
+    assert_eq!(lifecycle.create_calls.load(Ordering::SeqCst), 3);
+    start(&manager, "b1", "tenant/b").await.unwrap();
+    assert!(start(&manager, "b2", "tenant/b").await.is_err());
+    start_with_limit(&manager, "a4", "tenant/a", Some(4))
+        .await
+        .unwrap();
+    for id in ["a1", "a2", "a3", "a4"] {
+        manager.stop_instance(id).await.unwrap();
+    }
+    start(&manager, "a5", "tenant/a").await.unwrap();
+    assert!(start(&manager, "a6", "tenant/a").await.is_err());
+}
+
+#[tokio::test]
+async fn explicit_owner_limit_still_obeys_the_shared_global_limit() {
+    let (manager, _, _) = manager_with(1, 2);
+    start_with_limit(&manager, "a1", "tenant/a", Some(50))
+        .await
+        .unwrap();
+    start_with_limit(&manager, "b1", "tenant/b", Some(50))
+        .await
+        .unwrap();
+    assert!(matches!(
+        expect_err(start_with_limit(&manager, "b2", "tenant/b", Some(50)).await),
+        ProviderControlError::ResourceLimitExceeded { owner_ref, current: 2, max: 2, .. }
+            if owner_ref.contains("global cap")
+    ));
+    start_with_limit(&manager, "admin1", ADMIN_OWNER_REF, Some(0))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_creates_reserve_explicit_owner_quota_before_provider_creation() {
+    let (manager, lifecycle, _) = manager_with(20, 100);
+    let gate = Arc::new(CreateGate {
+        entered: tokio::sync::Notify::new(),
+        proceed: tokio::sync::Notify::new(),
+    });
+    lifecycle.set_gate(Arc::clone(&gate));
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..20 {
+        let manager = Arc::clone(&manager);
+        tasks.spawn(async move {
+            start_with_limit(&manager, &format!("r{index}"), "tenant/a", Some(3))
+                .await
+                .is_ok()
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while lifecycle.create_calls.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..17 {
+            assert!(!tasks.join_next().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("excess requests must fail while admitted creates remain in flight");
+    assert_eq!(manager.active_count("tenant/a"), 3);
+    gate.proceed.notify_waiters();
+    while let Some(result) = tasks.join_next().await {
+        assert!(result.unwrap());
+    }
+    assert_eq!(lifecycle.create_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn snapshot_load_checks_zero_owner_quota_before_calling_the_provider() {
+    let (manager, _, _) = manager_with(20, 100);
+    let error = expect_err(
+        manager
+            .load_instance_from_snapshot(
+                "loaded".into(),
+                BackendId("fake".into()),
+                "tenant/a".into(),
+                ProviderSnapshotId("snapshot".into()),
+                Value::Null,
+                Some(0),
+            )
+            .await,
+    );
+    assert!(matches!(
+        error,
+        ProviderControlError::ResourceLimitExceeded {
+            current: 0,
+            max: 0,
+            ..
+        }
+    ));
+    assert_eq!(manager.global_active_count(), 0);
 }
 
 /// `Result<Arc<dyn OperationBackend>, _>::unwrap_err()` doesn't compile
@@ -852,6 +970,7 @@ async fn start_instance_then_backend_for_returns_a_working_backend_against_a_rea
             BackendId("local".to_string()),
             "test-owner".to_string(),
             serde_json::json!({ "workspace_root": workspace.to_string_lossy() }),
+            None,
         )
         .await
         .expect("start_instance should succeed");
@@ -939,6 +1058,7 @@ async fn reconcile_after_restart_rebuilds_a_local_instance_from_the_ledger_alone
                 BackendId("local".to_string()),
                 "test-owner".to_string(),
                 serde_json::json!({ "workspace_root": workspace.to_string_lossy() }),
+                None,
             )
             .await
             .expect("start_instance should succeed");

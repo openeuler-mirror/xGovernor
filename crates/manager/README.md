@@ -5,7 +5,7 @@
 **做什么**：
 
 - `start_instance`/`stop_instance`：创建/销毁一个 provider 实例，并把结果注册进内存registry + SQLite 账本(`backend::ProviderInstanceLedger`)。
-- 配额：`max_sandboxes_per_owner`/`max_sandboxes_global` 两级限制，`admin` 哨兵豁免。
+- 配额：`max_sandboxes_per_owner` 是 owner 默认值，Application 按 backend 从可信 `SecurityContext` 选择租户覆盖值，通过独立的 `owner_limit` 参数传入；显式值替代默认值，0 禁止新建。create/load 在同一把锁内检查并预占 owner 和 global 配额，`max_sandboxes_global` 为 manager 共享总量上限，`admin` 哨兵豁免两级检查。
 - 失败重试：create 路径有限次重试+补偿删除+配额回滚；delete 失败进入待重试队列，无限重试直到成功（避免资源泄漏）。
 - `reconcile()`：daemon 重启后，用账本记录逐条尝试 `attach()` 重建内存 registry——`attach()` 成功即恢复；仅明确 `NotFound` 才视为孤儿，Transport/Timeout/权限等错误保留台账并返回错误，不再依赖 provider 自己的 `list_instances()` 做门槛判断(2026-08-17 的架构修复，因为 `list_instances()` 对 local provider 而言重启后天然为空，会导致所有活跃行被误判为孤儿)。
 - `destroy_by_runtime_id`：绕开 attach，直接按账本行删 provider 实例，用于"重启后 close，还没来得及 reconcile"的场景。

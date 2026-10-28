@@ -112,6 +112,11 @@ cargo run -p xgovernor-server
 | `XGOVERNOR_STREAM_ENTRY_TTL_SECS` | `30` | Retention time for turn event streams awaiting an SSE subscriber (both listeners); positive integer seconds, invalid values warn and fall back to 30. Checked every 10 seconds; restart to apply. |
 | `XGOVERNOR_RECLAIM_SWEEP_INTERVAL_SECS` | `300` | Provider sandbox liveness sweep interval |
 | `E2B_API_KEY` | *(unset)* | If set, the `e2b` backend is registered (otherwise local-only) |
+| `XGOVERNOR_E2B_MAX_SANDBOXES_PER_OWNER` | `20` | Default E2B instance ceiling when the tenant omits `max_sandboxes.e2b` |
+| `XGOVERNOR_E2B_MAX_SANDBOXES_GLOBAL` | `1024` | Shared E2B instance ceiling for this server's E2B manager |
+| `XGOVERNOR_LOCAL_MAX_SANDBOXES_PER_OWNER` | `20` | Default local instance ceiling when the tenant omits `max_sandboxes.local` |
+| `XGOVERNOR_LOCAL_MAX_SANDBOXES_GLOBAL` | `1024` | Shared local instance ceiling for this server's local manager |
+| `XGOVERNOR_DOCKER_MAX_CONTAINERS` | `2` | Shared Docker container ceiling and default tenant ceiling when `max_sandboxes.docker` is omitted |
 | `XGOVERNOR_E2B_TIMEOUT_SECS` | `3600` | Default E2B sandbox timeout; explicit provider `timeout_secs` overrides it |
 | `XGOVERNOR_E2B_ACTIVITY_REFRESH_SECS` | `60` | Minimum spacing between E2B timeout refresh requests |
 | `E2B_API_URL` | `https://api.e2b.app` | E2B control-plane URL; set this for self-hosted E2B |
@@ -127,8 +132,18 @@ tokens = ["demo-admin-token"]
 [[tenant]]
 tenant_id = "demo-tenant"
 tokens = ["demo-tenant-token"]
-# principal, max_sessions, max_requests_per_minute are all optional
+max_sessions = 6
+max_sandboxes = { e2b = 3, docker = 3, local = 0 }
+# principal, max_sessions, max_sandboxes, max_requests_per_minute are optional
 ```
+
+`max_sandboxes` is a map keyed by backend ID (`local`, `e2b`, `docker`). In this example the tenant may use up to three E2B instances and three Docker containers; local creation is disabled. Each backend is counted independently, and all tokens for a tenant share its counters. An omitted backend inherits its default; an explicit value replaces that default, including values above 20. Zero blocks new instances for that backend. Unknown backend names, negative limits, and values above 4294967295 are rejected. `max_sessions` separately limits the tenant's active sessions across all backends; omit it for no session ceiling.
+
+The backend's shared total still applies across tenants, including instances used by admin requests. Admin requests bypass the manager's owner and global admission checks. For Docker, raise `XGOVERNOR_DOCKER_MAX_CONTAINERS` from its default of 2 to at least 3 to accommodate three containers for this tenant; size it for all tenants sharing the host. E2B platform capacity also applies independently of xG's limits. xG does not discover or synchronize E2B project quotas or count other clients' usage, and its manager totals are not shared across server processes.
+
+Changes through `POST /api/v1/admin/tenants` and `PATCH /api/v1/admin/tenants/{tenant_id}` persist to `tenants.toml` and hot-reload for subsequent requests. A PATCH such as `{"max_sandboxes":{"e2b":5}}` changes only E2B; `{"max_sandboxes":{"e2b":null}}` restores E2B's default; `{"max_sandboxes":null}` restores all backend defaults. Missing fields or an empty map leave existing entries unchanged. Manual file edits require `SIGHUP`. Lowering a quota preserves existing instances and rejects new creation until usage falls below the applicable owner and global limits; already-admitted requests may finish under their previous quota. Open, checkpoint load, and fork all reserve from the same tenant/backend counter; close releases a slot.
+
+Environment variables configure backend defaults and shared totals at startup; restart the server to change them. The local/E2B sandbox variables accept integers from 1 to 4294967295; invalid values reject startup for the enabled backend. Docker validates its own configuration separately.
 
 Minimal working configuration and a full single-session walkthrough are in [apps/runtime-pi/demo/easydemo.md](./apps/runtime-pi/demo/easydemo.md) (§2–§9). The one-line shape of it:
 

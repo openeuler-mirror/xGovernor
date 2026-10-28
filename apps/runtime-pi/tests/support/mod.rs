@@ -108,6 +108,7 @@ pub async fn runtime_context(root: &str) -> RuntimeExecutionContext {
             provider_protocol::BackendId(LOCAL_BACKEND_ID.into()),
             "admin".into(),
             json!({"workspace_root": root}),
+            None,
         )
         .await
         .expect("provider start must succeed");
@@ -267,6 +268,7 @@ pub async fn start_runtime(
             provider_protocol::BackendId(LOCAL_BACKEND_ID.into()),
             "admin".into(),
             json!({"workspace_root": workspace_root}),
+            None,
         )
         .await
         .expect("provider start must succeed");

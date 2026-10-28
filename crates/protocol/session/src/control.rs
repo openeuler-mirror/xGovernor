@@ -156,10 +156,13 @@ pub struct SessionSummary {
 /// Quota snapshot for the caller's own scope: an admin token sees the global
 /// count (no `max_sessions` ceiling), a tenant token sees its own tenant's
 /// count against its own ceiling (`docs/tenancy_design.md` §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantQuotaSnapshot {
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    /// Configured per-backend overrides; absent entries inherit defaults.
+    #[serde(default)]
+    pub max_sandboxes: crate::SandboxLimits,
     pub active_sessions: u32,
     #[serde(default)]
     pub max_requests_per_minute: Option<u32>,

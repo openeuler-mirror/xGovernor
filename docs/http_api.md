@@ -90,7 +90,7 @@
     }
   ],
   "has_more": false,
-  "quota": { "max_sessions": 10, "active_sessions": 1, "max_requests_per_minute": null }
+  "quota": { "max_sessions": 10, "active_sessions": 1, "max_sandboxes": { "e2b": 3, "docker": 5 }, "max_requests_per_minute": null }
 }
 ```
 
@@ -121,6 +121,7 @@
 - v1 无真正分页：`sessions` 最多返回服务端固定上限（当前 100）条最近更新的记录；`has_more` 为 true 表示调用方真实活跃会话数超过了这个上限。
 - `quota.active_sessions` 是调用方可见范围内的**真实计数**（来自 SQLite 查询），不受 `sessions` 截断影响。session 准入计数在 daemon 启动时也从同一 SQLite 聚合恢复；恢复失败时服务拒绝启动，避免重启绕过 `max_sessions`。
 - `quota.max_sessions` / `max_requests_per_minute` 直接取自调用方自身的配额配置；admin 身份没有配额上限，两个字段为 `null`。
+- `quota.max_sandboxes` 返回租户按 backend 配置的覆盖值映射，不是用量计数或容量预留。缺席的 backend 继承服务端默认值，空对象表示全部继承；admin 通常返回空对象且豁免 manager 的配额准入。共享总量和平台额度独立生效。
 - 不返回历史/已关闭会话，也不暴露审计日志——这两者是 v1 明确排除的范围（[tenancy_design.md](./tenancy_design.md) §4）。
 
 ### open
@@ -214,22 +215,23 @@
 **`POST /api/v1/admin/tenants`** — 新建租户。
 
 ```json
-{ "tenant_id": "acme", "principal": null, "max_sessions": 5, "max_requests_per_minute": null }
+{ "tenant_id": "acme", "principal": null, "max_sessions": 6, "max_sandboxes": { "e2b": 3, "docker": 3 }, "max_requests_per_minute": null }
 ```
 
 - `tenant_id` 必填、非空（去除首尾空白后仍为空则 400）；与已有 `[[tenant]]` 块的 `tenant_id` 冲突则 409。
 - `principal`、`max_sessions`、`max_requests_per_minute` 均可省略；`principal` 缺省为 `"tenant"`，配额字段缺省为 `null`（不设上限）——与 `tenants.toml` 文件本身的字段缺省语义一致。
+- `max_sandboxes` 是可选映射，键为 `local` / `e2b` / `docker`，值为 0–4294967295 的整数，0 禁止该 backend 新建实例。缺席的 backend 使用对应默认值，显式值可以高于默认值，但仍受 backend 共享总量约束。POST 缺席或 `{}` 表示全部继承，未知键或非法值会被拒绝；不接受旧的单个数字格式。
 - token **由服务端生成**（`xgt_` 前缀 + 40 位随机字母数字，约 238 bit 熵），不接受客户端传入。
 
 响应 201 `TenantCreateResponse`：
 
 ```json
-{ "tenant_id": "acme", "token": "xgt_...", "principal": "tenant", "max_sessions": 5, "max_requests_per_minute": null }
+{ "tenant_id": "acme", "token": "xgt_...", "principal": "tenant", "max_sessions": 6, "max_sandboxes": { "e2b": 3, "docker": 3 }, "max_requests_per_minute": null }
 ```
 
 - `token` **仅在这一次响应中以明文返回**——之后任何接口（含未来可能出现的租户查询接口）都不会再回显它；遗失即只能删除重建该租户，当前没有单独的 token 轮换接口。
 
-**`PATCH /api/v1/admin/tenants/{tenant_id}`** — 修改租户配额，**部分字段更新语义**：请求体中缺席的字段保持原值不变；字段存在且为 `null` 表示清空为不设上限；字段存在且为数字表示设置该值。
+**`PATCH /api/v1/admin/tenants/{tenant_id}`** — 修改租户配额，**部分字段更新语义**：请求体中缺席的字段保持原值不变；`max_sessions` / `max_requests_per_minute` 为 `null` 表示清空为不设上限，为数字表示设置该值。`max_sandboxes` 按 backend 合并更新：数字设置对应上限，某个键为 `null` 删除该覆盖值并恢复默认；整个 `max_sandboxes` 为 `null` 清空全部覆盖。缺席的键和空对象不会修改已有 backend 配置。
 
 ```json
 { "max_sessions": 20 }
@@ -238,6 +240,14 @@
 ```json
 { "max_sessions": null }
 ```
+
+```json
+{ "max_sandboxes": { "e2b": 3, "docker": 5, "local": 0 } }
+```
+
+修改会原子写入 `tenants.toml` 并热更新，后续请求无需重启；手工编辑文件后发送 `SIGHUP`。调低额度保留存量，只限制后续创建，已受理请求可以按原配额完成。open/load/fork 按目标或来源 backend 选择对应配额，在 manager 同一把锁内检查并预占，失败回滚，close 释放。配额由服务端管理员维护，不从租户请求的 provider options 或 ext 读取。
+
+local/E2B 默认每租户 20，可分别通过 `XGOVERNOR_LOCAL_MAX_SANDBOXES_PER_OWNER` / `XGOVERNOR_E2B_MAX_SANDBOXES_PER_OWNER` 设置缺省值；对应 `..._MAX_SANDBOXES_GLOBAL` 设置各自共享总量（默认 1024），环境变量修改后重启生效。Docker 的默认值和共享总量由 `XGOVERNOR_DOCKER_MAX_CONTAINERS` 控制，缺省 2，因此允许租户创建 3 个 Docker 实例时也需提高该共享容量。E2B 平台配额独立生效。
 
 目标 `tenant_id` 不存在返回 404 `tenant_not_found`。响应 200 `TenantPatchResponse`，形态同 `TenantCreateResponse` 但不含 `token` 字段。
 
