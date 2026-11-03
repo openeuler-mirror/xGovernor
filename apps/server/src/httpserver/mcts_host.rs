@@ -56,7 +56,7 @@ impl RealSessionHostApplication {
         llm_model: Option<&str>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, PluginHostError> {
-        let manifest_path = repo_root.join("testcases_union/plugin/plugin_manifest.json");
+        let manifest_path = repo_root.join("src/plugin/plugin_manifest.json");
         let manifest = PluginManifest::load(manifest_path)?;
         let profile_registry = ProfileRegistry::new(manifest, repo_root);
         let llm_policy = LlmPolicy::new(llm_model.unwrap_or("DeepSeek-V4-Pro"));

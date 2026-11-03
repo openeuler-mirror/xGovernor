@@ -59,7 +59,7 @@ mod tests {
     fn manifest() -> PluginManifest {
         serde_json::from_value(json!({
             "plugin_id": "mcts",
-            "resource_root": "testcases_union",
+            "resource_root": "src",
             "modes": {
                 "zsoft": {
                     "task_plugin_root": "res/task_plugins/zsoft",
@@ -81,7 +81,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let prompt_path = temp
             .path()
-            .join("testcases_union/res/task_plugins/zsoft/prompts/prompt_solver_step.txt");
+            .join("src/res/task_plugins/zsoft/prompts/prompt_solver_step.txt");
         fs::create_dir_all(prompt_path.parent().unwrap()).unwrap();
         fs::write(&prompt_path, "hello {{goal}}").unwrap();
 

@@ -416,13 +416,13 @@ pub fn build_launch_command(
         "mock" => {
             command
                 .arg("-m")
-                .arg("testcases_union.core.main")
+                .arg("src.core.main")
                 .arg("--mock");
         }
         "zsoft" => {
             command
                 .arg("-m")
-                .arg("testcases_union.core.main")
+                .arg("src.core.main")
                 .arg("--mode")
                 .arg("zsoft");
             if let Some(task_id) = request.task_id.as_deref() {
@@ -432,7 +432,7 @@ pub fn build_launch_command(
         "sweverified" => {
             command
                 .arg("-m")
-                .arg("testcases_union.core.main")
+                .arg("src.core.main")
                 .arg("--mode")
                 .arg("sweverified");
             if let Some(instance_id) = request.instance_id.as_deref() {

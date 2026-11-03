@@ -1,0 +1,2136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xgovernor:mcts:rpc:v1",
+  "title": "xGovernor hosted MCTS JSON-RPC v1",
+  "description": "Validates one protocol message. Manifest and method-specific success results use the named definitions. x-methods and x-notifications are lookup annotations, not validation keywords.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/notification"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "x-methods": {
+    "plugin.initialize": {
+      "params": {
+        "$ref": "#/$defs/PluginInitializeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginInitializeResult"
+      }
+    },
+    "plugin.start": {
+      "params": {
+        "$ref": "#/$defs/PluginStartParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginStartResult"
+      }
+    },
+    "plugin.wait": {
+      "params": {
+        "$ref": "#/$defs/PluginWaitParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginWaitResult"
+      }
+    },
+    "plugin.cancel": {
+      "params": {
+        "$ref": "#/$defs/PluginCancelParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginCancelResult"
+      }
+    },
+    "plugin.shutdown": {
+      "params": {
+        "$ref": "#/$defs/PluginShutdownParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginShutdownResult"
+      }
+    },
+    "host.snapshot": {
+      "params": {
+        "$ref": "#/$defs/HostSnapshotParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostSnapshotResult"
+      }
+    },
+    "host.fork": {
+      "params": {
+        "$ref": "#/$defs/HostForkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostForkResult"
+      }
+    },
+    "host.agent_turn": {
+      "params": {
+        "$ref": "#/$defs/HostAgentTurnParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostAgentTurnResult"
+      }
+    },
+    "host.inspect": {
+      "params": {
+        "$ref": "#/$defs/HostInspectParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostInspectResult"
+      }
+    },
+    "host.exec": {
+      "params": {
+        "$ref": "#/$defs/HostExecParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostExecResult"
+      }
+    },
+    "host.file_read": {
+      "params": {
+        "$ref": "#/$defs/HostFileReadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostFileReadResult"
+      }
+    },
+    "host.file_write": {
+      "params": {
+        "$ref": "#/$defs/HostFileWriteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostFileWriteResult"
+      }
+    },
+    "host.diff": {
+      "params": {
+        "$ref": "#/$defs/HostDiffParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostDiffResult"
+      }
+    },
+    "host.release": {
+      "params": {
+        "$ref": "#/$defs/HostReleaseParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostReleaseResult"
+      }
+    }
+  },
+  "x-notifications": {
+    "plugin.started": {
+      "params": {
+        "$ref": "#/$defs/PluginStartedParams"
+      }
+    },
+    "plugin.progress": {
+      "params": {
+        "$ref": "#/$defs/PluginProgressParams"
+      }
+    },
+    "plugin.completed": {
+      "params": {
+        "$ref": "#/$defs/PluginCompletedParams"
+      }
+    },
+    "plugin.cancelled": {
+      "params": {
+        "$ref": "#/$defs/PluginCancelledParams"
+      }
+    },
+    "plugin.failed": {
+      "params": {
+        "$ref": "#/$defs/PluginFailedParams"
+      }
+    },
+    "host.job.started": {
+      "params": {
+        "$ref": "#/$defs/HostJobStartedParams"
+      }
+    },
+    "host.job.output_delta": {
+      "params": {
+        "$ref": "#/$defs/HostJobOutputDeltaParams"
+      }
+    },
+    "host.job.tool_activity": {
+      "params": {
+        "$ref": "#/$defs/HostJobToolActivityParams"
+      }
+    },
+    "host.job.completed": {
+      "params": {
+        "$ref": "#/$defs/HostJobCompletedParams"
+      }
+    },
+    "host.job.failed": {
+      "params": {
+        "$ref": "#/$defs/HostJobFailedParams"
+      }
+    }
+  },
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        {
+          "type": "integer"
+        }
+      ]
+    },
+    "capability": {
+      "enum": [
+        "snapshot",
+        "fork",
+        "agent_turn",
+        "inspect",
+        "exec",
+        "file_read",
+        "file_write",
+        "diff",
+        "release"
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/capability"
+      },
+      "uniqueItems": true
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_iters": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branching": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "max_time_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "max_tokens": {
+          "$ref": "#/$defs/positiveInteger"
+        }
+      },
+      "required": [
+        "max_iters",
+        "branching",
+        "max_time_ms",
+        "max_tokens"
+      ],
+      "additionalProperties": false
+    },
+    "usage": {
+      "type": "object",
+      "description": "Host-owned usage counters. Counter names are negotiated by the host; values are non-negative integers. An empty object means unavailable, not zero usage.",
+      "additionalProperties": {
+        "$ref": "#/$defs/nonNegativeInteger"
+      }
+    },
+    "failure": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "message": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "evidence_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "kind": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "content": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "kind",
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "state_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "evaluation_version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "candidate_id",
+        "state_id",
+        "score",
+        "evaluation_version",
+        "summary",
+        "evidence_refs"
+      ],
+      "additionalProperties": false
+    },
+    "applyPlan": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "const": "continue_from_state"
+            },
+            "state_id": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "base_state_id": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          },
+          "required": [
+            "kind",
+            "state_id",
+            "base_state_id"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "completionResult": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "completed"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "answer": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "selected_candidate_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/candidate"
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "apply_plan": {
+          "$ref": "#/$defs/applyPlan"
+        }
+      },
+      "required": [
+        "status",
+        "summary",
+        "answer",
+        "stop_reason",
+        "selected_candidate_id",
+        "candidates",
+        "evidence",
+        "limitations",
+        "apply_plan"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "selected_candidate_id": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "apply_plan": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "candidates": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "$comment": "Runtime checks: selected_candidate_id must resolve in candidates; evidence_refs must resolve in evidence; IDs must be unique; apply_plan state must match the selected candidate and authorized root."
+    },
+    "PluginInitializeParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "supported_api_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "host_version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "available_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "supported_api_versions",
+        "host_version",
+        "available_capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "PluginInitializeResult": {
+      "type": "object",
+      "properties": {
+        "api_version": {
+          "const": "mcts.rpc.v1"
+        },
+        "plugin_version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "required_host_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "optional_host_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        }
+      },
+      "required": [
+        "api_version",
+        "plugin_version",
+        "required_host_capabilities",
+        "optional_host_capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "PluginStartParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "session_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "turn_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "root_state_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "goal": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "content": {
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "granted_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "session_id",
+        "turn_id",
+        "root_state_id",
+        "goal",
+        "content",
+        "budget",
+        "granted_capabilities"
+      ],
+      "additionalProperties": false
+    },
+    "PluginStartResult": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "const": "accepted"
+        }
+      },
+      "required": [
+        "run_id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "PluginWaitParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "after_sequence": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 30000
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "after_sequence",
+        "timeout_ms"
+      ],
+      "additionalProperties": false
+    },
+    "PluginWaitResult": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "enum": [
+            "accepted",
+            "running",
+            "cancelling",
+            "completed",
+            "cancelled",
+            "failed"
+          ]
+        },
+        "sequence": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/completionResult"
+        },
+        "failure": {
+          "$ref": "#/$defs/failure"
+        },
+        "reason": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_input": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "status",
+        "sequence",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "result"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "result"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "failure"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "failure"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PluginCancelParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "reason": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "PluginCancelResult": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "enum": [
+            "cancelling",
+            "completed",
+            "cancelled",
+            "failed"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "PluginShutdownParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "grace_period_ms": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "grace_period_ms"
+      ],
+      "additionalProperties": false
+    },
+    "PluginShutdownResult": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "const": "stopped"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "HostSnapshotParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostSnapshotResult": {
+      "type": "object",
+      "properties": {
+        "state_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "state_id",
+        "expires_at"
+      ],
+      "additionalProperties": false
+    },
+    "HostForkParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "parent_state_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "parent_state_id",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostForkResult": {
+      "type": "object",
+      "properties": {
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "branch_id"
+      ],
+      "additionalProperties": false
+    },
+    "HostAgentTurnParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "input": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "profile": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "input",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostAgentTurnResult": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "const": "accepted"
+        }
+      },
+      "required": [
+        "job_id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "HostInspectParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "view": {
+          "enum": [
+            "summary",
+            "output"
+          ]
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "view"
+      ],
+      "additionalProperties": false
+    },
+    "HostInspectResult": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "HostExecParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "argv",
+        "cwd",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostExecResult": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "const": "accepted"
+        }
+      },
+      "required": [
+        "job_id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "base64": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?(?![\\s\\S])"
+    },
+    "HostFileReadParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "HostFileReadResult": {
+      "type": "object",
+      "properties": {
+        "content_base64": {
+          "$ref": "#/$defs/base64"
+        }
+      },
+      "required": [
+        "content_base64"
+      ],
+      "additionalProperties": false
+    },
+    "HostFileWriteParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "content_base64": {
+          "$ref": "#/$defs/base64"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "path",
+        "content_base64",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostFileWriteResult": {
+      "type": "object",
+      "properties": {
+        "written_bytes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "required": [
+        "written_bytes"
+      ],
+      "additionalProperties": false
+    },
+    "HostDiffParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "base_state_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "base_state_id"
+      ],
+      "additionalProperties": false
+    },
+    "HostDiffResult": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "HostReleaseParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "timeout_ms": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "branch_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "timeout_ms",
+        "branch_id",
+        "idempotency_key"
+      ],
+      "additionalProperties": false
+    },
+    "HostReleaseResult": {
+      "type": "object",
+      "properties": {
+        "released": {
+          "const": true
+        }
+      },
+      "required": [
+        "released"
+      ],
+      "additionalProperties": false
+    },
+    "PluginStartedParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "sequence"
+      ],
+      "additionalProperties": false
+    },
+    "PluginProgressParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "expanded_nodes": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "active_branches": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "best_candidate_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "sequence",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "PluginCompletedParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "result": {
+          "$ref": "#/$defs/completionResult"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "sequence",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "PluginCancelledParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "reason": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_input": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "sequence",
+        "reason",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "PluginFailedParams": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "failure": {
+          "$ref": "#/$defs/failure"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_input": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "run_id",
+        "sequence",
+        "failure",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "HostJobStartedParams": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        }
+      },
+      "required": [
+        "run_id",
+        "job_id",
+        "sequence"
+      ],
+      "additionalProperties": false
+    },
+    "HostJobOutputDeltaParams": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "stream": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "delta": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "job_id",
+        "sequence",
+        "stream",
+        "delta"
+      ],
+      "additionalProperties": false
+    },
+    "HostJobToolActivityParams": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "job_id",
+        "sequence",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "HostJobCompletedParams": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "output": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "run_id",
+        "job_id",
+        "sequence",
+        "output",
+        "usage"
+      ],
+      "additionalProperties": false,
+      "$comment": "For host.exec jobs exit_code is required. The host must correlate job_id with its originating method; that cross-message check cannot be expressed in this standalone schema."
+    },
+    "HostJobFailedParams": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "job_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "failure": {
+          "$ref": "#/$defs/failure"
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        }
+      },
+      "required": [
+        "run_id",
+        "job_id",
+        "sequence",
+        "failure",
+        "usage"
+      ],
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "enum": [
+            "plugin.initialize",
+            "plugin.start",
+            "plugin.wait",
+            "plugin.cancel",
+            "plugin.shutdown",
+            "host.snapshot",
+            "host.fork",
+            "host.agent_turn",
+            "host.inspect",
+            "host.exec",
+            "host.file_read",
+            "host.file_write",
+            "host.diff",
+            "host.release"
+          ]
+        },
+        "params": {
+          "type": "object"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.initialize"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginInitializeParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.start"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginStartParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.wait"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginWaitParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.cancel"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginCancelParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.shutdown"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginShutdownParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.snapshot"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostSnapshotParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.fork"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostForkParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.agent_turn"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostAgentTurnParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.inspect"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostInspectParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.exec"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostExecParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.file_read"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostFileReadParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.file_write"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostFileWriteParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.diff"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostDiffParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.release"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostReleaseParams"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "notification": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "enum": [
+            "plugin.started",
+            "plugin.progress",
+            "plugin.completed",
+            "plugin.cancelled",
+            "plugin.failed",
+            "host.job.started",
+            "host.job.output_delta",
+            "host.job.tool_activity",
+            "host.job.completed",
+            "host.job.failed"
+          ]
+        },
+        "params": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.started"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginStartedParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.progress"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginProgressParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.completed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginCompletedParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginCancelledParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "plugin.failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/PluginFailedParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.job.started"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostJobStartedParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.job.output_delta"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostJobOutputDeltaParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.job.tool_activity"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostJobToolActivityParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.job.completed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostJobCompletedParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "const": "host.job.failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "$ref": "#/$defs/HostJobFailedParams"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "rpcError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "enum": [
+            -32700,
+            -32600,
+            -32601,
+            -32602,
+            -32603,
+            -32010,
+            -32009,
+            -32008,
+            -32007,
+            -32006,
+            -32005,
+            -32004,
+            -32003,
+            -32002,
+            -32001
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "data": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "response": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "result": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "id",
+            "result"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "id": {
+              "$ref": "#/$defs/id"
+            },
+            "error": {
+              "$ref": "#/$defs/rpcError"
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "id",
+            "error"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "jsonrpc": {
+              "const": "2.0"
+            },
+            "id": {
+              "type": "null"
+            },
+            "error": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/rpcError"
+                },
+                {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        -32700,
+                        -32600
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "required": [
+            "jsonrpc",
+            "id",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$comment": "Responses do not carry method. Correlate id to the request, then validate result using x-methods[method].result. The root schema validates only the response envelope."
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "version": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "api_version": {
+          "const": "mcts.rpc.v1"
+        },
+        "triggers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "methods": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "plugin.initialize",
+              "plugin.start",
+              "plugin.wait",
+              "plugin.cancel",
+              "plugin.shutdown"
+            ]
+          },
+          "uniqueItems": true,
+          "minItems": 1
+        },
+        "required_host_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "optional_host_capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "plugin.started",
+              "plugin.progress",
+              "plugin.completed",
+              "plugin.cancelled",
+              "plugin.failed"
+            ]
+          },
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "plugin_id",
+        "version",
+        "api_version",
+        "triggers",
+        "methods",
+        "required_host_capabilities",
+        "optional_host_capabilities",
+        "events"
+      ],
+      "additionalProperties": false,
+      "$comment": "The host additionally checks that required and optional capability sets do not overlap, all lifecycle methods are supported, and all required capabilities are granted."
+    }
+  }
+}

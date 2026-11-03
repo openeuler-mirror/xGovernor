@@ -1,0 +1,6 @@
+config.env
+output/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
