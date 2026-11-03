@@ -1342,6 +1342,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcts-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "mcts-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mcts-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3457,9 +3481,11 @@ dependencies = [
  "async-trait",
  "axum",
  "backend",
+ "base64",
  "dirs",
  "futures-util",
  "http-body-util",
+ "mcts-plugin-host",
  "provider-protocol",
  "rand 0.8.7",
  "serde",

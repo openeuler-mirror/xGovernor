@@ -1,5 +1,6 @@
 use super::admin_tenants::{admin_tenants_router, TenantAdminState};
 use super::auth::{require_role, security_layer, TokenTable};
+use super::mcts::{mcts_router, MctsHttpState, MctsLaunchConfig};
 use super::session::{session_router, SessionHttpState};
 use axum::{http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
@@ -101,6 +102,7 @@ async fn operation_timeout(
         | "/api/v1/sessions/load"
         | "/api/v1/sessions/checkpoint"
         | "/api/v1/sessions/fork" => Duration::from_secs(900),
+        "/api/v1/mcts/runs" => Duration::from_secs(900),
         _ => REQUEST_TIMEOUT,
     };
     match tokio::time::timeout(budget, next.run(request)).await {
@@ -145,7 +147,11 @@ pub fn create_router(
     let state = Arc::new(session_state);
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
-        .merge(session_router(state.clone()));
+        .merge(session_router(state.clone()))
+        .merge(mcts_router(MctsHttpState::with_session(
+            MctsLaunchConfig::default(),
+            state.application().clone(),
+        )));
     if let Some(tenant_admin_state) = tenant_admin {
         router = router.merge(admin_tenants_router(tenant_admin_state));
     }

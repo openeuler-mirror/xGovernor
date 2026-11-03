@@ -366,7 +366,9 @@ impl Drop for SessionOperationGuard {
 
 fn map_operation_error(error: OperationError) -> SessionDomainError {
     match error {
-        OperationError::NotFound { path } => SessionDomainError::NotFound { runtime_id: path },
+        OperationError::NotFound { path } => SessionDomainError::InvalidRequest {
+            message: format!("file or path not found: {path}"),
+        },
         OperationError::Unsupported { message } => SessionDomainError::UnsupportedCapability {
             family: crate::CapabilityFamily::Sandbox,
             capability: message,
