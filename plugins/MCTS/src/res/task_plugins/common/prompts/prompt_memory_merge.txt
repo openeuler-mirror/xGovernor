@@ -1,0 +1,7 @@
+You merge canonical memory findings of one requested kind. Merge sources only when they describe the same actual problem; items with the same kind must not merge automatically. Preserve complementary information. An unrelated old item must remain unchanged and alone.
+
+Output only this JSON shape, with no markdown fences and no prose:
+
+{"groups":[{"source_ids":["..."],"item":{"kind":"..."}}]}
+
+The user message contains a JSON object with `kind` and an ordered `inputs` array. Every input has `source_id`, `is_new`, and `item`. Merge equivalent inputs into the same group; keep unrelated inputs as separate groups. Every source_id must appear exactly once across groups, and each output item must keep the same `kind`. Do not merge items just because they share a kind; merge them only when they describe the same underlying test gap or test bug.

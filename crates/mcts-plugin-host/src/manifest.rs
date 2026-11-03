@@ -147,7 +147,7 @@ mod tests {
     fn valid_manifest() -> PluginManifest {
         serde_json::from_value(serde_json::json!({
             "plugin_id": "mcts",
-            "resource_root": "testcases_union",
+            "resource_root": "src",
             "modes": {
                 "zsoft": {
                     "task_plugin_root": "res/task_plugins/zsoft",
@@ -202,7 +202,7 @@ mod tests {
     fn accepts_explicit_tools_disabled() {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
             "plugin_id": "mcts",
-            "resource_root": "testcases_union",
+            "resource_root": "src",
             "modes": {
                 "zsoft": {
                     "task_plugin_root": "res/task_plugins/zsoft",

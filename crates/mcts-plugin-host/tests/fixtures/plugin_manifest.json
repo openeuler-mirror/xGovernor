@@ -1,6 +1,6 @@
 {
   "plugin_id": "mcts",
-  "resource_root": "testcases_union",
+  "resource_root": "src",
   "modes": {
     "zsoft": {
       "task_plugin_root": "res/task_plugins/zsoft",

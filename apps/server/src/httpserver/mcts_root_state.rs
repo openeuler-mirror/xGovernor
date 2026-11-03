@@ -47,7 +47,7 @@ pub(crate) async fn prepare_native_root_state(
     command
         .current_dir(repo_root)
         .arg("-m")
-        .arg("testcases_union.harness.xg_root_state_prepare")
+        .arg("src.harness.xg_root_state_prepare")
         .arg("--mode")
         .arg(mode)
         .arg("--task-id")
