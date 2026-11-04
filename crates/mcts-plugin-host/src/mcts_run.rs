@@ -412,17 +412,19 @@ pub fn build_launch_command(
     request: &MctsRunRequest,
 ) -> Command {
     let mut command = Command::new(python_bin);
+    let entry_module = std::env::var("MCTS_PLUGIN_ENTRY_MODULE")
+        .unwrap_or_else(|_| "src.core.main".to_string());
     match request.mode.as_str() {
         "mock" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mock");
         }
         "zsoft" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mode")
                 .arg("zsoft");
             if let Some(task_id) = request.task_id.as_deref() {
@@ -432,7 +434,7 @@ pub fn build_launch_command(
         "sweverified" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mode")
                 .arg("sweverified");
             if let Some(instance_id) = request.instance_id.as_deref() {

@@ -19,6 +19,7 @@ use session_protocol::{
     SessionExecRequest, SessionExtensions, SessionFileReadRequest, SessionFileWriteRequest,
     SessionLeaseClaim, SessionLoadRequest, SessionRuntimeCapability, SessionSandboxCapability,
     SessionTurnRequest, SessionUsageReport,
+    DeploymentProfile,
 };
 use xgovernor_core::{SecurityContext, SessionApplication, SessionDomainError};
 
@@ -56,7 +57,9 @@ impl RealSessionHostApplication {
         llm_model: Option<&str>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, PluginHostError> {
-        let manifest_path = repo_root.join("src/plugin/plugin_manifest.json");
+        let manifest_rel = std::env::var("MCTS_PLUGIN_MANIFEST")
+            .unwrap_or_else(|_| "src/plugin/plugin_manifest.json".to_string());
+        let manifest_path = repo_root.join(manifest_rel);
         let manifest = PluginManifest::load(manifest_path)?;
         let profile_registry = ProfileRegistry::new(manifest, repo_root);
         let llm_policy = LlmPolicy::new(llm_model.unwrap_or("DeepSeek-V4-Pro"));
@@ -115,14 +118,18 @@ impl RealSessionHostApplication {
         }
     }
 
-    fn load_request(&self, checkpoint_id: &str) -> SessionLoadRequest {
+    fn load_request(&self, checkpoint_id: &str, offline: bool) -> SessionLoadRequest {
+        let mut deployment = DeploymentProfile::default();
+        deployment.options = json!({
+            "provider_options": {"allow_internet_access": !offline}
+        });
         SessionLoadRequest {
             checkpoint_id: checkpoint_id.to_string(),
             runtime_id: None,
             conversation_id: Some(format!("mcts:{}", self.client_id)),
             sender_id: Some("mcts".to_string()),
             requested_capabilities: Self::capabilities(),
-            deployment: Default::default(),
+            deployment,
             lease: self.lease(),
             llm: self.load_llm(),
         }
@@ -316,10 +323,10 @@ impl HostApplication for RealSessionHostApplication {
         })
     }
 
-    async fn fork(&self, _run_id: &str, parent_state_id: &str) -> Result<String, PluginHostError> {
+    async fn fork(&self, _run_id: &str, parent_state_id: &str, offline: bool) -> Result<String, PluginHostError> {
         let opened = self
             .session
-            .load_checkpoint(&self.ctx, self.load_request(parent_state_id))
+            .load_checkpoint(&self.ctx, self.load_request(parent_state_id, offline))
             .await
             .map_err(Self::session_error)?;
         Ok(opened.runtime_id)

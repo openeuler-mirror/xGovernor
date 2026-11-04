@@ -2478,13 +2478,24 @@ impl SessionApplication {
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
         let intent_id = format!("load:{runtime_id}");
         self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"load","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"target":runtime_id})).await?;
+        let mut isolation_options = provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id);
+        if let Some(request_options) = request
+            .deployment
+            .options
+            .get("provider_options")
+            .and_then(|value| value.as_object())
+        {
+            for (key, value) in request_options {
+                isolation_options[key] = value.clone();
+            }
+        }
         let backend = match manager
             .load_instance_from_snapshot(
                 runtime_id.clone(),
                 provider_protocol::BackendId(provider_id.clone()),
                 ctx.owner_ref(),
                 provider_protocol::ProviderSnapshotId(checkpoint.provider_snapshot_id.clone()),
-                provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id),
+                isolation_options,
                 ctx.quota.sandbox_limit(&provider_id),
             )
             .await

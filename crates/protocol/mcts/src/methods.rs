@@ -125,6 +125,8 @@ pub struct HostForkParams {
     pub timeout_ms: u64,
     pub parent_state_id: String,
     pub idempotency_key: String,
+    #[serde(default)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
