@@ -238,6 +238,8 @@ async fn create_run(
             &request.mode,
             task_id,
             &request.run_id,
+            request.goal.as_str(),
+            request.task_spec.as_ref(),
         )
         .await
         .map_err(|error| MctsApiError {
