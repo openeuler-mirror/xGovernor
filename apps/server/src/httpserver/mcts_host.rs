@@ -35,6 +35,15 @@ const JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// enforce it; this value keeps the wire contract valid in the meantime.
 const STATE_EXPIRES_AT: &str = "2099-12-31T23:59:59Z";
 
+fn provider_options_for_backend(offline: bool, backend: Option<&str>) -> serde_json::Value {
+    match backend {
+        Some("docker") => json!({}),
+        _ => json!({
+            "provider_options": {"allow_internet_access": !offline}
+        }),
+    }
+}
+
 pub struct RealSessionHostApplication {
     session: SessionApplication,
     ctx: SecurityContext,
@@ -118,11 +127,14 @@ impl RealSessionHostApplication {
         }
     }
 
-    fn load_request(&self, checkpoint_id: &str, offline: bool) -> SessionLoadRequest {
+    fn load_request(
+        &self,
+        checkpoint_id: &str,
+        offline: bool,
+        backend: Option<&str>,
+    ) -> SessionLoadRequest {
         let mut deployment = DeploymentProfile::default();
-        deployment.options = json!({
-            "provider_options": {"allow_internet_access": !offline}
-        });
+        deployment.options = provider_options_for_backend(offline, backend);
         SessionLoadRequest {
             checkpoint_id: checkpoint_id.to_string(),
             runtime_id: None,
@@ -323,10 +335,23 @@ impl HostApplication for RealSessionHostApplication {
         })
     }
 
-    async fn fork(&self, _run_id: &str, parent_state_id: &str, offline: bool) -> Result<String, PluginHostError> {
+    async fn fork(
+        &self,
+        _run_id: &str,
+        parent_state_id: &str,
+        offline: bool,
+    ) -> Result<String, PluginHostError> {
+        let backend = self
+            .session
+            .checkpoint_backend(&self.ctx, parent_state_id)
+            .await
+            .map_err(Self::session_error)?;
         let opened = self
             .session
-            .load_checkpoint(&self.ctx, self.load_request(parent_state_id, offline))
+            .load_checkpoint(
+                &self.ctx,
+                self.load_request(parent_state_id, offline, backend.as_deref()),
+            )
             .await
             .map_err(Self::session_error)?;
         Ok(opened.runtime_id)
@@ -591,5 +616,25 @@ mod tests {
     #[test]
     fn formats_epoch_as_rfc3339() {
         assert_eq!(rfc3339_from_unix_ms(0), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn provider_options_split_by_checkpoint_backend() {
+        assert_eq!(
+            provider_options_for_backend(false, Some("docker")),
+            json!({})
+        );
+        assert_eq!(
+            provider_options_for_backend(false, Some("e2b")),
+            json!({"provider_options": {"allow_internet_access": true}})
+        );
+        assert_eq!(
+            provider_options_for_backend(true, Some("e2b")),
+            json!({"provider_options": {"allow_internet_access": false}})
+        );
+        assert_eq!(
+            provider_options_for_backend(false, None),
+            json!({"provider_options": {"allow_internet_access": true}})
+        );
     }
 }

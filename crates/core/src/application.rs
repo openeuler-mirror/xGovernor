@@ -2190,6 +2190,25 @@ impl SessionApplication {
         })
     }
 
+    /// Resolve the provider backend a checkpoint was created on by reading its
+    /// persisted ``isolation.metadata``. MCTS fork uses this to decide whether
+    /// to send e2b-specific provider options or leave docker options to core.
+    pub async fn checkpoint_backend(
+        &self,
+        ctx: &SecurityContext,
+        checkpoint_id: &str,
+    ) -> Result<Option<String>, SessionDomainError> {
+        let record = self
+            .records
+            .get_checkpoint(checkpoint_id)
+            .await?
+            .filter(|record| ctx.owns(record.tenant_id.as_deref()))
+            .ok_or_else(|| SessionDomainError::NotFound {
+                runtime_id: checkpoint_id.to_string(),
+            })?;
+        Ok(provider_id_from_metadata(&record.isolation.metadata).map(str::to_owned))
+    }
+
     pub async fn checkpoint(
         &self,
         ctx: &SecurityContext,
