@@ -4,23 +4,12 @@
 //!
 //! `pi` persists each message as its `message_end` arrives, so a process
 //! killed mid-turn can leave the newest file ending on that turn's user
-//! message, a tool result, or a `pending` assistant message. The normal
-//! restore path treats that as `pi_session_state_lost` rather than handing a
-//! half-finished turn to a new process. This module's job is therefore to
-//! confirm the latest file ends on a completed assistant turn before trusting
-//! it enough to spawn `pi --session <path>`. The normal path never repairs or
-//! rewrites a session file — a file that fails validation is reported, never
-//! touched. [`truncate_to_last_complete_turn`] is the one explicit exception,
-//! reserved for the forced-cancel restart path where this process itself
-//! killed `pi` mid-turn.
-//!
-//! `pi` may append bookkeeping records after a completed turn — `compaction`
-//! (context-compaction summaries), `model_change`, `thinking_level_change` —
-//! none of which are `message` records. Validation therefore anchors on the
-//! last `message`-typed record (which must be a completed assistant turn: a
-//! non-empty `stopReason` other than `pending` or `toolUse`) and tolerates
-//! trailing bookkeeping records after it; only a physically half-written
-//! trailing line (failed JSON parse) is treated as truncation.
+//! message, a tool result, a `pending` assistant message, or a physically
+//! half-written JSON line. A restart cannot resume that in-flight turn, but it
+//! can safely discard its tail: [`latest_complete_turn_file_repairing_crash_tail`]
+//! truncates back to the last completed assistant turn and re-validates,
+//! preserving all completed history. Non-tail errors (I/O, missing directory)
+//! still fail closed.
 
 use std::path::{Path, PathBuf};
 
@@ -73,17 +62,44 @@ impl std::fmt::Display for SessionFileError {
 /// Finds the most recently modified `*.jsonl` file directly inside
 /// `session_dir` (pi lays these out flat when given an explicit
 /// `--session-dir` — F13) and validates that its last `message`-typed record
-/// is a fully-formed, terminal assistant message (F14: pi writes an entire
-/// turn atomically, so a valid last message record means the file holds no
-/// half-written turn). Trailing non-`message` bookkeeping records that `pi`
-/// appends after a completed turn — e.g. `compaction` summaries,
-/// `model_change`, `thinking_level_change` — are tolerated after it. Returns
-/// the file's path on success; otherwise a [`SessionFileError`] describing
-/// exactly what did not hold.
+/// is a fully-formed, terminal assistant message. Trailing non-`message`
+/// bookkeeping records that `pi` appends after a completed turn — e.g.
+/// `compaction` summaries, `model_change`, `thinking_level_change` — are
+/// tolerated after it. Returns the file's path on success; otherwise a
+/// [`SessionFileError`] describing exactly what did not hold. This strict
+/// variant does not repair; restore paths should use
+/// [`latest_complete_turn_file_repairing_crash_tail`].
 pub(crate) fn latest_complete_turn_file(session_dir: &Path) -> Result<PathBuf, SessionFileError> {
     let latest = latest_session_file(session_dir)?;
     validate_last_line_is_complete_turn(&latest)?;
     Ok(latest)
+}
+
+pub(crate) fn latest_complete_turn_file_repairing_crash_tail(
+    session_dir: &Path,
+) -> Result<Option<PathBuf>, SessionFileError> {
+    match latest_complete_turn_file(session_dir) {
+        Ok(path) => Ok(Some(path)),
+        Err(SessionFileError::NoSessionFiles(_)) => Ok(None),
+        Err(error) if is_crash_tail_error(&error) => {
+            truncate_to_last_complete_turn(session_dir)?;
+            match latest_complete_turn_file(session_dir) {
+                Ok(path) => Ok(Some(path)),
+                Err(SessionFileError::NoSessionFiles(_)) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_crash_tail_error(error: &SessionFileError) -> bool {
+    matches!(
+        error,
+        SessionFileError::Empty(_)
+            | SessionFileError::LastLineNotJson { .. }
+            | SessionFileError::LastLineNotCompleteAssistantMessage { .. }
+    )
 }
 
 /// Newest `*.jsonl` in `session_dir`, with no completeness judgement. Used by
@@ -130,20 +146,22 @@ fn latest_session_file(session_dir: &Path) -> Result<PathBuf, SessionFileError> 
 
 pub(crate) fn truncate_to_last_complete_turn(session_dir: &Path) -> Result<(), SessionFileError> {
     let path = latest_session_file(session_dir)?;
-    let contents = std::fs::read_to_string(&path).map_err(|error| SessionFileError::Io {
+    // Work on raw bytes: a SIGKILL can also cut a multi-byte UTF-8 sequence
+    // in half, and that tail must not make the whole repair fail.
+    let contents = std::fs::read(&path).map_err(|error| SessionFileError::Io {
         path: path.clone(),
         message: error.to_string(),
     })?;
 
     let mut cut = 0usize;
     let mut offset = 0usize;
-    for line in contents.split_inclusive('\n') {
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
         offset += line.len();
-        let trimmed = line.trim();
+        let trimmed = trim_ascii_line(line);
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(trimmed) else {
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
@@ -189,22 +207,38 @@ pub(crate) fn truncate_to_last_complete_turn(session_dir: &Path) -> Result<(), S
     Ok(())
 }
 
+fn trim_ascii_line(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &line[start..end]
+}
+
 fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileError> {
-    let contents = std::fs::read_to_string(path).map_err(|error| SessionFileError::Io {
+    // Raw bytes, not `read_to_string`: a crash can cut a UTF-8 sequence in
+    // half, and that must be reported as a repairable JSON tail rather than an
+    // opaque I/O error.
+    let contents = std::fs::read(path).map_err(|error| SessionFileError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
     let mut lines = contents
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty());
+        .split(|byte| *byte == b'\n')
+        .map(trim_ascii_line)
+        .filter(|line| !line.is_empty())
+        .rev();
     let last_line = lines
         .next()
         .ok_or_else(|| SessionFileError::Empty(path.to_path_buf()))?;
 
     // Truncation gate: the physical last line must parse as JSON. A
     // half-written trailing line means the process was killed mid-append.
-    serde_json::from_str::<serde_json::Value>(last_line).map_err(|error| {
+    let last_value = serde_json::from_slice::<serde_json::Value>(last_line).map_err(|error| {
         SessionFileError::LastLineNotJson {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -219,12 +253,9 @@ fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileErr
     // records at all. `toolUse` is a completed assistant *message* but not a
     // completed turn — the next entries are its tool results — so resuming
     // there would leave a dangling tool call.
-    for line in std::iter::once(last_line).chain(lines) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            // Only the physical last line must parse (checked above); an
-            // unparseable line in the middle cannot be a truncation tail.
-            continue;
-        };
+    let candidates = std::iter::once(last_value)
+        .chain(lines.filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok()));
+    for value in candidates {
         if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
             continue;
         }

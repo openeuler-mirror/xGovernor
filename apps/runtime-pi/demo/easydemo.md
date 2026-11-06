@@ -323,9 +323,10 @@ turn 不会在重启后自动恢复（它所附着的沙箱本身不受影响，
   无实例」缝隙时会惰性复原：向 `InstanceManager` 要回既有沙箱（e2b 经平台重新校验存活并重拉
   access token），`pi --mode rpc --session <最新 jsonl> --session-dir <per-runtime dir>`
   重新拉起并加载会话文件——上下文真实延续（§10.5 已实跑）。两个 fail-closed 场景按设计**不**
-  静默降级：① 沙箱已死（e2b 过期/被回收）→ `pi_sandbox_gone`，行置 `failed`；② 会话文件缺失或
-  末行校验不通过（`pi_session_state_lost`）——不会"看起来复原了其实失忆"。进行中的 turn 按设计
-  丢弃不续跑（pi 本身按整 turn 批量落盘，SIGKILL 后磁盘精确停在上一个完整 turn）。
+  静默降级：① 沙箱已死（e2b 过期/被回收）→ `pi_sandbox_gone`，行置 `failed`；② 会话目录缺失或
+  非尾部损坏（`pi_session_state_lost`）。SIGKILL 留下的半行 JSON 或未完成 turn 属于可截断的崩溃尾：
+  恢复前先按 `worker.pgid` 回收遗留 worker 进程组，再把 JSONL truncate 到最后一条完整 assistant turn，
+  然后继续；进行中的 turn 按设计丢弃不续跑。
 - 工具执行本身（读写文件、跑命令、grep）不再直接碰 daemon 本机文件系统——它们经桥接层落到 `InstanceManager` provision 出来的沙箱里，
 沙箱边界与隔离级别由所选 `backend_id` 决定（`local` 沙箱仍是本机一个目录，隔离级别与之前一致；`e2b` 是真正的远程沙箱）。
 - Steering（turn 进行中插话）不在范围内（架构决策，见本文件开头链接的两篇文档）——一个 turn 提交后只能等它结束或整体 `cancel`，不能中途

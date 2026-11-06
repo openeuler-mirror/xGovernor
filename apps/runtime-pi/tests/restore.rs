@@ -455,3 +455,109 @@ async fn restart_with_trailing_compaction_record_still_restores_the_session() {
         .events
         .expect("resumed turn carries an event stream");
 }
+
+/// A worker SIGKILLed mid-turn can leave the newest JSONL ending on the
+/// in-flight turn's user message or a physically half-written line. Lazy
+/// restoration must trim that crash tail back to the last completed turn and
+/// resume, instead of failing the whole session with `pi_session_state_lost`.
+fn seed_torn_session_file(session_dir: &str, file_name: &str) -> String {
+    let path = Path::new(session_dir).join(file_name);
+    std::fs::write(
+        &path,
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"first\"}}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"done\",\"stopReason\":\"end_turn\",\"usage\":{\"input\":100000,\"output\":2000,\"totalTokens\":102000}}}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"interrupted\"}}\n\
+         {\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"half-writ",
+    )
+    .expect("seed a torn session jsonl file");
+    path.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn restart_with_a_torn_trailing_turn_truncates_the_tail_and_resumes() {
+    let workspace = TempDir::new().expect("tempdir");
+    let workspace_root = workspace.path().to_str().unwrap().to_string();
+    let session_root = TempDir::new()
+        .expect("tempdir for pi session-dir root")
+        .keep();
+    let managers = support::build_managers();
+    let repository = StdArc::new(support::MemoryRepository::default());
+    let ctx = SecurityContext::admin("test");
+
+    {
+        let runtime_a = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+            .expect("bridge must bind");
+        let app_a = support::application_with_runtime(
+            runtime_a,
+            managers.clone(),
+            repository.clone(),
+            workspace_root.clone(),
+        );
+        app_a
+            .open(&ctx, open_request())
+            .await
+            .expect("open must succeed against a real pi subprocess");
+    }
+
+    let record = repository.0.lock().unwrap().clone().unwrap();
+    let session_dir = record
+        .runtime
+        .state
+        .get("pi_session_dir")
+        .and_then(Value::as_str)
+        .expect("persisted state must carry pi_session_dir")
+        .to_string();
+    let seeded_file = seed_torn_session_file(&session_dir, "session.jsonl");
+
+    {
+        let mut guard = repository.0.lock().unwrap();
+        let mut running = guard.clone().unwrap();
+        running.status = SessionStatus::Running;
+        *guard = Some(running);
+    }
+
+    let runtime_b = PiRuntime::new_with_worker(session_root.clone(), support::pi_worker_path())
+        .expect("bridge must bind");
+    let app_b = support::application_with_runtime(
+        runtime_b,
+        managers.clone(),
+        repository.clone(),
+        workspace_root,
+    );
+
+    let submission = app_b
+        .submit_turn(&ctx, turn_request("hello-after-crash"))
+        .await
+        .expect("lazy restore must repair a crash-truncated session file");
+    let _events = submission
+        .events
+        .expect("resumed turn carries an event stream");
+
+    let repaired = std::fs::read_to_string(&seeded_file).expect("read repaired session file");
+    assert!(
+        !repaired.contains("half-writ"),
+        "the half-written line must be truncated: {repaired:?}"
+    );
+    assert!(
+        !repaired.contains("interrupted"),
+        "the interrupted turn's user message must be truncated: {repaired:?}"
+    );
+    assert!(
+        repaired.contains("\"stopReason\":\"end_turn\""),
+        "completed history must be preserved: {repaired:?}"
+    );
+
+    let launch_args_path = Path::new(&session_dir).join("fake_pi_launch_args.json");
+    let launch_args: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&launch_args_path).expect("launch args"))
+            .expect("launch args must be a JSON string array");
+    let session_flag = launch_args
+        .iter()
+        .position(|arg| arg == "--session")
+        .expect("the restored pi must receive --session");
+    assert_eq!(
+        launch_args.get(session_flag + 1),
+        Some(&seeded_file),
+        "the restored pi must resume the repaired session file"
+    );
+}
