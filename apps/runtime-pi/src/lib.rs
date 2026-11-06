@@ -1,4 +1,5 @@
 pub mod bridge;
+mod process_reaper;
 mod session_file;
 pub mod worker;
 
@@ -1033,7 +1034,8 @@ impl PiRuntime {
         self.bridge.unregister(&stale.bridge_token);
 
         let session_dir = PathBuf::from(&persisted.pi_session_dir);
-        let resume_session_file = self.restart_session_file(&session_dir, &stale).await?;
+        process_reaper::clear_worker_pgid(&session_dir).await;
+        let resume_session_file = self.restart_session_file(&session_dir).await?;
         let llm = load_llm_config(&session_dir).await?;
         let workspace_root = backend.paths().workspace_root().clone();
         let bridge_token = Uuid::new_v4().to_string();
@@ -1077,6 +1079,7 @@ impl PiRuntime {
         #[cfg(not(unix))]
         let pgid = 0;
         backend::process_group::register_pgid(pgid);
+        process_reaper::record_worker_pgid(&session_dir, pgid).await;
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -1098,49 +1101,19 @@ impl PiRuntime {
         Ok(instance)
     }
 
-    /// Picks the session file a restarted worker should resume. A clean
-    /// restore must still fail closed; only a worker this process killed
-    /// mid-turn is allowed to trim the interrupted turn's tail so the
-    /// replacement can start without losing the completed history.
+    /// Picks the session file a restarted worker should resume. The previous
+    /// worker is already dead (its process group was reaped before this
+    /// call), so a crash-truncated tail can be safely trimmed back to the
+    /// last completed turn; non-tail corruption still fails closed.
     async fn restart_session_file(
         &self,
         session_dir: &Path,
-        stale: &PiInstance,
     ) -> Result<Option<PathBuf>, SessionDomainError> {
-        let force_killed = stale.force_killed_turn.lock().await.is_some();
-        match session_file::latest_complete_turn_file(session_dir) {
-            Ok(path) => Ok(Some(path)),
-            Err(session_file::SessionFileError::NoSessionFiles(_)) => Ok(None),
-            Err(error)
-                if force_killed
-                    && matches!(
-                        &error,
-                        session_file::SessionFileError::Empty(_)
-                            | session_file::SessionFileError::LastLineNotJson { .. }
-                            | session_file::SessionFileError::LastLineNotCompleteAssistantMessage { .. }
-                    ) =>
-            {
-                // The worker was killed mid-turn, so the newest file can end
-                // on that turn's user message / tool result / pending
-                // assistant message. Trim it back to the last completed turn
-                // and re-run the normal validation.
-                session_file::truncate_to_last_complete_turn(session_dir).map_err(|error| {
-                    SessionDomainError::Unavailable {
-                        message: format!("pi_session_state_lost: {error}"),
-                    }
-                })?;
-                match session_file::latest_complete_turn_file(session_dir) {
-                    Ok(path) => Ok(Some(path)),
-                    Err(session_file::SessionFileError::NoSessionFiles(_)) => Ok(None),
-                    Err(error) => Err(SessionDomainError::Unavailable {
-                        message: format!("pi_session_state_lost: {error}"),
-                    }),
-                }
-            }
-            Err(error) => Err(SessionDomainError::Unavailable {
+        session_file::latest_complete_turn_file_repairing_crash_tail(session_dir).map_err(|error| {
+            SessionDomainError::Unavailable {
                 message: format!("pi_session_state_lost: {error}"),
-            }),
-        }
+            }
+        })
     }
 
     /// Cold-start branch of `start()` (`request.state == None`): provisions a
@@ -1199,6 +1172,9 @@ impl PiRuntime {
                 ),
             });
         }
+        // A re-opened runtime id can inherit a stale marker from a previous
+        // closed/crashed instance; reap it before writing anything new.
+        process_reaper::reap_orphan_worker_group(&session_dir).await?;
 
         write_role(&session_dir, &ext.role).await?;
         let persisted_state = PiPersistedState {
@@ -1318,15 +1294,11 @@ impl PiRuntime {
             if owner != Some(request.runtime_id.as_str()) {
                 return Err(SessionDomainError::InvalidRequest {message:"legacy Pi state is a live session reference, not an immutable branch checkpoint; create a new checkpoint first".into()});
             }
-            let history = match session_file::latest_complete_turn_file(&dir) {
-                Ok(path) => Some(path),
-                Err(session_file::SessionFileError::NoSessionFiles(_)) => None,
-                Err(error) => {
-                    return Err(SessionDomainError::Unavailable {
-                        message: format!("pi_session_state_lost: {error}"),
-                    })
-                }
-            };
+            process_reaper::reap_orphan_worker_group(&dir).await?;
+            let history = session_file::latest_complete_turn_file_repairing_crash_tail(&dir)
+                .map_err(|error| SessionDomainError::Unavailable {
+                    message: format!("pi_session_state_lost: {error}"),
+                })?;
             (dir, history)
         };
         state.pi_session_dir = session_dir.to_string_lossy().into_owned();
@@ -1928,6 +1900,7 @@ impl PiRuntime {
         #[cfg(not(unix))]
         let pgid = 0;
         backend::process_group::register_pgid(pgid);
+        process_reaper::record_worker_pgid(&session_dir, pgid).await;
         let instance = Arc::new(PiInstance {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -1983,6 +1956,8 @@ impl PiRuntime {
         if instance.pgid > 0 {
             backend::process_group::unregister_pgid(instance.pgid);
         }
+        process_reaper::clear_worker_pgid(Path::new(&instance.persisted_state.pi_session_dir))
+            .await;
         self.bridge.unregister(&instance.bridge_token);
         Ok(())
     }

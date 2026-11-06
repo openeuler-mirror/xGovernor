@@ -59,6 +59,29 @@ pub fn unregister_pgid(pgid: i32) {
 #[cfg(not(unix))]
 pub fn unregister_pgid(_pgid: i32) {}
 
+/// Whether at least one process still belongs to `pgid`.
+///
+/// Used by the Pi runtime's cross-restart orphan reaper. A positive `pgid`
+/// that no longer exists returns `false`; a group owned by another user
+/// returns `true` (`EPERM`), which is enough to decide whether the recorded
+/// group is still alive.
+#[cfg(unix)]
+pub fn process_group_exists(pgid: i32) -> bool {
+    if pgid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn process_group_exists(_pgid: i32) -> bool {
+    false
+}
+
 /// Terminate a specific process group (synchronous version).
 ///
 /// Sends SIGTERM, waits 300ms, then sends SIGKILL to ensure all processes
