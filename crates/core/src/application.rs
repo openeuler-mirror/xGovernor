@@ -65,9 +65,18 @@ fn map_provider_error(error: provider_protocol::ProviderControlError) -> Session
                 capability,
             }
         }
-        provider_protocol::ProviderControlError::ResourceLimitExceeded { max, .. } => {
+        provider_protocol::ProviderControlError::ResourceLimitExceeded {
+            max,
+            owner_ref,
+            ..
+        } => {
+            let scope = if owner_ref == "snapshot storage" {
+                "snapshot storage"
+            } else {
+                "provider containers"
+            };
             SessionDomainError::QuotaExceeded {
-                scope: "provider containers".into(),
+                scope: scope.into(),
                 limit: max as u32,
             }
         }
@@ -2207,6 +2216,27 @@ impl SessionApplication {
                 runtime_id: checkpoint_id.to_string(),
             })?;
         Ok(provider_id_from_metadata(&record.isolation.metadata).map(str::to_owned))
+    }
+
+    /// Read-only, most-recent conversational turns owned by `runtime_id`
+    /// (user/assistant text, oldest first). This bypasses core's own record
+    /// store on purpose: core keeps no transcript, so the host must ask the
+    /// runtime adapter, which owns the full conversation history. Only tenant
+    /// ownership and adapter attachment are validated here.
+    pub async fn conversation_context(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<Vec<agent_runtime_protocol::RecentTurnText>, SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        self.ensure_runtime_attached(ctx, &record).await?;
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .recent_turn_texts(&record.runtime_id, limit)
+            .await
+            .map_err(map_runtime_error)
     }
 
     pub async fn checkpoint(

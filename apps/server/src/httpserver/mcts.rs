@@ -10,11 +10,13 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::{Json, Router};
 use mcts_plugin_host::{
-    build_launch_command, FakeApplication, HostApplication, HostCapService, MctsRun,
-    MctsRunOutcome, MctsRunRequest, MctsRunStatus, RunMap,
+    all_capabilities, build_launch_command, Budget, FakeApplication, HostApplication,
+    HostCapService, MctsRun, MctsRunOutcome, MctsRunRequest, MctsRunStatus, RunMap,
 };
 use serde::{Deserialize, Serialize};
-use session_protocol::{SessionCheckpointDeleteRequest, SessionLeaseClaim};
+use session_protocol::{
+    SessionCheckpointDeleteRequest, SessionCheckpointRequest, SessionLeaseClaim,
+};
 use xgovernor_core::{SecurityContext, SessionApplication};
 
 use super::mcts_host::RealSessionHostApplication;
@@ -101,7 +103,7 @@ struct MctsRunRecord {
 }
 
 #[derive(Serialize, Deserialize)]
-struct MctsRunView {
+pub(super) struct MctsRunView {
     run_id: String,
     status: MctsRunStatus,
     request: MctsRunRequest,
@@ -132,9 +134,19 @@ impl From<MctsRunRecord> for MctsRunView {
     }
 }
 
-struct MctsApiError {
+#[derive(Debug)]
+pub(super) struct MctsApiError {
     status: StatusCode,
     message: String,
+}
+
+impl MctsApiError {
+    pub(super) fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for MctsApiError {
@@ -185,11 +197,105 @@ fn collect_plugin_envs() -> Vec<(String, String)> {
 async fn create_run(
     State(state): State<MctsHttpState>,
     context: Option<Extension<SecurityContext>>,
-    Json(mut request): Json<MctsRunRequest>,
+    Json(request): Json<MctsRunRequest>,
 ) -> Result<(StatusCode, Json<MctsRunView>), MctsApiError> {
     let ctx = context
         .map(|Extension(ctx)| ctx)
         .unwrap_or_else(|| SecurityContext::admin("system:mcts-worker"));
+    let view = start_mcts_run(&state, &ctx, request).await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// Start a generic MCTS run against a live session, without the HTTP
+/// single-request native prepare path. This is the `/mcts <goal>` turn entry:
+/// the current session is checkpointed in place and used as the root state.
+pub(super) async fn start_turn_run(
+    state: &MctsHttpState,
+    ctx: &SecurityContext,
+    runtime_id: &str,
+    goal: &str,
+    lease: &SessionLeaseClaim,
+) -> Result<MctsRunView, MctsApiError> {
+    let checkpoint_id = checkpoint_current_session(state, ctx, runtime_id, lease).await?;
+    let request = MctsRunRequest {
+        plugin_id: "mcts".to_string(),
+        mode: "generic".to_string(),
+        task_id: Some(format!("turn-{runtime_id}")),
+        instance_id: None,
+        split: None,
+        testbench: None,
+        task_spec: None,
+        run_id: uuid::Uuid::new_v4().to_string(),
+        root_state_id: Some(checkpoint_id),
+        goal: goal.to_string(),
+        content: "Run the MCTS search.".to_string(),
+        budget: Budget {
+            max_iters: 1,
+            branching: 2,
+            max_time_ms: 3_600_000,
+            max_tokens: 30_000_000,
+        },
+        llm: None,
+        granted_capabilities: all_capabilities(),
+    };
+    start_mcts_run(state, ctx, request).await
+}
+
+async fn checkpoint_current_session(
+    state: &MctsHttpState,
+    ctx: &SecurityContext,
+    runtime_id: &str,
+    lease: &SessionLeaseClaim,
+) -> Result<String, MctsApiError> {
+    let session = state.session.as_ref().ok_or_else(|| MctsApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "MCTS is not wired to a session application".to_string(),
+    })?;
+    let result = session
+        .checkpoint(
+            ctx,
+            SessionCheckpointRequest {
+                runtime_id: runtime_id.to_string(),
+                name: Some(format!("mcts-turn-root-{runtime_id}")),
+                requested_scope: None,
+                lease: lease.clone(),
+            },
+        )
+        .await
+        .map_err(|error| MctsApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("failed to checkpoint current session: {error}"),
+        })?;
+    let backend = session
+        .checkpoint_backend(ctx, &result.checkpoint_id)
+        .await
+        .map_err(|error| MctsApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to resolve checkpoint backend: {error}"),
+        })?;
+    if backend.as_deref() != Some("docker") {
+        let _ = session
+            .delete_checkpoint(
+                &SecurityContext::admin("system:mcts-worker"),
+                SessionCheckpointDeleteRequest {
+                    checkpoint_id: result.checkpoint_id.clone(),
+                    lease: lease.clone(),
+                },
+            )
+            .await;
+        return Err(MctsApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "only docker sessions support /mcts".to_string(),
+        });
+    }
+    Ok(result.checkpoint_id)
+}
+
+pub(super) async fn start_mcts_run(
+    state: &MctsHttpState,
+    ctx: &SecurityContext,
+    mut request: MctsRunRequest,
+) -> Result<MctsRunView, MctsApiError> {
     if request.plugin_id != "mcts" {
         return Err(MctsApiError {
             status: StatusCode::BAD_REQUEST,
@@ -335,19 +441,16 @@ async fn create_run(
         runs.insert(record.run_id.clone(), record);
     }
 
-    Ok((
-        StatusCode::CREATED,
-        Json(MctsRunView {
-            run_id: request.run_id.clone(),
-            status,
-            request,
-            root_state_prepared,
-            root_state_id,
-            outcome: None,
-            error: None,
-            protocol_jsonl: None,
-        }),
-    ))
+    Ok(MctsRunView {
+        run_id: request.run_id.clone(),
+        status,
+        request,
+        root_state_prepared,
+        root_state_id,
+        outcome: None,
+        error: None,
+        protocol_jsonl: None,
+    })
 }
 
 fn spawn_mcts_task<A: HostApplication + 'static>(

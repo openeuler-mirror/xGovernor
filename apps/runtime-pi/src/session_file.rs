@@ -250,3 +250,132 @@ fn validate_last_line_is_complete_turn(path: &Path) -> Result<(), SessionFileErr
         path: path.to_path_buf(),
     })
 }
+
+/// Maximum characters retained per exported user/assistant message. The host
+/// only needs enough text to consolidate a task description, so capping each
+/// message keeps the `/mcts` extraction payload bounded.
+const MESSAGE_TEXT_LIMIT: usize = 8_000;
+
+/// Reads the newest session `*.jsonl` and returns the most recent user and
+/// assistant text messages (oldest first, at most `limit`). Unparseable or
+/// trailing bookkeeping lines are skipped; a missing session directory or
+/// zero session files is reported as-is.
+pub(crate) fn recent_turn_texts(
+    session_dir: &Path,
+    limit: usize,
+) -> Result<Vec<(String, String)>, SessionFileError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let path = latest_session_file(session_dir)?;
+    let contents = std::fs::read_to_string(&path).map_err(|error| SessionFileError::Io {
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
+
+    let mut collected: Vec<(String, String)> = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let Some(role) = message.get("role").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let Some(text) = message_text(message.get("content")) else {
+            continue;
+        };
+        let text = truncate_chars(&text, MESSAGE_TEXT_LIMIT);
+        if text.trim().is_empty() {
+            continue;
+        }
+        collected.push((role.to_string(), text));
+    }
+
+    if collected.len() > limit {
+        collected.drain(..collected.len() - limit);
+    }
+    Ok(collected)
+}
+
+/// Decodes a `message.content` value into plain text. `pi` writes either a
+/// plain string (`"hi"`) or an array of content blocks (`{"type":"text",
+/// "text":"..."}`); tool-use blocks carry no prose and are ignored.
+fn message_text(content: Option<&serde_json::Value>) -> Option<String> {
+    let content = content?;
+    match content {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        serde_json::Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                let text = block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| block.get("content").and_then(serde_json::Value::as_str));
+                if let Some(text) = text {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        parts.push(text);
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_recent_user_and_assistant_text_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            json!({"type":"message","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","message":{"role":"assistant","content":[]}}),
+            json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"second"}]}}),
+            json!({"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"done"},{"type":"tool_use","call_id":"c","tool_name":"bash","input":{}}],"stopReason":"end_turn"}}),
+        ];
+        std::fs::write(&path, lines.into_iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+
+        let texts = recent_turn_texts(dir.path(), 2).unwrap();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], ("user".to_string(), "second".to_string()));
+        assert_eq!(texts[1], ("assistant".to_string(), "done".to_string()));
+    }
+}

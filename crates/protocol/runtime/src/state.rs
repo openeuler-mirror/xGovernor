@@ -3,6 +3,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// A single conversational turn text exported by a runtime for the host's
+/// task-consolidation path (`/mcts` context materialization). Ordering is
+/// implied by the vector position (oldest first).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentTurnText {
+    pub role: String,
+    pub text: String,
+}
+
 /// Runtime-owned state quarantined behind a runtime kind and schema version.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {

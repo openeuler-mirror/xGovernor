@@ -392,7 +392,7 @@ impl<A: HostApplication + 'static> MctsRun<A> {
     }
 }
 
-fn all_capabilities() -> BTreeSet<Capability> {
+pub fn all_capabilities() -> BTreeSet<Capability> {
     [
         Capability::Snapshot,
         Capability::Fork,

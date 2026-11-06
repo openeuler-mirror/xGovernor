@@ -30,9 +30,11 @@ pub use lifecycle::PluginSession;
 pub use llm_policy::LlmPolicy;
 pub use manifest::{ModeManifest, PluginManifest, ProfileManifest, PLUGIN_ID};
 pub use mcts_run::{
-    build_launch_command, LlmConfig, MctsRun, MctsRunOutcome, MctsRunRequest, MctsRunStatus,
+    all_capabilities, build_launch_command, LlmConfig, MctsRun, MctsRunOutcome, MctsRunRequest,
+    MctsRunStatus,
 };
 pub use mcts_protocol::messages::Failure;
+pub use mcts_protocol::methods::Budget;
 pub use process::PluginProcess;
 pub use profile_registry::ProfileRegistry;
 pub use registry::{PluginManager, PluginRegistry, PluginStatus};
