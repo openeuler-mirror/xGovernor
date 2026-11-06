@@ -55,13 +55,43 @@ pub fn local_backend_with_isolation(
         .as_ref()
         .map(|path| backend_path_from_host_path(path.as_path()))
         .transpose()?;
-    let temp_root_host = temp_root.unwrap_or_else(std::env::temp_dir);
     let isolation = isolation
         .map(serde_json::from_value::<LocalIsolationOptions>)
         .transpose()
         .map_err(|error| LocalBuildError::InvalidConfig {
             message: format!("invalid local backend isolation options: {error}"),
         })?;
+    let workspace_scoped = matches!(
+        isolation.as_ref(),
+        Some(LocalIsolationOptions::Workspace { .. })
+    );
+    let temp_root_host = if workspace_scoped {
+        // Strict workspace mode owns its scratch space. Ignoring a caller
+        // supplied `temp_root` here is deliberate: a shared host temp
+        // directory would be reachable by every session.
+        let temp = workspace_root_host.join(".xgovernor").join("tmp");
+        ensure_workspace_dir(temp.as_path())?;
+        let canonical = std::fs::canonicalize(temp.as_path()).map_err(|error| {
+            LocalBuildError::InvalidConfig {
+                message: format!(
+                    "failed to resolve workspace temp directory {}: {error}",
+                    temp.display()
+                ),
+            }
+        })?;
+        if !canonical.starts_with(workspace_root_host.as_path()) {
+            return Err(LocalBuildError::InvalidConfig {
+                message: format!(
+                    "workspace temp directory {} resolves outside the workspace {}",
+                    canonical.display(),
+                    workspace_root_host.display()
+                ),
+            });
+        }
+        canonical
+    } else {
+        temp_root.unwrap_or_else(std::env::temp_dir)
+    };
     let policy = LocalBackendPolicy::from_isolation_options(
         isolation,
         workspace_root_host.as_path(),
@@ -82,6 +112,45 @@ pub fn local_backend_with_isolation(
     ))))
 }
 
+/// Creates `path` (and missing parents) without following symlinks. Existing
+/// entries must be real directories; otherwise the strict workspace temp
+/// root could be redirected outside the workspace by a planted symlink.
+fn ensure_workspace_dir(path: &Path) -> Result<(), LocalBuildError> {
+    if let Some(parent) = path.parent() {
+        if parent != Path::new(std::path::MAIN_SEPARATOR_STR) {
+            ensure_workspace_dir(parent)?;
+        }
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                LocalBuildError::InvalidConfig {
+                    message: format!(
+                        "failed to inspect workspace temp directory {}: {error}",
+                        path.display()
+                    ),
+                }
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(LocalBuildError::InvalidConfig {
+                    message: format!(
+                        "workspace temp path {} must be a real directory, not a symlink/file",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(error) => Err(LocalBuildError::InvalidConfig {
+            message: format!(
+                "failed to create workspace temp directory {}: {error}",
+                path.display()
+            ),
+        }),
+    }
+}
+
 pub(crate) fn absolute_dir(
     field_name: &str,
     value: &str,
@@ -92,15 +161,22 @@ pub(crate) fn absolute_dir(
             message: format!("{field_name} must be an absolute path: {value}"),
         });
     }
-    let metadata = std::fs::metadata(path).map_err(|error| LocalBuildError::InvalidConfig {
+    // Canonicalize once so the policy roots, the sandbox `--chdir` target and
+    // the workspace temp directory all agree on the same spelling (notably
+    // `/var` vs `/private/var` on macOS).
+    let path = std::fs::canonicalize(path).map_err(|error| LocalBuildError::InvalidConfig {
         message: format!("failed to read {field_name}: {error}"),
     })?;
+    let metadata =
+        std::fs::metadata(path.as_path()).map_err(|error| LocalBuildError::InvalidConfig {
+            message: format!("failed to read {field_name}: {error}"),
+        })?;
     if !metadata.is_dir() {
         return Err(LocalBuildError::InvalidConfig {
             message: format!("{field_name} must point to a directory: {value}"),
         });
     }
-    Ok(path.to_path_buf())
+    Ok(path)
 }
 
 pub(crate) fn backend_path_from_host_path(path: &Path) -> Result<BackendPath, LocalBuildError> {

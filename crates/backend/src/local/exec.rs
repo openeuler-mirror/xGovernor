@@ -49,6 +49,15 @@ impl OperationExec for LocalExec {
         let mut command =
             command_from_spec(command_spec, &self._state.policy, command_cwd.as_deref());
 
+        if self._state.policy.is_workspace_scoped() {
+            // The strict workspace mode keeps scratch state inside the
+            // workspace; do this before applying caller-supplied env so an
+            // explicit TMPDIR still wins.
+            command.env("TMPDIR", &self._state.temp_root_host);
+            command.env("TMP", &self._state.temp_root_host);
+            command.env("TEMP", &self._state.temp_root_host);
+        }
+
         if let Some(env_vars) = &request.env {
             for (k, v) in env_vars {
                 command.env(k, v);
@@ -477,8 +486,12 @@ mod linux_bubblewrap_tests {
 
 #[cfg(all(test, unix))]
 mod pipe_drain_tests {
+    use crate::local::backend::LocalBackendState;
     use crate::local::factory::local_backend;
+    use crate::local::policy::LocalBackendPolicy;
+    use operation_protocol::capability::OperationExec;
     use operation_protocol::{capability::exec::ExecRequest, BackendPath};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     // Regression test for the stdout-pipe deadlock: a background process spawned
@@ -581,6 +594,51 @@ mod pipe_drain_tests {
         assert!(out.contains("done"), "stdout was: {out:?}");
         assert!(out.contains("bg-1"), "stdout was: {out:?}");
         assert!(out.contains("bg-3"), "stdout was: {out:?}");
+
+        let _ = std::fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    fn workspace_scoped_exec_pins_cwd_to_workspace_and_tmpdir_to_session_temp() {
+        let _guard = crate::process_group::process_group_test_lock()
+            .lock()
+            .unwrap();
+        let root = super::test_workspace_root("xgovernor-workspace-cwd-", "cwd");
+        let workspace = std::fs::canonicalize(root.join("workspace")).unwrap();
+        let temp = workspace.join(".xgovernor").join("tmp");
+        std::fs::create_dir_all(temp.as_path()).unwrap();
+
+        let exec = super::LocalExec::new(Arc::new(LocalBackendState {
+            backend_id: "test".to_string(),
+            workspace_root: BackendPath(workspace.to_string_lossy().into_owned()),
+            workspace_root_host: workspace.clone(),
+            home_dir: None,
+            home_dir_host: None,
+            temp_root_host: temp.clone(),
+            default_shell: Some("/bin/sh".to_string()),
+            policy: LocalBackendPolicy::test_workspace_scoped_without_os_sandbox(),
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(exec.exec(ExecRequest {
+                command: "printf '%s\\n%s' \"$PWD\" \"$TMPDIR\"".to_string(),
+                args: vec![],
+                shell: Some("/bin/sh".to_string()),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                env: None,
+                extra: None,
+            }))
+            .expect("workspace-scoped exec");
+
+        assert_eq!(result.exit_code, Some(0));
+        let stdout = String::from_utf8_lossy(result.stdout.as_slice());
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next().unwrap_or(""), workspace.to_string_lossy());
+        assert_eq!(lines.next().unwrap_or(""), temp.to_string_lossy());
 
         let _ = std::fs::remove_dir_all(root.as_path());
     }

@@ -471,6 +471,8 @@ impl OperationAttach for LocalProvider {
 mod tests {
     use super::*;
     use operation_protocol::capability::exec::ExecRequest;
+    use operation_protocol::capability::filesystem::{WriteBytesRequest, WriteMode};
+    use operation_protocol::{BackendPath, OperationError};
     use provider_protocol::{
         BackendId, ProviderInstanceId, ProviderLifecycleReason, ProviderLifecycleState,
     };
@@ -497,6 +499,54 @@ mod tests {
             provider_options: json!({ "workspace_root": workspace_root.to_string_lossy() }),
             correlation: Value::Null,
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn create_with_workspace_isolation_applies_to_the_attached_backend() {
+        let provider = LocalProvider::new();
+        let root = test_workspace();
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(workspace.as_path()).unwrap();
+        std::fs::create_dir_all(outside.as_path()).unwrap();
+
+        let mut request = create_request(&workspace);
+        request.provider_options = json!({
+            "workspace_root": workspace.to_string_lossy(),
+            "isolation": {"kind": "workspace"},
+        });
+        let instance = match provider.create(request).await {
+            Ok(instance) => instance,
+            // A Linux host without bwrap must fail closed; that path is
+            // asserted by the backend integration test.
+            Err(ProviderControlError::ProviderFailure { .. }) if cfg!(target_os = "linux") => {
+                let _ = std::fs::remove_dir_all(root.as_path());
+                return;
+            }
+            Err(error) => panic!("unexpected create error: {error}"),
+        };
+        assert_eq!(
+            instance.metadata["provider_options"]["isolation"]["kind"],
+            "workspace"
+        );
+
+        let backend = provider.attach(&instance).await.unwrap();
+        let result = backend
+            .files()
+            .write_bytes(WriteBytesRequest {
+                path: BackendPath(outside.join("denied.txt").to_string_lossy().into_owned()),
+                content: b"no".to_vec(),
+                mode: WriteMode::AtomicOverwrite,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(OperationError::SandboxPolicyDenied { .. })
+        ));
+        assert!(!outside.join("denied.txt").exists());
+
+        let _ = std::fs::remove_dir_all(root.as_path());
     }
 
     #[tokio::test]

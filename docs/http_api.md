@@ -372,6 +372,20 @@ local/E2B 默认每租户 20，可分别通过 `XGOVERNOR_LOCAL_MAX_SANDBOXES_PE
 
 `workspace_root` 始终取环境 normalizer 已验证的值，provider_options 不能覆盖它。`runtime_kind: "xiaoo"` 对应 `ext.xiaoo`，`runtime_kind: "pi"` 对应 `ext.runtime_pi`；两者都支持 `system_prompt`、正整数 `max_turns`、`tools_enabled`，可在 open 设置默认值，也可在 turns 的对应 ext 对象中覆盖，覆盖结果进入后续 checkpoint。`tools_enabled: false` 会禁用模型工具，适用于 selector；宿主调用的 exec/files 操作不受角色工具开关影响，仍由 sandbox capability/lease 控制。xiaoo 额外支持 `allow_interaction`（默认 true）；基准测试可设 false 禁止 ask_user_question。
 
+对 `local` backend，`provider_options.isolation` 控制“工具区内修改”与“任意权限”两种模式：
+
+| `isolation` | 行为 |
+| --- | --- |
+| 省略 或 `{"kind":"unrestricted"}` |任意权限读写。 |
+| `{"kind":"workspace"}` | 严格工具区模式：文件/搜索只允许 workspace；exec 在 macOS 用 seatbelt、Linux 用 bubblewrap；临时目录固定为 `<workspace>/.xgovernor/tmp`。Linux 缺少 `bwrap` 或平台不支持时 fail closed。 |
+| `{"kind":"macos_seatbelt", ...}` / `{"kind":"linux_bubblewrap", ...}` | 高级用法：手动指定平台和 `readable_roots` / `writable_roots`，行为与历史一致。 |
+
+`workspace` 的 `allow_network` 可省略（默认 true）。该配置随 `isolation.metadata.provider_options` 持久化，checkpoint/load/fork 会复用；`workspace_root` 仍由 normalizer 决定，不能通过 provider_options 改写。`workspace` 模式会忽略外部 `temp_root`，强制使用会话内的 `<workspace>/.xgovernor/tmp`。
+
+```json
+{"deployment":{"options":{"provider_options":{"isolation":{"kind":"workspace"}}}}}
+```
+
 Pi 用受信扩展替换真实 system prompt，限定沙箱工具集合，关闭个人扩展/skills/template/theme 发现。其 checkpoint 导出会冻结当时完整 JSONL 和角色配置；每次 load/fork 获得独立会话目录。正常 turn 持久化只保存本会话的实时状态，不重复复制历史。快照的模型环境凭证保留环境变量引用；inline key 放在权限为 0600 的独立私有文件中，opaque state/SQLite 只含引用，删除 checkpoint 时释放。关闭源 session 后 checkpoint 仍有效，必须显式调用 checkpoint/delete 清理。
 
 Pi 状态 schema 升级为 2；schema 1 的同会话重启仍支持，但旧式仅含实时会话目录的 state 不可直接作为新分支使用，需要在升级后的服务上重新 checkpoint。当前本地 provider 不提供环境快照；完整 MCTS 分支需使用具备 snapshot 能力的 provider（如 E2B）。

@@ -26,6 +26,10 @@ pub(crate) struct PathIsolationConfig {
 #[derive(Debug, Clone)]
 pub(crate) struct LocalBackendPolicy {
     isolation: LocalIsolationConfig,
+    /// True only for the portable `workspace` isolation mode. It changes the
+    /// exec default cwd and the per-session temp root; explicit platform
+    /// profiles keep their pre-existing behavior.
+    workspace_scoped: bool,
     grants: Arc<Mutex<GrantStore>>,
 }
 
@@ -45,6 +49,17 @@ struct SandboxPermissionGrant {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum LocalIsolationOptions {
+    /// Portable "modify only inside the tool workspace" mode. The provider
+    /// resolves this to `macos_seatbelt` or `linux_bubblewrap` at build time;
+    /// callers do not need to know the host platform.
+    Workspace {
+        #[serde(default = "default_allow_network")]
+        allow_network: bool,
+    },
+    /// Explicit "arbitrary permissions" mode. Identical to omitting
+    /// `isolation` entirely; useful for clients that want the choice to be
+    /// self-documenting.
+    Unrestricted,
     MacosSeatbelt {
         #[serde(default = "default_allow_network")]
         allow_network: bool,
@@ -71,8 +86,13 @@ impl LocalBackendPolicy {
     pub(crate) fn unrestricted() -> Self {
         Self {
             isolation: LocalIsolationConfig::None,
+            workspace_scoped: false,
             grants: Arc::new(Mutex::new(GrantStore::default())),
         }
+    }
+
+    pub(crate) fn is_workspace_scoped(&self) -> bool {
+        self.workspace_scoped
     }
 
     pub(crate) fn from_isolation_options(
@@ -84,31 +104,18 @@ impl LocalBackendPolicy {
             return Ok(Self::unrestricted());
         };
 
-        let (kind, allow_network, readable_roots, writable_roots) = match options {
+        match options {
+            LocalIsolationOptions::Unrestricted => Ok(Self::unrestricted()),
+            LocalIsolationOptions::Workspace { allow_network } => Ok(Self {
+                isolation: build_workspace_isolation(allow_network, workspace_root)?,
+                workspace_scoped: true,
+                grants: Arc::new(Mutex::new(GrantStore::default())),
+            }),
             LocalIsolationOptions::MacosSeatbelt {
                 allow_network,
                 readable_roots,
                 writable_roots,
-            } => (
-                "macos_seatbelt",
-                allow_network,
-                readable_roots,
-                writable_roots,
-            ),
-            LocalIsolationOptions::LinuxBubblewrap {
-                allow_network,
-                readable_roots,
-                writable_roots,
-            } => (
-                "linux_bubblewrap",
-                allow_network,
-                readable_roots,
-                writable_roots,
-            ),
-        };
-
-        match kind {
-            "macos_seatbelt" => {
+            } => {
                 if !cfg!(target_os = "macos") {
                     return Err(LocalBuildError::Unsupported {
                         message: "macos_seatbelt isolation is only supported on macOS".to_string(),
@@ -123,10 +130,15 @@ impl LocalBackendPolicy {
                         workspace_root,
                         temp_root,
                     )?),
+                    workspace_scoped: false,
                     grants: Arc::new(Mutex::new(GrantStore::default())),
                 })
             }
-            "linux_bubblewrap" => {
+            LocalIsolationOptions::LinuxBubblewrap {
+                allow_network,
+                readable_roots,
+                writable_roots,
+            } => {
                 if !cfg!(target_os = "linux") {
                     return Err(LocalBuildError::Unsupported {
                         message: "linux_bubblewrap isolation is only supported on Linux"
@@ -148,10 +160,10 @@ impl LocalBackendPolicy {
                         workspace_root,
                         temp_root,
                     )?),
+                    workspace_scoped: false,
                     grants: Arc::new(Mutex::new(GrantStore::default())),
                 })
             }
-            _ => unreachable!("all local isolation kinds are matched"),
         }
     }
 
@@ -284,7 +296,7 @@ impl LocalBackendPolicy {
     }
 
     pub(crate) fn requires_exec_cwd(&self) -> bool {
-        matches!(self.isolation, LocalIsolationConfig::LinuxBubblewrap(_))
+        self.workspace_scoped || matches!(self.isolation, LocalIsolationConfig::LinuxBubblewrap(_))
     }
 
     pub(crate) fn grant(
@@ -377,6 +389,19 @@ impl LocalBackendPolicy {
         };
         Self {
             isolation,
+            workspace_scoped: false,
+            grants: Arc::new(Mutex::new(GrantStore::default())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_workspace_scoped_without_os_sandbox() -> Self {
+        // Exercise the cwd/temp behavior of the portable workspace mode
+        // without requiring seatbelt/bwrap to be applicable (CI containers
+        // often forbid nested sandboxes).
+        Self {
+            isolation: LocalIsolationConfig::None,
+            workspace_scoped: true,
             grants: Arc::new(Mutex::new(GrantStore::default())),
         }
     }
@@ -665,6 +690,47 @@ impl BubblewrapArg for &Path {
     }
 }
 
+fn build_workspace_isolation(
+    allow_network: bool,
+    workspace_root: &Path,
+) -> Result<LocalIsolationConfig, LocalBuildError> {
+    let config = build_workspace_isolation_config(allow_network, workspace_root)?;
+    if cfg!(target_os = "macos") {
+        Ok(LocalIsolationConfig::MacosSeatbelt(config))
+    } else if cfg!(target_os = "linux") {
+        if !bubblewrap_available() {
+            return Err(LocalBuildError::Unsupported {
+                message: "workspace isolation requires bubblewrap (bwrap) in PATH on Linux"
+                    .to_string(),
+            });
+        }
+        Ok(LocalIsolationConfig::LinuxBubblewrap(config))
+    } else {
+        Err(LocalBuildError::Unsupported {
+            message:
+                "workspace isolation requires macOS seatbelt or Linux bubblewrap; this platform \
+                 is not supported"
+                    .to_string(),
+        })
+    }
+}
+
+/// Strict form of the portable `workspace` mode: the canonicalized workspace
+/// is the only readable/writable root. The per-session temp directory lives
+/// inside it (see `LocalProvider`), so shared host temp directories are not
+/// part of the sandbox.
+fn build_workspace_isolation_config(
+    allow_network: bool,
+    workspace_root: &Path,
+) -> Result<PathIsolationConfig, LocalBuildError> {
+    let workspace = normalize_build_path("workspace_root", workspace_root)?;
+    Ok(PathIsolationConfig {
+        allow_network,
+        readable_roots: vec![workspace.clone()],
+        writable_roots: vec![workspace],
+    })
+}
+
 fn build_path_isolation_config(
     allow_network: bool,
     readable_roots: Vec<String>,
@@ -846,6 +912,7 @@ mod tests {
                 readable_roots: vec![PathBuf::from("/workspace"), PathBuf::from("/workspace/tmp")],
                 writable_roots: vec![PathBuf::from("/workspace/tmp")],
             }),
+            workspace_scoped: false,
             grants: Arc::new(Mutex::new(GrantStore::default())),
         })
     }
