@@ -3276,3 +3276,61 @@ async fn joint_terminal_projection_survives_subscriber_loss_and_never_invents_us
         assert!(!*runtime.stopped.lock().await);
     }
 }
+
+#[tokio::test]
+async fn open_registers_the_session_in_the_lease_table_for_the_orphan_reaper() {
+    // The orphan reaper only walks `SessionLeaseTable::snapshot()`. A session
+    // that is absent from that table is invisible to it, so a client that dies
+    // between `open` and its first heartbeat would leak the session and its
+    // backend forever.
+    let lease_table = Arc::new(SessionLeaseTable::new());
+    let repository = Arc::new(MemoryRepository::default());
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        test_provider_managers(),
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(TestEnvironment),
+        Arc::new(FixedTurnId),
+    )
+    .with_lease_table(lease_table.clone());
+
+    let response = application
+        .open(
+            &admin_ctx(),
+            SessionOpenRequest {
+                runtime_id: None,
+                runtime_kind: None,
+                conversation_id: "conversation".into(),
+                sender_id: "sender".into(),
+                workspace: Default::default(),
+                deployment: Default::default(),
+                requested_capabilities: Default::default(),
+                llm: None,
+                ext: Default::default(),
+                lease: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let snapshot = lease_table.snapshot().await;
+    let entry = snapshot
+        .iter()
+        .find(|(session_id, _, _)| session_id == &response.runtime_id);
+    assert!(
+        entry.is_some(),
+        "open must register the session in the lease table, otherwise the orphan \
+         reaper can never see it and its backend leaks (runtime_id={:?}, table={:?})",
+        response.runtime_id,
+        snapshot.iter().map(|(id, _, _)| id).collect::<Vec<_>>()
+    );
+    // The placeholder records "exists, nobody holds it yet": an empty holder so
+    // a real client is never displaced, and a fresh timestamp so the entry goes
+    // stale on its own if no heartbeat follows.
+    assert!(
+        entry.unwrap().1.is_empty(),
+        "the entry an open registers must not claim a holder"
+    );
+}
