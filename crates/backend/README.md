@@ -3,6 +3,9 @@
 `provider-protocol`(控制面) + `operation-protocol`(操作面) 两份契约的**具体实现**。每个子模块是一个真实的资源供应方：
 
 - **`local/`** — 本地进程沙箱：workspace 目录 + bubblewrap(Linux)/seatbelt(macOS) 隔离策略。没有独立的常驻进程，"实例"本质就是一份目录+策略配置。
+
+  `provider_options.isolation` 是显式的权限档位：省略或 `{"kind":"unrestricted"}` 保持历史行为（无 OS sandbox、可跨 workspace）；`{"kind":"workspace"}` 是严格工具区模式，自动选择 macOS seatbelt / Linux bubblewrap，文件/搜索只允许 workspace，exec 的 cwd 固定为 workspace（临时目录 `<workspace>/.xgovernor/tmp` 只用于 `TMPDIR`/`TMP`/`TEMP` 和 `temp_path`，不是 cwd），Linux 缺少 `bwrap` 时 fail closed。`macos_seatbelt` / `linux_bubblewrap` 仍可用于手动指定 roots。checkpoint/load/fork 复用 `isolation.metadata.provider_options` 中保存的配置。
+
 - **`docker/`** — 实验性 Linux Docker 工具后端；用受控镜像实现无宿主挂载的容器执行。见 [原型说明](../../scripts/docker-prototype/README.md)。
 - **`e2b/`** — E2B 远程沙箱：通过 E2B 平台 API 创建/查询/删除远程沙箱，操作面经 `envd`(沙箱内 HTTP 服务)转发。
 - **`ledger` / `sqlite_ledger.rs`** — provider 实例的持久化账本(SQLite)，记录哪些实例处于活跃状态，供进程重启后的 reconcile 使用。
