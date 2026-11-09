@@ -38,7 +38,7 @@ pub struct HostSnapshot {
 #[async_trait]
 pub trait HostApplication: Send + Sync {
     async fn snapshot(&self, run_id: &str, branch_id: &str) -> Result<HostSnapshot, PluginHostError>;
-    async fn fork(&self, run_id: &str, parent_state_id: &str) -> Result<String, PluginHostError>;
+    async fn fork(&self, run_id: &str, parent_state_id: &str, offline: bool) -> Result<String, PluginHostError>;
     async fn agent_turn(
         &self,
         run_id: &str,
@@ -157,7 +157,7 @@ impl<A: HostApplication> HostCapService<A> {
         if let Err(error) = self.run_map.require_state(&params.parent_state_id) {
             return error_response(id, error.rpc_code(), error.to_string());
         }
-        match with_timeout(params.timeout_ms, self.app.fork(&params.run_id, &params.parent_state_id)).await {
+        match with_timeout(params.timeout_ms, self.app.fork(&params.run_id, &params.parent_state_id, params.offline)).await {
             Ok(branch_id) => {
                 if let Err(error) = self.run_map.add_branch(&params.run_id, &branch_id, &params.parent_state_id) {
                     return error_response(id, error.rpc_code(), error.to_string());
@@ -389,7 +389,7 @@ impl HostApplication for FakeApplication {
             .map_err(|_| PluginHostError::Manifest("fake application lock poisoned".to_string()))
     }
 
-    async fn fork(&self, _run_id: &str, parent_state_id: &str) -> Result<String, PluginHostError> {
+    async fn fork(&self, _run_id: &str, parent_state_id: &str, _offline: bool) -> Result<String, PluginHostError> {
         self.state
             .lock()
             .map(|mut state| {
@@ -588,6 +588,8 @@ struct HostForkParams {
     timeout_ms: u64,
     parent_state_id: String,
     idempotency_key: String,
+    #[serde(default)]
+    offline: bool,
 }
 
 #[derive(Debug, Deserialize)]

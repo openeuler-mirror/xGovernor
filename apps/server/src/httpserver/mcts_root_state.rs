@@ -38,16 +38,20 @@ pub(crate) async fn prepare_native_root_state(
     mode: &str,
     task_id: &str,
     run_id: &str,
+    goal: &str,
+    task_spec: Option<&serde_json::Value>,
 ) -> Result<PreparedRootState, String> {
     let output_dir = std::env::temp_dir().join(format!("xg-mcts-root-{run_id}"));
     std::fs::create_dir_all(&output_dir)
         .map_err(|error| format!("failed to create root-state output dir: {error}"))?;
+    let prepare_module = std::env::var("MCTS_ROOT_STATE_PREPARE_MODULE")
+        .unwrap_or_else(|_| "src.harness.xg_root_state_prepare".to_string());
 
     let mut command = Command::new(python_bin);
     command
         .current_dir(repo_root)
         .arg("-m")
-        .arg("src.harness.xg_root_state_prepare")
+        .arg(&prepare_module)
         .arg("--mode")
         .arg(mode)
         .arg("--task-id")
@@ -58,6 +62,17 @@ pub(crate) async fn prepare_native_root_state(
         .arg("pi")
         .arg("--output-dir")
         .arg(&output_dir);
+    if !goal.trim().is_empty() {
+        command.arg("--goal").arg(goal);
+    }
+    if let Some(spec) = task_spec {
+        let spec_path = output_dir.join("task_spec.json");
+        let spec_bytes = serde_json::to_vec_pretty(spec)
+            .map_err(|error| format!("failed to serialize task_spec: {error}"))?;
+        std::fs::write(&spec_path, spec_bytes)
+            .map_err(|error| format!("failed to write task_spec: {error}"))?;
+        command.arg("--task-spec").arg(&spec_path);
+    }
     if let Some(token) = token {
         command.arg("--token").arg(token);
     }

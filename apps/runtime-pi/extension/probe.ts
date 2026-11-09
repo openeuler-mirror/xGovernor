@@ -15,7 +15,7 @@ export default async function (pi: ExtensionAPI) {
             if (!model) throw new Error("Model not found");
             const result = await ctx.modelRegistry.complete(model, {
                 messages:[{role:"user",content:"Reply OK.",timestamp:Date.now()}],
-            }, {maxTokens:Math.min(16,model.maxTokens),signal:AbortSignal.timeout(10000),maxRetries:0});
+            }, {maxTokens:Math.min(16,model.maxTokens),signal:AbortSignal.timeout(60000),maxRetries:0});
             if (result.stopReason === "error" || result.stopReason === "aborted") {
                 throw new Error(result.errorMessage ?? "Model provider request failed");
             }

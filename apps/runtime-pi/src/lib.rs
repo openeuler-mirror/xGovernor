@@ -13,7 +13,7 @@ use agent_runtime_protocol::{
 use agent_runtime_protocol::{
     AgentRuntime, RuntimeCapability, RuntimeCapabilityContext, RuntimeEvent, RuntimeEventReceiver,
     RuntimeExecutionContext, RuntimeInteractionRequest as RuntimeInteractionInput,
-    RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
+    RecentTurnText, RuntimeStartRequest, RuntimeTurnRequest as RuntimeTurnInput,
 };
 use async_trait::async_trait;
 use bridge::Bridge;
@@ -1676,6 +1676,27 @@ impl AgentRuntime for PiRuntime {
                 credential_source: config.credential_source,
             }),
         )
+    }
+
+    async fn recent_turn_texts(
+        &self,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RecentTurnText>, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        let dir = PathBuf::from(&instance.persisted_state.pi_session_dir);
+        let texts = session_file::recent_turn_texts(&dir, limit).map_err(|error| {
+            RuntimeError::StateCorrupt {
+                message: format!("cannot read Pi conversation history: {error}"),
+            }
+        })?;
+        Ok(texts
+            .into_iter()
+            .map(|(role, text)| RecentTurnText { role, text })
+            .collect())
     }
 
     async fn export_state(&self, runtime_id: &str) -> Result<OpaqueRuntimeState, RuntimeError> {

@@ -75,6 +75,8 @@ pub struct MctsRunRequest {
     pub split: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub testbench: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_spec: Option<serde_json::Value>,
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_state_id: Option<String>,
@@ -390,7 +392,7 @@ impl<A: HostApplication + 'static> MctsRun<A> {
     }
 }
 
-fn all_capabilities() -> BTreeSet<Capability> {
+pub fn all_capabilities() -> BTreeSet<Capability> {
     [
         Capability::Snapshot,
         Capability::Fork,
@@ -412,17 +414,19 @@ pub fn build_launch_command(
     request: &MctsRunRequest,
 ) -> Command {
     let mut command = Command::new(python_bin);
+    let entry_module = std::env::var("MCTS_PLUGIN_ENTRY_MODULE")
+        .unwrap_or_else(|_| "src.core.main".to_string());
     match request.mode.as_str() {
         "mock" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mock");
         }
         "zsoft" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mode")
                 .arg("zsoft");
             if let Some(task_id) = request.task_id.as_deref() {
@@ -432,7 +436,7 @@ pub fn build_launch_command(
         "sweverified" => {
             command
                 .arg("-m")
-                .arg("src.core.main")
+                .arg(&entry_module)
                 .arg("--mode")
                 .arg("sweverified");
             if let Some(instance_id) = request.instance_id.as_deref() {
@@ -443,6 +447,19 @@ pub fn build_launch_command(
             }
             if let Some(testbench) = request.testbench.as_deref() {
                 command.arg("--testbench").arg(testbench);
+            }
+        }
+        "generic" => {
+            command
+                .arg("-m")
+                .arg(&entry_module)
+                .arg("--mode")
+                .arg("generic");
+            if let Some(task_id) = request.task_id.as_deref() {
+                command.arg("--task-id").arg(task_id);
+            }
+            if !request.goal.trim().is_empty() {
+                command.arg("--goal").arg(&request.goal);
             }
         }
         _ => {}
@@ -754,6 +771,27 @@ mod tests {
             .get_program()
             .to_string_lossy()
             .contains("python3"));
+    }
+
+    #[test]
+    fn build_launch_command_passes_generic_mode_and_goal() {
+        let mut request = request();
+        request.mode = "generic".to_string();
+        request.task_id = Some("generic-001".to_string());
+        request.goal = "implement add".to_string();
+
+        let command = build_launch_command("python3", "/repo", &request);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "--mode"));
+        assert!(args.iter().any(|arg| arg == "generic"));
+        assert!(args.iter().any(|arg| arg == "--task-id"));
+        assert!(args.iter().any(|arg| arg == "generic-001"));
+        assert!(args.iter().any(|arg| arg == "--goal"));
+        assert!(args.iter().any(|arg| arg == "implement add"));
     }
 
     fn host_service() -> Arc<HostCapService<FakeApplication>> {

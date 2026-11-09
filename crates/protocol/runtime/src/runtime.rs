@@ -98,6 +98,18 @@ pub trait AgentRuntime: Send + Sync {
         self.export_state(runtime_id).await
     }
 
+    /// Read-only view of the most recent conversational turns kept by this
+    /// runtime (user/assistant text only, oldest first). Used by the host to
+    /// consolidate prior context before materializing a `/mcts` task. The
+    /// default is empty for runtimes that do not keep a transcript.
+    async fn recent_turn_texts(
+        &self,
+        _runtime_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<crate::RecentTurnText>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
     /// Release private resources owned by an immutable checkpoint export.
     async fn delete_checkpoint_state(
         &self,

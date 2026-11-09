@@ -917,7 +917,7 @@ pub(crate) async fn probe_llm(executable: &str, config: &PiLlmConfig) -> Result<
         .map_err(super::to_runtime_error)?;
     let mut child = command.spawn().map_err(setup_error)?;
     let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
-    let result = timeout(Duration::from_secs(20), async {
+    let result = timeout(Duration::from_secs(60), async {
         while let Some(line) = lines.next_line().await.map_err(setup_error)? {
             let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
                 continue;

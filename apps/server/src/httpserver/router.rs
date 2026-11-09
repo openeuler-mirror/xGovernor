@@ -144,14 +144,15 @@ pub fn create_router(
     role_gate: Option<Role>,
     tenant_admin: Option<TenantAdminState>,
 ) -> Router {
-    let state = Arc::new(session_state);
+    let mcts_state = MctsHttpState::with_session(
+        MctsLaunchConfig::default(),
+        session_state.application().clone(),
+    );
+    let state = Arc::new(session_state.with_mcts(mcts_state.clone()));
     let mut router = Router::new()
         .route("/api/v1/health", get(health))
         .merge(session_router(state.clone()))
-        .merge(mcts_router(MctsHttpState::with_session(
-            MctsLaunchConfig::default(),
-            state.application().clone(),
-        )));
+        .merge(mcts_router(mcts_state));
     if let Some(tenant_admin_state) = tenant_admin {
         router = router.merge(admin_tenants_router(tenant_admin_state));
     }

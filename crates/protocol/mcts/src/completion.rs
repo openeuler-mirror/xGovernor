@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,12 @@ pub struct CompletionResult {
     pub evidence: Vec<Evidence>,
     pub limitations: Vec<String>,
     pub apply_plan: Option<ApplyPlan>,
+    /// Final deliverable files for tasks whose result is live code rather
+    /// than a patch/PoC. Keys are workspace-relative paths, typically under
+    /// `repo/`; values are the complete file contents. The host materializes
+    /// these back into the originating session before reporting completion.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
 }
 
 impl CompletionResult {

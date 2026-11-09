@@ -64,6 +64,7 @@ pub struct SessionHttpState {
     application: SessionApplication,
     stream_entry_ttl: Duration,
     streams: Arc<Mutex<HashMap<String, HashMap<String, StreamEntry>>>>,
+    mcts: Option<super::mcts::MctsHttpState>,
 }
 
 impl SessionHttpState {
@@ -72,6 +73,7 @@ impl SessionHttpState {
             application,
             stream_entry_ttl: DEFAULT_STREAM_ENTRY_TTL,
             streams: Arc::new(Mutex::new(HashMap::new())),
+            mcts: None,
         }
     }
 
@@ -84,6 +86,11 @@ impl SessionHttpState {
     pub fn with_stream_entry_ttl(mut self, ttl: Duration) -> Self {
         assert!(!ttl.is_zero(), "stream entry TTL must be positive");
         self.stream_entry_ttl = ttl;
+        self
+    }
+
+    pub fn with_mcts(mut self, mcts: super::mcts::MctsHttpState) -> Self {
+        self.mcts = Some(mcts);
         self
     }
 
@@ -247,11 +254,80 @@ fn unattachable_receipt_body(
     body
 }
 
+fn leading_mcts_goal(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let head = trimmed.get(..5)?;
+    if !head.eq_ignore_ascii_case("/mcts") {
+        return None;
+    }
+    let rest = &trimmed[5..];
+    let boundary_ok = rest.is_empty()
+        || rest
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true);
+    if !boundary_ok {
+        return None;
+    }
+    Some(rest.trim_start().to_string())
+}
+
+async fn handle_mcts_turn(
+    state: &Arc<SessionHttpState>,
+    ctx: &SecurityContext,
+    request: SessionTurnRequest,
+    goal: &str,
+) -> Response {
+    let Some(mcts) = state.mcts.as_ref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "MCTS is not configured for this frontend"})),
+        )
+            .into_response();
+    };
+    let directive =
+        super::mcts_context::extract_directive(state.application(), ctx, &request, goal).await;
+    if let Err(error) = super::mcts_materialize::materialize(
+        state.application(),
+        ctx,
+        &request.runtime_id,
+        &request.lease,
+        &directive,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+    match super::mcts::start_turn_run(
+        mcts,
+        ctx,
+        &request.runtime_id,
+        &directive.goal,
+        &request.lease,
+    )
+    .await
+    {
+        Ok(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
 async fn submit_turn(
     State(state): State<Arc<SessionHttpState>>,
     Extension(ctx): Extension<SecurityContext>,
     Json(request): Json<SessionTurnRequest>,
 ) -> Response {
+    if let Some(goal) = leading_mcts_goal(&request.text) {
+        if goal.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "usage: /mcts <task goal>"})),
+            )
+                .into_response();
+        }
+        return handle_mcts_turn(&state, &ctx, request, &goal).await;
+    }
     match state.application.submit_turn(&ctx, request).await {
         Ok(submission) => {
             // `events` is `None` when the receipt was replayed for a

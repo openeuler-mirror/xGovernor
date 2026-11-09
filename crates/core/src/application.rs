@@ -65,9 +65,18 @@ fn map_provider_error(error: provider_protocol::ProviderControlError) -> Session
                 capability,
             }
         }
-        provider_protocol::ProviderControlError::ResourceLimitExceeded { max, .. } => {
+        provider_protocol::ProviderControlError::ResourceLimitExceeded {
+            max,
+            owner_ref,
+            ..
+        } => {
+            let scope = if owner_ref == "snapshot storage" {
+                "snapshot storage"
+            } else {
+                "provider containers"
+            };
             SessionDomainError::QuotaExceeded {
-                scope: "provider containers".into(),
+                scope: scope.into(),
                 limit: max as u32,
             }
         }
@@ -2196,6 +2205,46 @@ impl SessionApplication {
         })
     }
 
+    /// Resolve the provider backend a checkpoint was created on by reading its
+    /// persisted ``isolation.metadata``. MCTS fork uses this to decide whether
+    /// to send e2b-specific provider options or leave docker options to core.
+    pub async fn checkpoint_backend(
+        &self,
+        ctx: &SecurityContext,
+        checkpoint_id: &str,
+    ) -> Result<Option<String>, SessionDomainError> {
+        let record = self
+            .records
+            .get_checkpoint(checkpoint_id)
+            .await?
+            .filter(|record| ctx.owns(record.tenant_id.as_deref()))
+            .ok_or_else(|| SessionDomainError::NotFound {
+                runtime_id: checkpoint_id.to_string(),
+            })?;
+        Ok(provider_id_from_metadata(&record.isolation.metadata).map(str::to_owned))
+    }
+
+    /// Read-only, most-recent conversational turns owned by `runtime_id`
+    /// (user/assistant text, oldest first). This bypasses core's own record
+    /// store on purpose: core keeps no transcript, so the host must ask the
+    /// runtime adapter, which owns the full conversation history. Only tenant
+    /// ownership and adapter attachment are validated here.
+    pub async fn conversation_context(
+        &self,
+        ctx: &SecurityContext,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<Vec<agent_runtime_protocol::RecentTurnText>, SessionDomainError> {
+        let record = self.require_session(ctx, runtime_id).await?;
+        self.ensure_runtime_attached(ctx, &record).await?;
+        let registration = self.registration_for_record(&record)?;
+        let runtime = Arc::clone(&registration.runtime);
+        runtime
+            .recent_turn_texts(&record.runtime_id, limit)
+            .await
+            .map_err(map_runtime_error)
+    }
+
     pub async fn checkpoint(
         &self,
         ctx: &SecurityContext,
@@ -2484,13 +2533,24 @@ impl SessionApplication {
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
         let intent_id = format!("load:{runtime_id}");
         self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"load","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"target":runtime_id})).await?;
+        let mut isolation_options = provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id);
+        if let Some(request_options) = request
+            .deployment
+            .options
+            .get("provider_options")
+            .and_then(|value| value.as_object())
+        {
+            for (key, value) in request_options {
+                isolation_options[key] = value.clone();
+            }
+        }
         let backend = match manager
             .load_instance_from_snapshot(
                 runtime_id.clone(),
                 provider_protocol::BackendId(provider_id.clone()),
                 ctx.owner_ref(),
                 provider_protocol::ProviderSnapshotId(checkpoint.provider_snapshot_id.clone()),
-                provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id),
+                isolation_options,
                 ctx.quota.sandbox_limit(&provider_id),
             )
             .await
