@@ -9,13 +9,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Extension;
 use axum::{Json, Router};
+use base64::Engine;
 use mcts_plugin_host::{
     all_capabilities, build_launch_command, Budget, FakeApplication, HostApplication,
     HostCapService, MctsRun, MctsRunOutcome, MctsRunRequest, MctsRunStatus, RunMap,
+    CompletionResult,
 };
 use serde::{Deserialize, Serialize};
 use session_protocol::{
-    SessionCheckpointDeleteRequest, SessionCheckpointRequest, SessionLeaseClaim,
+    SessionCheckpointDeleteRequest, SessionCheckpointRequest, SessionFileWriteRequest,
+    SessionLeaseClaim, SessionTurnRequest,
 };
 use xgovernor_core::{SecurityContext, SessionApplication};
 
@@ -53,6 +56,21 @@ impl Default for MctsLaunchConfig {
         }
     }
 }
+
+/// Feedback routing context for a `/mcts` turn: which session to write the
+/// result back into, and under which lease. The single-request HTTP create
+/// path has no originating turn, so it passes `None`.
+#[derive(Clone)]
+pub(super) struct MctsTurnFeedback {
+    runtime_id: String,
+    lease: SessionLeaseClaim,
+}
+
+/// Caps copied from P6 materialization so a large plugin `files` payload
+/// cannot blow up the write-back stage. Oversized files are skipped with a
+/// warning rather than failing the whole completion feedback.
+const FEEDBACK_MAX_FILE_BYTES: usize = 256 * 1024;
+const FEEDBACK_MAX_TOTAL_BYTES: usize = 1024 * 1024;
 
 impl MctsHttpState {
     pub fn new(config: MctsLaunchConfig) -> Self {
@@ -100,6 +118,10 @@ struct MctsRunRecord {
     outcome: Option<MctsRunOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_lease: Option<SessionLeaseClaim>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,7 +224,7 @@ async fn create_run(
     let ctx = context
         .map(|Extension(ctx)| ctx)
         .unwrap_or_else(|| SecurityContext::admin("system:mcts-worker"));
-    let view = start_mcts_run(&state, &ctx, request).await?;
+    let view = start_mcts_run(&state, &ctx, request, None).await?;
     Ok((StatusCode::CREATED, Json(view)))
 }
 
@@ -238,7 +260,16 @@ pub(super) async fn start_turn_run(
         llm: None,
         granted_capabilities: all_capabilities(),
     };
-    start_mcts_run(state, ctx, request).await
+    start_mcts_run(
+        state,
+        ctx,
+        request,
+        Some(MctsTurnFeedback {
+            runtime_id: runtime_id.to_string(),
+            lease: lease.clone(),
+        }),
+    )
+    .await
 }
 
 async fn checkpoint_current_session(
@@ -295,6 +326,7 @@ pub(super) async fn start_mcts_run(
     state: &MctsHttpState,
     ctx: &SecurityContext,
     mut request: MctsRunRequest,
+    feedback: Option<MctsTurnFeedback>,
 ) -> Result<MctsRunView, MctsApiError> {
     if request.plugin_id != "mcts" {
         return Err(MctsApiError {
@@ -396,16 +428,20 @@ pub(super) async fn start_mcts_run(
             })?;
             spawn_mcts_task(
                 state.clone(),
+                ctx.clone(),
                 request.clone(),
                 Arc::new(HostCapService::new(application, run_map)),
                 cancel.clone(),
+                feedback.clone(),
             );
         } else {
             spawn_mcts_task(
                 state.clone(),
+                ctx.clone(),
                 request.clone(),
                 Arc::new(HostCapService::new(FakeApplication::new(), run_map)),
                 cancel.clone(),
+                feedback.clone(),
             );
         }
     }
@@ -432,6 +468,8 @@ pub(super) async fn start_mcts_run(
         root_state_id: request.root_state_id.clone(),
         outcome: None,
         error: None,
+        original_runtime_id: feedback.as_ref().map(|f| f.runtime_id.clone()),
+        original_lease: feedback.as_ref().map(|f| f.lease.clone()),
     };
     {
         let mut runs = state.runs.lock().map_err(|_| MctsApiError {
@@ -455,11 +493,14 @@ pub(super) async fn start_mcts_run(
 
 fn spawn_mcts_task<A: HostApplication + 'static>(
     state: MctsHttpState,
+    ctx: SecurityContext,
     request: MctsRunRequest,
     host_service: Arc<HostCapService<A>>,
     cancel: Arc<AtomicBool>,
+    feedback: Option<MctsTurnFeedback>,
 ) {
     let run_id = request.run_id.clone();
+    let cleanup_turn_root = feedback.is_some();
     let command = build_launch_command(
         state.config.python_bin.clone(),
         state.config.repo_root.clone(),
@@ -473,14 +514,21 @@ fn spawn_mcts_task<A: HostApplication + 'static>(
     tokio::spawn(async move {
         let outcome = run.execute().await;
         let mut prepared_state_id = None;
+        let mut turn_root_state_id = None;
+        let mut completed_result = None;
         if let Ok(mut records) = runs.lock() {
             if let Some(record) = records.get_mut(&run_id) {
                 if record.root_state_prepared {
                     prepared_state_id = record.root_state_id.clone();
+                } else if cleanup_turn_root {
+                    turn_root_state_id = record.root_state_id.clone();
                 }
                 if record.status != MctsRunStatus::Cancelled {
                     match outcome {
                         Ok(mcts_outcome) => {
+                            if mcts_outcome.status == MctsRunStatus::Completed {
+                                completed_result = mcts_outcome.result.clone();
+                            }
                             record.status = mcts_outcome.status;
                             record.outcome = Some(mcts_outcome);
                         }
@@ -495,10 +543,155 @@ fn spawn_mcts_task<A: HostApplication + 'static>(
         if let (Some(state_id), Some(session)) = (prepared_state_id, state.session.clone()) {
             cleanup_prepared_root_state(&session, &run_id, &state_id).await;
         }
+        if let (Some(state_id), Some(session)) = (turn_root_state_id, state.session.clone()) {
+            cleanup_prepared_root_state(&session, &run_id, &state_id).await;
+        }
+        if let (Some(result), Some(session), Some(feedback)) =
+            (completed_result, state.session.clone(), feedback)
+        {
+            write_back_mcts_feedback(&session, &ctx, &feedback, &result).await;
+        }
         if let Ok(mut map) = cancellations.lock() {
             map.remove(&run_id);
         }
     });
+}
+
+async fn write_back_mcts_feedback(
+    session: &SessionApplication,
+    ctx: &SecurityContext,
+    feedback: &MctsTurnFeedback,
+    result: &CompletionResult,
+) {
+    let runtime_id = &feedback.runtime_id;
+    let lease = &feedback.lease;
+
+    write_feedback_file(
+        session,
+        ctx,
+        runtime_id,
+        lease,
+        ".mcts/result.json",
+        &serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".to_string()),
+    )
+    .await;
+    write_feedback_file(
+        session,
+        ctx,
+        runtime_id,
+        lease,
+        ".mcts/artifact.txt",
+        &result.answer,
+    )
+    .await;
+    write_feedback_file(
+        session,
+        ctx,
+        runtime_id,
+        lease,
+        ".mcts/summary.txt",
+        &build_feedback_summary(result),
+    )
+    .await;
+
+    let mut written_total = 0usize;
+    for (path, content) in &result.files {
+        if written_total >= FEEDBACK_MAX_TOTAL_BYTES {
+            tracing::warn!(run_target = runtime_id, "MCTS feedback files total budget exhausted");
+            break;
+        }
+        if content.len() > FEEDBACK_MAX_FILE_BYTES {
+            tracing::warn!(run_target = runtime_id, path, "MCTS feedback file skipped (too large)");
+            continue;
+        }
+        let Ok(rel) = repo_file_path(path) else {
+            tracing::warn!(run_target = runtime_id, path, "MCTS feedback file skipped (bad path)");
+            continue;
+        };
+        written_total = written_total.saturating_add(content.len());
+        write_feedback_file(session, ctx, runtime_id, lease, &rel, content).await;
+    }
+
+    let text = "MCTS 已完成。结果见 /home/user/workspace/.mcts/result.json 与 \
+                /home/user/workspace/.mcts/artifact.txt。请检查结果，并把最终答案/下一步行动回复给用户。"
+        .to_string();
+    if let Err(error) = session
+        .submit_turn(
+            ctx,
+            SessionTurnRequest {
+                runtime_id: runtime_id.clone(),
+                text,
+                entry: Default::default(),
+                llm: None,
+                reasoning_effort: None,
+                client_request_id: None,
+                ext: Default::default(),
+                lease: lease.clone(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(run_target = runtime_id, error = %error, "MCTS feedback turn failed");
+    }
+}
+
+async fn write_feedback_file(
+    session: &SessionApplication,
+    ctx: &SecurityContext,
+    runtime_id: &str,
+    lease: &SessionLeaseClaim,
+    path: &str,
+    content: &str,
+) {
+    let content_base64 = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    if let Err(error) = session
+        .write_file(
+            ctx,
+            SessionFileWriteRequest {
+                runtime_id: runtime_id.to_string(),
+                path: path.to_string(),
+                content_base64,
+                create_parents: true,
+                lease: lease.clone(),
+            },
+        )
+        .await
+    {
+        tracing::warn!(run_target = runtime_id, path, error = %error, "MCTS feedback file write failed");
+    }
+}
+
+fn build_feedback_summary(result: &CompletionResult) -> String {
+    let mut parts = vec![format!("summary: {}", result.summary.trim())];
+    if let Some(selected) = result.selected_candidate_id.as_ref() {
+        parts.push(format!("selected_candidate: {selected}"));
+    }
+    if !result.limitations.is_empty() {
+        parts.push(format!("limitations: {}", result.limitations.join("; ")));
+    }
+    if !result.evidence.is_empty() {
+        let ids = result
+            .evidence
+            .iter()
+            .map(|evidence| evidence.evidence_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("evidence: {ids}"));
+    }
+    parts.join("\n")
+}
+
+fn repo_file_path(path: &str) -> Result<String, String> {
+    let raw = path.trim();
+    if raw.is_empty() || raw.starts_with('/') || raw.contains("..") {
+        return Err(format!("invalid file path: {path}"));
+    }
+    let rel = raw.strip_prefix("./").unwrap_or(raw);
+    let rel = rel.strip_prefix("repo/").unwrap_or(rel);
+    if rel.is_empty() {
+        return Err(format!("invalid file path: {path}"));
+    }
+    Ok(format!("repo/{rel}"))
 }
 
 async fn cleanup_prepared_root_state(session: &SessionApplication, run_id: &str, state_id: &str) {
@@ -586,6 +779,16 @@ mod tests {
             },
             "granted_capabilities": ["snapshot", "fork", "agent_turn"]
         })
+    }
+
+    #[test]
+    fn repo_file_path_normalizes_and_rejects_escapes() {
+        assert_eq!(repo_file_path("calc.py").unwrap(), "repo/calc.py");
+        assert_eq!(repo_file_path("repo/calc.py").unwrap(), "repo/calc.py");
+        assert_eq!(repo_file_path("./repo/lib/util.py").unwrap(), "repo/lib/util.py");
+        assert!(repo_file_path("/tmp/evil.py").is_err());
+        assert!(repo_file_path("../evil.py").is_err());
+        assert!(repo_file_path("").is_err());
     }
 
     #[test]

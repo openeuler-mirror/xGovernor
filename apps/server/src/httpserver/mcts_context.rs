@@ -10,7 +10,7 @@ use xgovernor_core::{SecurityContext, SessionApplication};
 /// `/mcts` message is intercepted before `submit_turn`, so it never reaches
 /// the runtime transcript and must be appended separately.
 const HISTORY_LIMIT: usize = 20;
-const EXTRACT_TIMEOUT: Duration = Duration::from_secs(15);
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) const MAX_FILE_PATHS: usize = 32;
 pub(super) const MAX_TEXT_FILE_BYTES: usize = 256 * 1024;

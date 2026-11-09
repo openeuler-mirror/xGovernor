@@ -34,6 +34,7 @@ pub use mcts_run::{
     MctsRunStatus,
 };
 pub use mcts_protocol::messages::Failure;
+pub use mcts_protocol::CompletionResult;
 pub use mcts_protocol::methods::Budget;
 pub use process::PluginProcess;
 pub use profile_registry::ProfileRegistry;
