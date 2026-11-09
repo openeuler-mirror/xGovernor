@@ -3,8 +3,10 @@ use agent_runtime_protocol::{
     RuntimeCancelRequest, RuntimeCapability, RuntimeCapabilityContext, RuntimeError, RuntimeEvent,
     RuntimeEventReceiver, RuntimeExecutionContext,
     RuntimeInteractionRequest as RuntimeInteractionInput, RuntimeStartRequest,
-    RuntimeStateSnapshot, RuntimeTurnRequest as RuntimeTurnInput, WorkerRequest, WorkerResponse,
+    RecentTurnText, RuntimeStateSnapshot, RuntimeTurnRequest as RuntimeTurnInput, WorkerRequest,
+    WorkerResponse,
 };
+use agent_types::{ContentBlock, MessageRole};
 use async_trait::async_trait;
 use backend::execution::OperationExecutionExt;
 use serde_json::{json, Value};
@@ -58,6 +60,14 @@ fn map_runtime_error(error: RuntimeError) -> SessionDomainError {
             message,
             source: None,
         },
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
     }
 }
 
@@ -185,6 +195,46 @@ impl AgentRuntime for XiaooRuntime {
             .map_err(to_runtime_error)?;
         let descriptor = instance.persisted.lock().await.llm.descriptor();
         Ok(Some(descriptor))
+    }
+
+    async fn recent_turn_texts(
+        &self,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RecentTurnText>, RuntimeError> {
+        let instance = self
+            .instance_for(runtime_id)
+            .await
+            .map_err(to_runtime_error)?;
+        let persisted = instance.persisted.lock().await;
+        let mut collected = Vec::new();
+        for message in &persisted.loop_state.messages {
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                _ => continue,
+            };
+            let text = message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.trim().is_empty() {
+                continue;
+            }
+            collected.push(RecentTurnText {
+                role: role.to_string(),
+                text: truncate_chars(&text, 8_000),
+            });
+        }
+        if collected.len() > limit {
+            collected.drain(..collected.len() - limit);
+        }
+        Ok(collected)
     }
 
     async fn stop(&self, runtime_id: &str) -> Result<(), RuntimeError> {
