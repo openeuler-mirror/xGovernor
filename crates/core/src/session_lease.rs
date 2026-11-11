@@ -264,6 +264,13 @@ impl SessionLeaseTable {
         };
         let mut table = self.shard_for(session_id).lock().await;
         match table.get_mut(session_id) {
+            Some(lease) if lease.client_id.is_empty() => {
+                // `open` registers a fresh, empty-holder placeholder so the
+                // orphan reaper can see the session. The first identified
+                // heartbeat claims that placeholder instead of racing it.
+                *lease = fresh_lease(client_id.to_string(), client_pid, client_hostname, now);
+                Ok(())
+            }
             Some(lease) if lease.client_id == client_id => {
                 lease.last_heartbeat_ms = now;
                 Ok(())
@@ -622,6 +629,19 @@ mod tests {
         let table = SessionLeaseTable::new();
         assert!(table.check_holder("s1", Some("client-a")).await.is_ok());
         assert!(table.check_holder("s1", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_claims_open_placeholder_lease() {
+        let table = SessionLeaseTable::new();
+        table.ensure_unclaimed("s1").await;
+        assert!(table.heartbeat("s1", "client-a", Some(1), None).await.is_ok());
+        match table.heartbeat("s1", "client-b", None, None).await.unwrap_err() {
+            LeaseCheckFailure::Busy {
+                holder_client_id, ..
+            } => assert_eq!(holder_client_id, "client-a"),
+            other => panic!("expected client-a to hold the claimed lease, got {other:?}"),
+        }
     }
 
     #[tokio::test]
