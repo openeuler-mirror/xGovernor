@@ -56,6 +56,13 @@ async fn materialize_file(
     ensure_repo_dir(app, ctx, runtime_id, lease).await?;
     for raw in &source.paths {
         let rel = workspace_relative(raw)?;
+        // The extractor may legitimately choose the repo directory itself
+        // (`/home/user/workspace/repo`) when the task already lives there.
+        // Reading a directory as a file is invalid; just keep the current
+        // workspace state and let the MCTS run start from it.
+        if rel == "repo" || rel.strip_prefix("repo/").is_some() {
+            continue;
+        }
         // Existence probe first; a missing path must fail before checkpointing.
         app.read_file(
             ctx,
@@ -69,10 +76,6 @@ async fn materialize_file(
         .map_err(|error| {
             MctsApiError::bad_request(format!("file code_source path not found ({raw}): {error}"))
         })?;
-        // Already inside the unified repo? Nothing to copy.
-        if rel == "repo" || rel.strip_prefix("repo/").is_some() {
-            continue;
-        }
         let src = format!("{WORKSPACE_ROOT}/{rel}");
         let dest = format!("{REPO_DIR}/{rel}");
         if let Some((parent, _)) = dest.rsplit_once('/') {

@@ -3155,3 +3155,48 @@ async fn open_registers_the_session_in_the_lease_table_for_the_orphan_reaper() {
         "the entry an open registers must not claim a holder"
     );
 }
+
+#[tokio::test]
+async fn open_claims_the_lease_when_the_open_request_carries_a_client_id() {
+    let lease_table = Arc::new(SessionLeaseTable::new());
+    let repository = Arc::new(MemoryRepository::default());
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        test_provider_managers(),
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(TestEnvironment),
+        Arc::new(FixedTurnId),
+    )
+    .with_lease_table(lease_table.clone());
+
+    let response = application
+        .open(
+            &admin_ctx(),
+            SessionOpenRequest {
+                runtime_id: None,
+                runtime_kind: None,
+                conversation_id: "conversation".into(),
+                sender_id: "sender".into(),
+                workspace: Default::default(),
+                deployment: Default::default(),
+                requested_capabilities: Default::default(),
+                llm: None,
+                ext: Default::default(),
+                lease: SessionLeaseClaim {
+                    client_id: Some("client-a".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let snapshot = lease_table.snapshot().await;
+    let holder = snapshot
+        .iter()
+        .find(|(session_id, _, _)| session_id == &response.runtime_id)
+        .map(|(_, holder, _)| holder.as_str());
+    assert_eq!(holder, Some("client-a"));
+}

@@ -886,11 +886,34 @@ impl SessionApplication {
             }
             return Err(error);
         }
-        // Record the session in the lease table as "exists, no holder yet" so
-        // the orphan reaper can reclaim it if the client dies before its first
-        // heartbeat: the reaper only walks that table.
         if let Some(lease_table) = &self.lease_table {
-            lease_table.ensure_unclaimed(&record.runtime_id).await;
+            match request.lease.client_id.as_deref().filter(|id| !id.is_empty()) {
+                Some(client_id) => {
+                    if let Err(failure) = lease_table
+                        .heartbeat(
+                            &record.runtime_id,
+                            client_id,
+                            request.lease.client_pid,
+                            request.lease.client_hostname.clone(),
+                        )
+                        .await
+                    {
+                        let _ = runtime.stop(&record.runtime_id).await;
+                        let _ = manager.stop_instance(&record.runtime_id).await;
+                        if let Some(tenant_id) = &tenant_id_for_quota {
+                            self.release_tenant_session(tenant_id);
+                        }
+                        return Err(lease_check_failure_to_domain_error(
+                            &record.runtime_id,
+                            failure,
+                        ));
+                    }
+                }
+                // Record an unclaimed session in the lease table so the orphan
+                // reaper can reclaim a client that dies before its first
+                // heartbeat: the reaper only walks that table.
+                None => lease_table.ensure_unclaimed(&record.runtime_id).await,
+            }
         }
         Ok(project_session(&record))
     }
