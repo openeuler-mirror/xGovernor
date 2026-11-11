@@ -12,7 +12,6 @@ members = [
     "crates/backend",
     "crates/core",
     "crates/manager",
-    "crates/thinkthread-client",
 ]
 resolver = "2"
 
