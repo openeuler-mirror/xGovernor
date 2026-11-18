@@ -1175,6 +1175,11 @@ impl SessionApplication {
                     }
                     .await;
                     if let Err(error) = persisted {
+                        let usage = match &event {
+                            RuntimeEvent::Completed { usage, .. }
+                            | RuntimeEvent::Failed { usage, .. } => *usage,
+                            _ => unreachable!("guarded by terminal match"),
+                        };
                         event = RuntimeEvent::Failed {
                             error: RuntimeFailure {
                                 code: "runtime_state_persist_failed".into(),
@@ -1182,7 +1187,7 @@ impl SessionApplication {
                                 retryable: true,
                                 details: serde_json::Value::Null,
                             },
-                            usage: session_protocol::SessionUsage::default(),
+                            usage,
                         };
                     }
                 }

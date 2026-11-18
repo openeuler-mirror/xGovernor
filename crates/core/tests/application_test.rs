@@ -572,6 +572,7 @@ impl SessionRepository for MemoryRepository {
 
 #[derive(Default)]
 struct CompletingRuntime {
+    usage: SessionUsage,
     started: Mutex<Option<RuntimeStartRequest>>,
     submitted: Mutex<Option<RuntimeTurnInput>>,
     stopped: Mutex<bool>,
@@ -621,7 +622,7 @@ impl AgentRuntime for CompletingRuntime {
         let (tx, rx) = mpsc::channel(2);
         tx.send(RuntimeEvent::Completed {
             outcome: session_protocol::SessionTurnOutcome::Complete,
-            usage: SessionUsage::default(),
+            usage: self.usage,
         })
         .await
         .unwrap();
@@ -2041,8 +2042,16 @@ impl SessionRepository for FullDiskRepository {
 
 #[tokio::test]
 async fn accepted_turn_reports_failed_terminal_when_disk_full_prevents_state_persistence() {
+    let usage = SessionUsage {
+        input_tokens: 71,
+        output_tokens: 9,
+        total_tokens: 80,
+    };
     let application = SessionApplication::new(
-        Arc::new(CompletingRuntime::default()),
+        Arc::new(CompletingRuntime {
+            usage,
+            ..Default::default()
+        }),
         test_provider_managers(),
         Arc::new(FullDiskRepository),
         Arc::new(FixedTurnId),
@@ -2062,7 +2071,12 @@ async fn accepted_turn_reports_failed_terminal_when_disk_full_prevents_state_per
             .unwrap()
             .unwrap();
         match terminal {
-            SessionEvent::TurnFailed { error, .. } => {
+            SessionEvent::TurnFailed {
+                error,
+                usage: reported,
+                ..
+            } => {
+                assert_eq!(reported, usage.into());
                 assert_eq!(error.code, "runtime_state_persist_failed");
                 assert!(error.message.contains("database or disk is full"));
             }
