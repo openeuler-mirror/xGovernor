@@ -3463,6 +3463,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "xgovernor-runtime-opencode"
+version = "0.1.0"
+dependencies = [
+ "agent-runtime-protocol",
+ "async-trait",
+ "axum",
+ "backend",
+ "futures-util",
+ "operation-protocol",
+ "provider-protocol",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "session-protocol",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "xgovernor-runtime-pi"
 version = "0.1.0"
 dependencies = [
