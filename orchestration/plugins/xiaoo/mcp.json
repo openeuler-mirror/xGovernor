@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "mcts": {"transport": "stdio", "command": "mcts", "args": ["mcp"]}
+  }
+}
