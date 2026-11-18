@@ -1,0 +1,63 @@
+{
+  "start_key": "verified-example",
+  "goal": "Replace with the instance problem statement",
+  "content": "",
+  "code_source": {
+    "kind": "task",
+    "task": "swe_bench",
+    "reference": "psf__requests-6028"
+  },
+  "config": {
+    "budget": {
+      "max_tokens": 1500000,
+      "max_time_ms": 2700000
+    },
+    "network_policy": "offline",
+    "backend": {
+      "selection": "auto"
+    },
+    "requirements": {
+      "capabilities": [
+        "prepare_root",
+        "renew_run_lease",
+        "reclaim_run",
+        "export_workspace",
+        "snapshot",
+        "fork",
+        "agent_turn",
+        "exec",
+        "file_read",
+        "file_write",
+        "diff",
+        "release"
+      ],
+      "isolation": "sandbox",
+      "joint_snapshots": true,
+      "independent_branches": true,
+      "can_reset_history": true
+    },
+    "algorithm": {
+      "namespace": "mcts",
+      "version": "1",
+      "schema": "urn:xgovernor:mcts:run-config:1",
+      "parameters": {
+        "max_iters": 1,
+        "branching": 2,
+        "max_concurrent": 1,
+        "task": {
+          "mode": "sweverified",
+          "arguments": {
+            "instance_id": "psf__requests-6028",
+            "instance_file": "/absolute/path/instance.json"
+          }
+        }
+      }
+    }
+  },
+  "approval": {
+    "budget": {
+      "max_tokens": 1500000,
+      "max_time_ms": 2700000
+    }
+  }
+}

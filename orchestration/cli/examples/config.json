@@ -1,0 +1,52 @@
+{
+  "runs_dir": "./runs",
+  "algorithms_dir": "./algorithms",
+  "python_executable": "python3",
+  "package_directory": ".",
+  "models": {
+    "solver": {
+      "provider": "openai-compatible",
+      "model": "DeepSeek-V4.1-Flash-1017",
+      "api_base": "https://model.example.invalid/v1",
+      "credential_ref": "env:MCTS_SOLVER_API_KEY"
+    },
+    "reviewer": {
+      "provider": "openai-compatible",
+      "model": "DeepSeek-V4.1-Flash-1017",
+      "api_base": "https://model.example.invalid/v1",
+      "credential_ref": "file:/home/your-user/.config/mcts/reviewer.key"
+    }
+  },
+  "backends": [
+    {
+      "kind": "e2b",
+      "driver": "own",
+      "e2b": {
+        "api_url": "https://api.e2b.app",
+        "domain": "e2b.app",
+        "envd_scheme": "https",
+        "credential_ref": "env:E2B_API_KEY",
+        "timeout_secs": 3600,
+        "model": "solver",
+        "opencode_executable": "/usr/local/bin/opencode"
+      }
+    }
+  ],
+  "lease_ttl_ms": 30000,
+  "export_max_bytes": 16777216,
+  "tasks": {
+    "swe_bench": {
+      "image": "swebench/sweb.eval.x86_64.{reference}:latest",
+      "working_directory": "/testbed",
+      "default_network_policy": "offline",
+      "instances": {}
+    },
+    "deepswe": {
+      "image": "deepswe/{reference}:latest",
+      "working_directory": "/testbed",
+      "default_network_policy": "allow_internet",
+      "instances": {}
+    }
+  },
+  "swebench_python": null
+}

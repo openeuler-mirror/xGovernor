@@ -1,0 +1,16 @@
+[package]
+name = "xgovernor-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+orchestration-contract = { path = "../contract", features = ["json-schema"] }
+schemars = "0.8.22"
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
