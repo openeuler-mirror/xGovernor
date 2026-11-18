@@ -1570,6 +1570,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "orchestration-backend-own"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "backend",
+ "base64",
+ "chrono",
+ "libc",
+ "operation-protocol",
+ "orchestration-compat",
+ "orchestration-contract",
+ "provider-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "session-protocol",
+ "sha2",
+ "similar",
+ "tokio",
+ "uuid",
+ "xgovernor-core",
+ "xgovernor-manager",
+ "xgovernor-runtime-opencode",
+ "xgovernor-runtime-pi",
+]
+
+[[package]]
 name = "orchestration-compat"
 version = "0.1.0"
 dependencies = [
