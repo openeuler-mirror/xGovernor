@@ -1,0 +1,22 @@
+[package]
+name = "orchestration-compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-support = ["dep:async-trait", "dep:serde", "dep:serde_json", "dep:base64", "dep:tar", "dep:sha2"]
+
+[dependencies]
+orchestration-contract = { path = "../contract" }
+async-trait = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { version = "0.22.1", optional = true }
+tar = { version = "0.4.46", optional = true }
+sha2 = { version = "0.10.9", optional = true }
+
+[dev-dependencies]
+orchestration-compat = { path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile.workspace = true
