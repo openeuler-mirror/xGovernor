@@ -1,0 +1,30 @@
+[package]
+name = "orchestration-backend-own"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+uuid.workspace = true
+rusqlite.workspace = true
+base64.workspace = true
+chrono = "0.4"
+similar = "2"
+sha2 = "0.10.9"
+libc = "0.2"
+xgovernor-runtime-opencode = { path = "../../../apps/runtime-opencode" }
+orchestration-contract = { path = "../../contract" }
+xgovernor-core = { path = "../../../crates/core" }
+xgovernor-manager = { path = "../../../crates/manager" }
+backend = { path = "../../../crates/backend" }
+operation-protocol = { path = "../../../crates/protocol/operation" }
+session-protocol = { path = "../../../crates/protocol/session" }
+
+[dev-dependencies]
+orchestration-compat = { path = "../../tests" }
+xgovernor-runtime-pi = { path = "../../../apps/runtime-pi" }
+provider-protocol = { path = "../../../crates/protocol/provider" }

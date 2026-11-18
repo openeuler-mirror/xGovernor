@@ -729,6 +729,15 @@ impl InstanceManager {
     /// automatic background retry — see [`Self::spawn_retry_loop`]. Either
     /// path can win the race to clean it up; both are serialized against
     /// each other by the same per-`runtime_id` lock `start_instance` uses.
+    /// Read durable identity evidence without querying the platform or claiming
+    /// that the resource still exists. Written after successful load and attach.
+    pub async fn recorded_instance(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<ProviderInstance>, ProviderControlError> {
+        self.ledger.recorded_instance(&self.kind, runtime_id).await
+    }
+
     /// Find a restore whose response was lost, without retiring its identity.
     pub async fn pending_snapshot_load_instance(
         &self,
@@ -737,11 +746,7 @@ impl InstanceManager {
         if self.kind.0 != "e2b" {
             return Ok(None);
         }
-        if let Some(instance) = self
-            .ledger
-            .recorded_instance(&self.kind, runtime_id)
-            .await?
-        {
+        if let Some(instance) = self.recorded_instance(runtime_id).await? {
             return Ok(Some(instance));
         }
         self.pending_correlated_instance("xgovernor_load_request", &format!("load:{runtime_id}"))

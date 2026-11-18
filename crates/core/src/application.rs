@@ -2222,6 +2222,8 @@ impl SessionApplication {
             .await
             .map_err(map_runtime_error)
         {
+            self.record_failed_restore(runtime.as_ref(), &runtime_id, &intent_id)
+                .await;
             let _ = manager.stop_instance(&runtime_id).await;
             if let Some(id) = &tenant_id_for_quota {
                 self.release_tenant_session(id);
@@ -2232,7 +2234,8 @@ impl SessionApplication {
             match export_runtime_snapshot(runtime.as_ref(), &runtime_id).await {
                 Ok(state) => state,
                 Err(error) => {
-                    let _ = runtime.stop(&runtime_id).await;
+                    self.record_failed_restore(runtime.as_ref(), &runtime_id, &intent_id)
+                        .await;
                     let _ = manager.stop_instance(&runtime_id).await;
                     if let Some(id) = &tenant_id_for_quota {
                         self.release_tenant_session(id);
@@ -2265,7 +2268,8 @@ impl SessionApplication {
             created_by: ctx.principal.clone(),
         };
         if let Err(error) = self.records.save(record.clone()).await {
-            let _ = runtime.stop(&runtime_id).await;
+            self.record_failed_restore(runtime.as_ref(), &runtime_id, &intent_id)
+                .await;
             let _ = manager.stop_instance(&runtime_id).await;
             if let Some(id) = &tenant_id_for_quota {
                 self.release_tenant_session(id);
@@ -2274,6 +2278,24 @@ impl SessionApplication {
         }
         self.records.delete_operation_intent(&intent_id).await?;
         Ok(project_session(&record))
+    }
+
+    async fn record_failed_restore(
+        &self,
+        runtime: &dyn AgentRuntime,
+        runtime_id: &str,
+        intent_id: &str,
+    ) {
+        let stopped = runtime.stop(runtime_id).await.is_ok()
+            || matches!(runtime.check_alive(runtime_id).await, Ok(false));
+        if stopped {
+            if let Ok(intents) = self.records.operation_intents().await {
+                if let Some((_, mut body)) = intents.into_iter().find(|(id, _)| id == intent_id) {
+                    body["runtime_failure_confirmed"] = serde_json::json!(true);
+                    let _ = self.records.save_operation_intent(intent_id, body).await;
+                }
+            }
+        }
     }
 
     pub async fn delete_checkpoint(

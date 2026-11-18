@@ -2,6 +2,7 @@
 members = [
     "apps/server",
     "apps/runtime-pi",
+    "apps/runtime-opencode",
     "apps/runtime-xiaoo",
     "crates/protocol/provider",
     "crates/protocol/session",
@@ -14,6 +15,7 @@ members = [
     "crates/manager",
     "orchestration/contract",
     "orchestration/tests",
+    "orchestration/backends/own",
 ]
 resolver = "2"
 
