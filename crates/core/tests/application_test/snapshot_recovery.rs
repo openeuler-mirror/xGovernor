@@ -72,6 +72,13 @@ impl AgentRuntime for RecoveryRuntime {
         self.inner.cancel(request).await
     }
 
+    async fn export_checkpoint_state(
+        &self,
+        _id: &str,
+    ) -> Result<agent_runtime_protocol::RuntimeStateSnapshot, RuntimeError> {
+        Ok(checkpoint_manager_record().runtime_state)
+    }
+
     async fn delete_checkpoint_state(
         &self,
         state: &agent_runtime_protocol::RuntimeStateSnapshot,
@@ -99,7 +106,7 @@ fn recovery_application(
         records,
         Arc::new(FixedTurnId),
         Arc::new(FixedTurnId),
-        Arc::new(UnusedEnvironment),
+        Arc::new(SnapshotTestEnvironment),
         clock,
     )
 }
@@ -506,4 +513,224 @@ async fn failed_recovery_retains_its_intent_without_blocking_an_independent_publ
         records.get_checkpoint("checkpoint-1").await.unwrap(),
         Some(published)
     );
+}
+
+fn intent_fault_managers(faults: Arc<IntentFaults>) -> HashMap<String, Arc<InstanceManager>> {
+    let local = Arc::new(backend::local::LocalProvider::new());
+    let lifecycle = Arc::new(SnapshotLifecycle {
+        local: local.clone(),
+        faults: Some(faults),
+        fail_snapshot_delete: false,
+        snapshot_deletes: None,
+    });
+    HashMap::from([(
+        "e2b".into(),
+        Arc::new(InstanceManager::new(
+            lifecycle,
+            local,
+            Arc::new(backend::SqliteProviderInstanceLedger::open_in_memory().unwrap()),
+            provider_protocol::ProviderKind("e2b".into()),
+            xgovernor_manager::InstanceManagerConfig::new(10, 10),
+        )),
+    )])
+}
+
+#[tokio::test]
+async fn lost_create_response_retains_intent_until_correlated_cleanup_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("sessions.db");
+    let records = Arc::new(SqliteSessionRepository::open(&database).unwrap());
+    let faults = Arc::new(IntentFaults::default());
+    faults.lose_create.store(true, Ordering::SeqCst);
+    let providers = intent_fault_managers(faults.clone());
+    let clock = Arc::new(RecoveryClock(AtomicU64::new(100)));
+    let app = recovery_application(
+        records.clone(),
+        Arc::new(RecoveryRuntime::default()),
+        providers.clone(),
+        clock.clone(),
+    );
+    let request = sandbox_request("lost-create", "e2b");
+    assert!(app.open(&tenant_ctx(), request).await.is_err());
+    assert!(records.get("lost-create").await.unwrap().is_none());
+    let pending = records.operation_intents().await.unwrap();
+    assert_eq!(pending[0].0, "create:lost-create");
+    let created = faults.created.lock().await[0].clone();
+    assert_eq!(
+        created.metadata["platform_metadata"]["xgovernor_create_request"],
+        "create:lost-create"
+    );
+    drop(app);
+    drop(records);
+    let records = Arc::new(SqliteSessionRepository::open(&database).unwrap());
+    let app = recovery_application(
+        records.clone(),
+        Arc::new(RecoveryRuntime::default()),
+        providers,
+        clock.clone(),
+    );
+    faults.fail_query.store(true, Ordering::SeqCst);
+    assert!(app.reconcile_snapshot_intents().await.is_err());
+    assert_eq!(records.operation_intents().await.unwrap().len(), 1);
+    faults.fail_query.store(false, Ordering::SeqCst);
+    clock.0.store(10_000, Ordering::SeqCst);
+    app.reconcile_snapshot_intents().await.unwrap();
+    assert!(records.operation_intents().await.unwrap().is_empty());
+    assert!(
+        faults.created.lock().await.is_empty(),
+        "the correlated instance must be deleted"
+    );
+}
+
+#[tokio::test]
+async fn rejected_checkpoint_retires_intent_and_unknown_queries_do_not_block_foreground() {
+    let directory = tempfile::tempdir().unwrap();
+    let records =
+        Arc::new(SqliteSessionRepository::open(&directory.path().join("sessions.db")).unwrap());
+    let faults = Arc::new(IntentFaults::default());
+    let providers = intent_fault_managers(faults.clone());
+    let clock = Arc::new(RecoveryClock(AtomicU64::new(100)));
+    let app = Arc::new(recovery_application(
+        records.clone(),
+        Arc::new(RecoveryRuntime::default()),
+        providers.clone(),
+        clock.clone(),
+    ));
+    let mut record = tenant_test_record();
+    record.isolation.metadata = serde_json::json!({"backend_id":"e2b"});
+    record.capabilities.runtime.extend([
+        RuntimeCapability::StateExport,
+        RuntimeCapability::Checkpoint,
+    ]);
+    record
+        .capabilities
+        .sandbox
+        .insert(SandboxCapability::Snapshot);
+    providers["e2b"]
+        .start_instance(
+            record.runtime_id.clone(),
+            provider_protocol::BackendId("e2b".into()),
+            "test".into(),
+            serde_json::json!({"workspace_root":directory.path()}),
+            None,
+        )
+        .await
+        .unwrap();
+    records.save(record.clone()).await.unwrap();
+    faults.reject_checkpoint.store(true, Ordering::SeqCst);
+    assert!(app
+        .checkpoint(
+            &tenant_ctx(),
+            SessionCheckpointRequest {
+                runtime_id: record.runtime_id.clone(),
+                name: None,
+                requested_scope: None,
+                lease: Default::default()
+            }
+        )
+        .await
+        .is_err());
+    assert!(records.operation_intents().await.unwrap().is_empty());
+    records.save_operation_intent("unknown", serde_json::json!({"kind":"checkpoint","provider":"e2b","runtime_kind":"test","snapshot_request_id":"unknown","created_at_ms":100})).await.unwrap();
+    faults.block_query.store(true, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let app = app.clone();
+        async move { app.reconcile_snapshot_intents().await }
+    });
+    faults.query_started.notified().await;
+    faults.reject_checkpoint.store(false, Ordering::SeqCst);
+    let foreground = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        app.checkpoint(
+            &tenant_ctx(),
+            SessionCheckpointRequest {
+                runtime_id: record.runtime_id,
+                name: None,
+                requested_scope: None,
+                lease: Default::default(),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        foreground.unwrap().is_ok(),
+        "platform reconciliation must not hold the snapshot lock"
+    );
+    faults.query_release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(records.operation_intents().await.unwrap().len(), 1);
+    faults.block_query.store(false, Ordering::SeqCst);
+    for now in [3_600_100, 3_630_100, 3_660_100] {
+        clock.0.store(now, Ordering::SeqCst);
+        let _ = app.reconcile_snapshot_intents().await;
+    }
+    assert!(records.operation_intents().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn restore_cleanup_recovers_deleted_ledger_identity_without_guessing_absence() {
+    use backend::ProviderInstanceLedger;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("sessions.db");
+    let faults = Arc::new(IntentFaults::default());
+    let local = Arc::new(backend::local::LocalProvider::new());
+    let mut instance = provider_protocol::ProviderLifecycle::create(
+        local.as_ref(),
+        provider_protocol::ProviderCreateRequest {
+            backend_id: provider_protocol::BackendId("e2b".into()),
+            owner_ref: "test".into(),
+            reason: provider_protocol::ProviderLifecycleReason::Acquire,
+            resource_limits: Default::default(),
+            provider_options: serde_json::json!({"workspace_root":directory.path()}),
+            correlation: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    instance.provider = provider_protocol::ProviderKind("e2b".into());
+    faults.created.lock().await.push(instance.clone());
+    {
+        let ledger = backend::SqliteProviderInstanceLedger::open(&database).unwrap();
+        ledger
+            .record_created("lost-restore", "test", &instance)
+            .await
+            .unwrap();
+        ledger.record_deleted("lost-restore").await.unwrap();
+        let records = SqliteSessionRepository::open(&database).unwrap();
+        records.save_operation_intent("load:lost-restore",serde_json::json!({"kind":"load","runtime_kind":"test","provider":"e2b","target":"lost-restore"})).await.unwrap();
+    }
+    let records = Arc::new(SqliteSessionRepository::open(&database).unwrap());
+    let manager = Arc::new(InstanceManager::new(
+        Arc::new(SnapshotLifecycle {
+            local: local.clone(),
+            faults: Some(faults.clone()),
+            fail_snapshot_delete: false,
+            snapshot_deletes: None,
+        }),
+        local,
+        Arc::new(backend::SqliteProviderInstanceLedger::open(&database).unwrap()),
+        provider_protocol::ProviderKind("e2b".into()),
+        xgovernor_manager::InstanceManagerConfig::new(10, 10),
+    ));
+    let clock = Arc::new(RecoveryClock(AtomicU64::new(100)));
+    let app = recovery_application(
+        records.clone(),
+        Arc::new(RecoveryRuntime::default()),
+        HashMap::from([("e2b".into(), manager)]),
+        clock.clone(),
+    );
+    faults.fail_query.store(true, Ordering::SeqCst);
+    faults.fail_instance_delete.store(true, Ordering::SeqCst);
+    assert!(app.reconcile_snapshot_intents().await.is_err());
+    let pending = records.operation_intents().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].1["resolved_load_instance"]["instance_id"],
+        instance.instance_id.0
+    );
+    faults.fail_instance_delete.store(false, Ordering::SeqCst);
+    clock.0.store(10_000, Ordering::SeqCst);
+    app.reconcile_snapshot_intents().await.unwrap();
+    assert!(records.operation_intents().await.unwrap().is_empty());
+    assert!(faults.created.lock().await.is_empty());
 }
