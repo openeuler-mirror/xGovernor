@@ -66,9 +66,7 @@ fn map_provider_error(error: provider_protocol::ProviderControlError) -> Session
             }
         }
         provider_protocol::ProviderControlError::ResourceLimitExceeded {
-            max,
-            owner_ref,
-            ..
+            max, owner_ref, ..
         } => {
             let scope = if owner_ref == "snapshot storage" {
                 "snapshot storage"
@@ -443,6 +441,26 @@ impl TurnGate {
     }
 }
 
+struct IntentGuard {
+    active: Arc<Mutex<std::collections::HashSet<String>>>,
+    id: String,
+}
+impl Drop for IntentGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .expect("intent gate poisoned")
+            .remove(&self.id);
+    }
+}
+
+fn creation_rejected(error: &provider_protocol::ProviderControlError) -> bool {
+    matches!(
+        error,
+        provider_protocol::ProviderControlError::ResourceLimitExceeded { .. }
+    ) || matches!(error, provider_protocol::ProviderControlError::ProviderFailure { details, .. } if details["creation_rejected"] == true)
+}
+
 #[derive(Clone)]
 pub struct SessionApplication {
     runtimes: Arc<BTreeMap<String, RuntimeRegistration>>,
@@ -461,6 +479,8 @@ pub struct SessionApplication {
     /// Single-active-turn enforcement + `client_request_id` idempotency.
     turn_gate: Arc<TurnGate>,
     snapshot_transactions: Arc<tokio::sync::Mutex<()>>,
+    intent_reconciliation: Arc<tokio::sync::Mutex<()>>,
+    active_intents: Arc<Mutex<std::collections::HashSet<String>>>,
     snapshot_publication: Arc<tokio::sync::Mutex<()>>,
     /// tenant_id → count of sessions currently open for that tenant.
     tenant_sessions: Arc<Mutex<HashMap<String, usize>>>,
@@ -530,9 +550,58 @@ impl SessionApplication {
             lease_table: None,
             turn_gate: Arc::new(TurnGate::default()),
             snapshot_transactions: Default::default(),
+            intent_reconciliation: Default::default(),
+            active_intents: Default::default(),
             snapshot_publication: Default::default(),
             tenant_sessions: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn claim_intent(&self, id: &str) -> Option<IntentGuard> {
+        self.active_intents
+            .lock()
+            .expect("intent gate poisoned")
+            .insert(id.to_owned())
+            .then(|| IntentGuard {
+                active: self.active_intents.clone(),
+                id: id.to_owned(),
+            })
+    }
+
+    // E2B's API request deadline is 70s; creation requests here also stop at
+    // 120s. Allow one hour for platform publication, then require three complete
+    // empty queries at least 30s apart, with no intervening query failure.
+    // Older intents without a creation timestamp remain pending for audit.
+    async fn observe_absence(
+        &self,
+        id: &str,
+        body: &mut serde_json::Value,
+        resource: &str,
+    ) -> Result<bool, SessionDomainError> {
+        let now = self.clock.now_ms();
+        let Some(started) = body["created_at_ms"].as_u64() else {
+            return Ok(false);
+        };
+        // Start a fresh settling window once the abandoned operation is first
+        // observed: its intent may predate a slow export or admission queue.
+        let settling = body[resource]["settling_started_at_ms"]
+            .as_u64()
+            .unwrap_or(now);
+        if body[resource].is_null() {
+            body[resource] = serde_json::json!({"settling_started_at_ms":settling});
+            self.records.save_operation_intent(id, body.clone()).await?;
+        }
+        if now < started.max(settling).saturating_add(3_600_000) {
+            return Ok(false);
+        }
+        let last = body[resource]["last_absent_at_ms"].as_u64().unwrap_or(0);
+        if now < last.saturating_add(30_000) {
+            return Ok(false);
+        }
+        let count = body[resource]["absent_observations"].as_u64().unwrap_or(0) + 1;
+        body[resource] = serde_json::json!({"settling_started_at_ms":settling,"absent_observations":count,"last_absent_at_ms":now});
+        self.records.save_operation_intent(id, body.clone()).await?;
+        Ok(count >= 3)
     }
 
     fn registration(&self, kind: &str) -> Result<&RuntimeRegistration, SessionDomainError> {
@@ -796,23 +865,40 @@ impl SessionApplication {
 
         let now = self.clock.now_ms();
         let (provider_id, manager) = provider_for_request(registration, &request)?;
+        let create_intent = format!("create:{runtime_id}");
+        let _intent_guard =
+            self.claim_intent(&create_intent)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: "creation is being reconciled".into(),
+                })?;
+        let mut options =
+            provider_options(&normalized.workspace, &normalized.isolation, &provider_id);
+        if provider_id == "e2b" {
+            if !options["metadata"].is_object() {
+                options["metadata"] = serde_json::json!({});
+            }
+            options["metadata"]["xgovernor_create_request"] = serde_json::json!(create_intent);
+            self.records.save_operation_intent(&create_intent, serde_json::json!({"kind":"create","provider":provider_id,"runtime_kind":runtime.runtime_kind(),"target":runtime_id,"created_at_ms":self.clock.now_ms()})).await?;
+        }
         let backend = match manager
             .start_instance(
                 runtime_id.clone(),
                 provider_protocol::BackendId(provider_id.clone()),
                 ctx.owner_ref(),
-                provider_options(&normalized.workspace, &normalized.isolation, &provider_id),
+                options,
                 ctx.quota.sandbox_limit(&provider_id),
             )
             .await
-            .map_err(map_provider_error)
         {
             Ok(backend) => backend,
             Err(error) => {
+                if creation_rejected(&error) {
+                    self.records.delete_operation_intent(&create_intent).await?;
+                }
                 if let Some(tenant_id) = &tenant_id_for_quota {
                     self.release_tenant_session(tenant_id);
                 }
-                return Err(error);
+                return Err(map_provider_error(error));
             }
         };
         if let Err(error) = runtime
@@ -887,7 +973,12 @@ impl SessionApplication {
             return Err(error);
         }
         if let Some(lease_table) = &self.lease_table {
-            match request.lease.client_id.as_deref().filter(|id| !id.is_empty()) {
+            match request
+                .lease
+                .client_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+            {
                 Some(client_id) => {
                     if let Err(failure) = lease_table
                         .heartbeat(
@@ -914,6 +1005,9 @@ impl SessionApplication {
                 // heartbeat: the reaper only walks that table.
                 None => lease_table.ensure_unclaimed(&record.runtime_id).await,
             }
+        }
+        if provider_id == "e2b" {
+            self.records.delete_operation_intent(&create_intent).await?;
         }
         Ok(project_session(&record))
     }
@@ -1081,6 +1175,11 @@ impl SessionApplication {
                     }
                     .await;
                     if let Err(error) = persisted {
+                        let usage = match &event {
+                            RuntimeEvent::Completed { usage, .. }
+                            | RuntimeEvent::Failed { usage, .. } => *usage,
+                            _ => unreachable!("guarded by terminal match"),
+                        };
                         event = RuntimeEvent::Failed {
                             error: RuntimeFailure {
                                 code: "runtime_state_persist_failed".into(),
@@ -1088,7 +1187,7 @@ impl SessionApplication {
                                 retryable: true,
                                 details: serde_json::Value::Null,
                             },
-                            usage: session_protocol::SessionUsage::default(),
+                            usage,
                         };
                     }
                 }
@@ -1802,6 +1901,25 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionCheckpointRequest,
     ) -> Result<SessionCheckpointResult, SessionDomainError> {
+        self.checkpoint_with_memory(ctx, request, true).await
+    }
+
+    /// Full joint checkpoint with a cold-boot filesystem image. Agent state is
+    /// still exported; sandbox processes and memory are deliberately excluded.
+    pub async fn checkpoint_filesystem(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointRequest,
+    ) -> Result<SessionCheckpointResult, SessionDomainError> {
+        self.checkpoint_with_memory(ctx, request, false).await
+    }
+
+    async fn checkpoint_with_memory(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionCheckpointRequest,
+        include_memory: bool,
+    ) -> Result<SessionCheckpointResult, SessionDomainError> {
         let _transaction = self.snapshot_transactions.lock().await;
         let mut record = self.require_session(ctx, &request.runtime_id).await?;
         self.check_lease_holder(&request.runtime_id, &request.lease)
@@ -1846,14 +1964,22 @@ impl SessionApplication {
         }
         let (provider_id, manager) = provider_for_isolation(registration, &record.isolation)?;
         let checkpoint_id = format!("checkpoint-{}", self.runtime_ids.next_runtime_id());
-        let mut intent = serde_json::json!({"kind":"checkpoint","runtime_kind":record.runtime.runtime_kind,"provider":provider_id,"source":request.runtime_id,"checkpoint":checkpoint_id,"snapshot":format!("request:{checkpoint_id}")});
+        let _intent_guard =
+            self.claim_intent(&checkpoint_id)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: "checkpoint is being reconciled".into(),
+                })?;
+        let mut intent = serde_json::json!({"created_at_ms":self.clock.now_ms(),"kind":"checkpoint","runtime_kind":record.runtime.runtime_kind,"provider":provider_id,"source":request.runtime_id,"checkpoint":checkpoint_id,"snapshot_request_id":checkpoint_id});
         self.records
             .save_operation_intent(&checkpoint_id, intent.clone())
             .await?;
-        let runtime_state = runtime
-            .export_checkpoint_state(&request.runtime_id)
-            .await
-            .map_err(map_runtime_error)?;
+        let runtime_state = match runtime.export_checkpoint_state(&request.runtime_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                self.records.delete_operation_intent(&checkpoint_id).await?;
+                return Err(map_runtime_error(error));
+            }
+        };
         intent["history"] =
             serde_json::to_value(&runtime_state).map_err(|e| SessionDomainError::Internal {
                 message: e.to_string(),
@@ -1865,15 +1991,25 @@ impl SessionApplication {
         let provider_snapshot = match manager
             .checkpoint_instance_correlated(
                 &request.runtime_id,
-                serde_json::json!({"request_id":checkpoint_id}),
+                serde_json::json!({"request_id":checkpoint_id,"memory":include_memory}),
             )
             .await
-            .map_err(map_provider_error)
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = runtime.delete_checkpoint_state(&runtime_state).await;
-                return Err(error);
+                if creation_rejected(&error) {
+                    // Retire the runtime archive even when the platform rejected creation.
+                    intent["resolved_snapshots"] = serde_json::json!([]);
+                    self.records
+                        .save_operation_intent(&checkpoint_id, intent.clone())
+                        .await?;
+                    runtime
+                        .delete_checkpoint_state(&runtime_state)
+                        .await
+                        .map_err(map_runtime_error)?;
+                    self.records.delete_operation_intent(&checkpoint_id).await?;
+                }
+                return Err(map_provider_error(error));
             }
         };
         intent["snapshot"] = serde_json::json!(provider_snapshot.snapshot_id.0);
@@ -1944,6 +2080,18 @@ impl SessionApplication {
         ctx: &SecurityContext,
         request: SessionLoadRequest,
     ) -> Result<SessionOpenResponse, SessionDomainError> {
+        self.load_checkpoint_with_fresh_runtime(ctx, request, None)
+            .await
+    }
+
+    /// Restore a workspace, optionally starting a fresh Agent with its bootstrap
+    /// configuration instead of importing the checkpoint's opaque conversation.
+    pub async fn load_checkpoint_with_fresh_runtime(
+        &self,
+        ctx: &SecurityContext,
+        request: SessionLoadRequest,
+        fresh_runtime: Option<session_protocol::SessionExtensions>,
+    ) -> Result<SessionOpenResponse, SessionDomainError> {
         let _transaction = self.snapshot_transactions.lock().await;
         let resolved_llm = request.llm.as_ref().and_then(|llm| {
             let provider = llm.provider.as_deref()?.trim();
@@ -2001,8 +2149,14 @@ impl SessionApplication {
         }
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
         let intent_id = format!("load:{runtime_id}");
-        self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"load","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"target":runtime_id})).await?;
-        let mut isolation_options = provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id);
+        let _intent_guard =
+            self.claim_intent(&intent_id)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: "restore is being reconciled".into(),
+                })?;
+        self.records.save_operation_intent(&intent_id,serde_json::json!({"created_at_ms":self.clock.now_ms(),"kind":"load","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"target":runtime_id})).await?;
+        let mut isolation_options =
+            provider_options(&checkpoint.workspace, &checkpoint.isolation, &provider_id);
         if let Some(request_options) = request
             .deployment
             .options
@@ -2023,14 +2177,16 @@ impl SessionApplication {
                 ctx.quota.sandbox_limit(&provider_id),
             )
             .await
-            .map_err(map_provider_error)
         {
             Ok(backend) => backend,
             Err(error) => {
+                if creation_rejected(&error) {
+                    self.records.delete_operation_intent(&intent_id).await?;
+                }
                 if let Some(id) = &tenant_id_for_quota {
                     self.release_tenant_session(id);
                 }
-                return Err(error);
+                return Err(map_provider_error(error));
             }
         };
         if let Err(error) = runtime
@@ -2045,10 +2201,19 @@ impl SessionApplication {
                         .sender_id
                         .clone()
                         .unwrap_or_else(|| ctx.principal.clone()),
-                    workspace: checkpoint.workspace.clone(),
-                    state: Some(checkpoint.runtime_state.clone()),
+                    workspace: if fresh_runtime.is_some() {
+                        let mut workspace = checkpoint.workspace.clone();
+                        // The restored filesystem is already materialized.
+                        workspace.metadata = serde_json::Value::Null;
+                        workspace
+                    } else {
+                        checkpoint.workspace.clone()
+                    },
+                    state: fresh_runtime
+                        .is_none()
+                        .then(|| checkpoint.runtime_state.clone()),
                     llm: request.llm.clone(),
-                    ext: Default::default(),
+                    ext: fresh_runtime.unwrap_or_default(),
                 },
                 RuntimeExecutionContext {
                     operation_backend: backend,
@@ -2185,6 +2350,11 @@ impl SessionApplication {
         let registration = self.registration(&checkpoint.runtime_state.runtime_kind)?;
         let (provider_id, manager) = provider_for_isolation(registration, &checkpoint.isolation)?;
         let intent_id = format!("delete:{}", request.checkpoint_id);
+        let _intent_guard =
+            self.claim_intent(&intent_id)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: "deletion is being reconciled".into(),
+                })?;
         self.records.save_operation_intent(&intent_id,serde_json::json!({"kind":"delete","provider":provider_id,"runtime_kind":checkpoint.runtime_state.runtime_kind,"checkpoint":request.checkpoint_id,"snapshot":checkpoint.provider_snapshot_id,"history":checkpoint.runtime_state})).await?;
         manager
             .delete_snapshot(
@@ -2277,11 +2447,16 @@ impl SessionApplication {
         }
 
         let intent_id = format!("fork:{runtime_id}");
+        let _intent_guard =
+            self.claim_intent(&intent_id)
+                .ok_or_else(|| SessionDomainError::Conflict {
+                    message: "fork is being reconciled".into(),
+                })?;
         let intent_provider = provider_for_isolation(registration, &parent.isolation)
             .ok()
             .map(|p| p.0)
             .unwrap_or_default();
-        let mut intent = serde_json::json!({"kind":"fork","provider":intent_provider,"runtime_kind":parent.runtime.runtime_kind,"target":runtime_id,"source":request.parent_runtime_id,"snapshot":format!("request:{intent_id}")});
+        let mut intent = serde_json::json!({"created_at_ms":self.clock.now_ms(),"kind":"fork","provider":intent_provider,"runtime_kind":parent.runtime.runtime_kind,"target":runtime_id,"source":request.parent_runtime_id,"snapshot_request_id":intent_id});
         if !intent_provider.is_empty() {
             self.records
                 .save_operation_intent(&intent_id, intent.clone())
@@ -2744,18 +2919,35 @@ impl SessionApplication {
         })
     }
 
-    /// Reconcile abandoned branch operations. A live transaction owns the same lock.
+    /// Reconcile abandoned operations without holding the foreground snapshot lock.
     pub async fn reconcile_snapshot_intents(&self) -> Result<(), SessionDomainError> {
-        let Ok(_transaction) = self.snapshot_transactions.try_lock() else {
+        let Ok(_reconcile) = self.intent_reconciliation.try_lock() else {
             return Ok(());
         };
         let mut first_error = None;
         for (id, mut body) in self.records.operation_intents().await? {
+            let Some(_intent_guard) = self.claim_intent(&id) else {
+                continue;
+            };
             if body["retry_at_ms"].as_u64().unwrap_or(0) > self.clock.now_ms() {
                 continue;
             }
             if let Err(error) = self.reconcile_snapshot_intent(&id, &body).await {
+                if let Some((_, persisted)) = self
+                    .records
+                    .operation_intents()
+                    .await?
+                    .into_iter()
+                    .find(|(key, _)| key == &id)
+                {
+                    body = persisted;
+                }
                 let attempts = body["retry_count"].as_u64().unwrap_or(0).saturating_add(1);
+                if !matches!(&error, SessionDomainError::Conflict { message } if message == "creation absence is not yet confirmed")
+                {
+                    body["instance_absence"] = serde_json::Value::Null;
+                    body["snapshot_absence"] = serde_json::Value::Null;
+                }
                 body["retry_count"] = serde_json::json!(attempts);
                 body["last_error"] = serde_json::json!(error.to_string());
                 body["retry_at_ms"] = serde_json::json!(self
@@ -2780,10 +2972,11 @@ impl SessionApplication {
         id: &str,
         body: &serde_json::Value,
     ) -> Result<(), SessionDomainError> {
+        let mut body = body.clone();
         let kind = body["runtime_kind"].as_str().unwrap_or("");
         let registration = self.registration(kind)?;
-        let provider = body["provider"].as_str().unwrap_or("");
-        let manager = registration.providers.get(provider).ok_or_else(|| {
+        let provider = body["provider"].as_str().unwrap_or("").to_owned();
+        let manager = registration.providers.get(&provider).ok_or_else(|| {
             SessionDomainError::Unavailable {
                 message: "snapshot provider unavailable".into(),
             }
@@ -2795,14 +2988,55 @@ impl SessionApplication {
         } else {
             false
         };
-        if let Some(target) = body["target"].as_str() {
-            if self.records.get(target).await?.is_none() {
-                let _ = registration.runtime.stop(target).await;
-                manager
-                    .abort_pending_snapshot_load(target)
-                    .await
+        if let Some(target) = body["target"].as_str().map(str::to_owned) {
+            if self.records.get(&target).await?.is_none() {
+                let _ = registration.runtime.stop(&target).await;
+                let resolved = if let Some(value) = body.get("resolved_load_instance") {
+                    Some(serde_json::from_value(value.clone()).map_err(|e| {
+                        SessionDomainError::Internal {
+                            message: e.to_string(),
+                            source: None,
+                        }
+                    })?)
+                } else {
+                    let instance = if body["kind"] == "create" {
+                        manager.pending_created_instance(&target).await
+                    } else {
+                        manager.pending_snapshot_load_instance(&target).await
+                    }
                     .map_err(map_provider_error)?;
-                match manager.stop_instance(target).await {
+                    if instance.is_none() && provider == "e2b" {
+                        if !self
+                            .observe_absence(id, &mut body, "instance_absence")
+                            .await?
+                        {
+                            return Err(SessionDomainError::Conflict {
+                                message: "creation absence is not yet confirmed".into(),
+                            });
+                        }
+                        body["instance_absent"] = serde_json::json!(true);
+                    }
+                    if let Some(instance) = &instance {
+                        let mut resolved = body.clone();
+                        resolved["resolved_load_instance"] = serde_json::to_value(instance)
+                            .map_err(|e| SessionDomainError::Internal {
+                                message: e.to_string(),
+                                source: None,
+                            })?;
+                        self.records
+                            .save_operation_intent(id, resolved.clone())
+                            .await?;
+                        body = resolved;
+                    }
+                    instance
+                };
+                if body["instance_absent"] != true {
+                    manager
+                        .abort_pending_snapshot_load(&target, resolved)
+                        .await
+                        .map_err(map_provider_error)?;
+                }
+                match manager.stop_instance(&target).await {
                     Ok(_) => {}
                     Err(provider_protocol::ProviderControlError::NotFound { .. }) => {}
                     Err(e) => return Err(map_provider_error(e)),
@@ -2810,10 +3044,62 @@ impl SessionApplication {
             }
         }
         if !published {
+            if body["snapshot"].is_null() {
+                if let Some(request_id) = body["snapshot_request_id"].as_str() {
+                    let snapshots = if let Some(ids) = body.get("resolved_snapshots") {
+                        serde_json::from_value(ids.clone()).map_err(|e| {
+                            SessionDomainError::Internal {
+                                message: e.to_string(),
+                                source: None,
+                            }
+                        })?
+                    } else {
+                        let ids = manager
+                            .pending_checkpoint_snapshots(
+                                provider_protocol::BackendId(provider.clone()),
+                                request_id,
+                            )
+                            .await
+                            .map_err(map_provider_error)?;
+                        if ids.is_empty()
+                            && provider == "e2b"
+                            && !self
+                                .observe_absence(id, &mut body, "snapshot_absence")
+                                .await?
+                        {
+                            return Err(SessionDomainError::Conflict {
+                                message: "creation absence is not yet confirmed".into(),
+                            });
+                        }
+                        let mut resolved = body.clone();
+                        resolved["resolved_snapshots"] =
+                            serde_json::to_value(&ids).map_err(|e| {
+                                SessionDomainError::Internal {
+                                    message: e.to_string(),
+                                    source: None,
+                                }
+                            })?;
+                        self.records
+                            .save_operation_intent(id, resolved.clone())
+                            .await?;
+                        body = resolved;
+                        ids
+                    };
+                    for snapshot in snapshots {
+                        manager
+                            .delete_snapshot(
+                                provider_protocol::BackendId(provider.clone()),
+                                snapshot,
+                            )
+                            .await
+                            .map_err(map_provider_error)?;
+                    }
+                }
+            }
             if let Some(snapshot) = body["snapshot"].as_str() {
                 match manager
                     .delete_snapshot(
-                        provider_protocol::BackendId(provider.into()),
+                        provider_protocol::BackendId(provider.clone()),
                         provider_protocol::ProviderSnapshotId(snapshot.into()),
                     )
                     .await

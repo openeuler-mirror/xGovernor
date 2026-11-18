@@ -14,7 +14,20 @@ use xgovernor_manager::InstanceManager;
 
 use backend;
 
+#[derive(Default)]
+struct IntentFaults {
+    lose_create: std::sync::atomic::AtomicBool,
+    fail_instance_delete: std::sync::atomic::AtomicBool,
+    reject_checkpoint: std::sync::atomic::AtomicBool,
+    fail_query: std::sync::atomic::AtomicBool,
+    query_started: tokio::sync::Notify,
+    query_release: tokio::sync::Notify,
+    block_query: std::sync::atomic::AtomicBool,
+    created: Mutex<Vec<provider_protocol::ProviderInstance>>,
+}
+
 struct SnapshotLifecycle {
+    faults: Option<Arc<IntentFaults>>,
     local: Arc<backend::local::LocalProvider>,
     fail_snapshot_delete: bool,
     snapshot_deletes: Option<Arc<Mutex<Vec<String>>>>,
@@ -32,11 +45,27 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
             .as_object_mut()
             .unwrap()
             .remove("allow_internet_access");
+        let request_id = request.correlation["request_id"].clone();
+        request
+            .provider_options
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
         let mut instance = self.local.create(request).await?;
         instance
             .capabilities
             .lifecycle
             .insert(provider_protocol::ProviderCapability::Snapshot);
+        if let Some(f) = &self.faults {
+            instance.metadata =
+                serde_json::json!({"platform_metadata":{"xgovernor_create_request":request_id}});
+            f.created.lock().await.push(instance.clone());
+            if f.lose_create.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(provider_protocol::ProviderControlError::Transport {
+                    message: "response lost".into(),
+                });
+            }
+        }
         Ok(instance)
     }
 
@@ -68,6 +97,16 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
         &self,
         request: provider_protocol::ProviderCheckpointRequest,
     ) -> Result<provider_protocol::ProviderSnapshot, provider_protocol::ProviderControlError> {
+        if self.faults.as_ref().is_some_and(|f| {
+            f.reject_checkpoint
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            return Err(provider_protocol::ProviderControlError::ProviderFailure {
+                provider: provider_protocol::ProviderKind("e2b".into()),
+                message: "rejected".into(),
+                details: serde_json::json!({"creation_rejected":true}),
+            });
+        }
         Ok(provider_protocol::ProviderSnapshot {
             snapshot_id: provider_protocol::ProviderSnapshotId(format!(
                 "{}-snapshot",
@@ -86,6 +125,54 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
         request: provider_protocol::ProviderDeleteRequest,
     ) -> Result<provider_protocol::ProviderDeleteOutcome, provider_protocol::ProviderControlError>
     {
+        if let Some(id) = request.correlation["abort_load_instance"]
+            .as_str()
+            .map(str::to_owned)
+        {
+            if let Some(f) = &self.faults {
+                if f.fail_instance_delete
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(provider_protocol::ProviderControlError::Transport {
+                        message: "delete unconfirmed".into(),
+                    });
+                }
+                let instance = f
+                    .created
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|v| v.instance_id.0 == id)
+                    .cloned()
+                    .unwrap();
+                let outcome = self
+                    .local
+                    .delete(provider_protocol::ProviderDeleteRequest {
+                        instance_id: Some(instance.instance_id),
+                        ..request
+                    })
+                    .await?;
+                f.created.lock().await.retain(|v| v.instance_id.0 != id);
+                return Ok(outcome);
+            }
+        }
+        if request.correlation["resolve_checkpoint_request"].is_string() {
+            if let Some(f) = &self.faults {
+                if f.block_query.load(std::sync::atomic::Ordering::SeqCst) {
+                    f.query_started.notify_one();
+                    f.query_release.notified().await;
+                }
+                return Ok(provider_protocol::ProviderDeleteOutcome {
+                    backend_id: request.backend_id,
+                    provider: provider_protocol::ProviderKind("e2b".into()),
+                    instance_id: None,
+                    deleted: false,
+                    retained_snapshots: vec![],
+                    deleted_snapshots: vec![],
+                    correlation: request.correlation,
+                });
+            }
+        }
         if let Some(snapshot_id) = request.snapshot_id {
             if let Some(deletes) = &self.snapshot_deletes {
                 deletes.lock().await.push(snapshot_id.0.clone());
@@ -120,6 +207,14 @@ impl provider_protocol::ProviderLifecycle for SnapshotLifecycle {
         &self,
     ) -> Result<Vec<provider_protocol::ProviderInstance>, provider_protocol::ProviderControlError>
     {
+        if let Some(f) = &self.faults {
+            if f.fail_query.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(provider_protocol::ProviderControlError::Transport {
+                    message: "query failed".into(),
+                });
+            }
+            return Ok(f.created.lock().await.clone());
+        }
         self.local.list_instances().await
     }
 }
@@ -139,6 +234,7 @@ fn snapshot_provider_managers_with_deletes(
     let local = Arc::new(backend::local::LocalProvider::new());
     let lifecycle: Arc<dyn ProviderLifecycle> = Arc::new(SnapshotLifecycle {
         local: Arc::clone(&local),
+        faults: None,
         fail_snapshot_delete,
         snapshot_deletes,
     });
@@ -476,6 +572,7 @@ impl SessionRepository for MemoryRepository {
 
 #[derive(Default)]
 struct CompletingRuntime {
+    usage: SessionUsage,
     started: Mutex<Option<RuntimeStartRequest>>,
     submitted: Mutex<Option<RuntimeTurnInput>>,
     stopped: Mutex<bool>,
@@ -525,7 +622,7 @@ impl AgentRuntime for CompletingRuntime {
         let (tx, rx) = mpsc::channel(2);
         tx.send(RuntimeEvent::Completed {
             outcome: session_protocol::SessionTurnOutcome::Complete,
-            usage: SessionUsage::default(),
+            usage: self.usage,
         })
         .await
         .unwrap();
@@ -1945,8 +2042,16 @@ impl SessionRepository for FullDiskRepository {
 
 #[tokio::test]
 async fn accepted_turn_reports_failed_terminal_when_disk_full_prevents_state_persistence() {
+    let usage = SessionUsage {
+        input_tokens: 71,
+        output_tokens: 9,
+        total_tokens: 80,
+    };
     let application = SessionApplication::new(
-        Arc::new(CompletingRuntime::default()),
+        Arc::new(CompletingRuntime {
+            usage,
+            ..Default::default()
+        }),
         test_provider_managers(),
         Arc::new(FullDiskRepository),
         Arc::new(FixedTurnId),
@@ -1966,7 +2071,12 @@ async fn accepted_turn_reports_failed_terminal_when_disk_full_prevents_state_per
             .unwrap()
             .unwrap();
         match terminal {
-            SessionEvent::TurnFailed { error, .. } => {
+            SessionEvent::TurnFailed {
+                error,
+                usage: reported,
+                ..
+            } => {
+                assert_eq!(reported, usage.into());
                 assert_eq!(error.code, "runtime_state_persist_failed");
                 assert!(error.message.contains("database or disk is full"));
             }
@@ -3199,4 +3309,29 @@ async fn open_claims_the_lease_when_the_open_request_carries_a_client_id() {
         .find(|(session_id, _, _)| session_id == &response.runtime_id)
         .map(|(_, holder, _)| holder.as_str());
     assert_eq!(holder, Some("client-a"));
+}
+
+#[tokio::test]
+async fn unknown_checkpoint_intent_survives_failed_cleanup_and_retries() {
+    let repository = Arc::new(xgovernor_core::SqliteSessionRepository::open_in_memory().unwrap());
+    repository.save_operation_intent("lost-checkpoint", serde_json::json!({
+        "kind":"checkpoint", "provider":"local", "runtime_kind":"test", "snapshot_request_id":"lost-checkpoint"
+    })).await.unwrap();
+    let application = SessionApplication::new(
+        Arc::new(CompletingRuntime::default()),
+        snapshot_provider_managers(true),
+        repository.clone(),
+        Arc::new(FixedTurnId),
+        Arc::new(FixedTurnId),
+        Arc::new(UnusedEnvironment),
+        Arc::new(FixedTurnId),
+    );
+    assert!(application.reconcile_snapshot_intents().await.is_err());
+    let intents = repository.operation_intents().await.unwrap();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(
+        intents[0].1["resolved_snapshots"][0],
+        "request:lost-checkpoint"
+    );
+    assert_eq!(intents[0].1["retry_count"], 1);
 }

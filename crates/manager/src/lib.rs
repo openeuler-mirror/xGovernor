@@ -355,7 +355,10 @@ impl InstanceManager {
         owner_ref: String,
         provider_options: Value,
     ) -> Result<ProviderInstance, ProviderControlError> {
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = provider_options["metadata"]["xgovernor_create_request"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut attempt = 0u32;
         let mut delay = self.config.retry.base_delay;
         loop {
@@ -381,7 +384,11 @@ impl InstanceManager {
             match outcome {
                 Ok(instance) => return Ok(instance),
                 Err(error) => {
-                    if attempt >= self.config.retry.max_attempts || !is_retryable(&error) {
+                    if (self.kind.0 == "e2b"
+                        && provider_options["metadata"]["xgovernor_create_request"].is_string())
+                        || attempt >= self.config.retry.max_attempts
+                        || !is_retryable(&error)
+                    {
                         return Err(error);
                     }
                     tracing::warn!(
@@ -502,6 +509,29 @@ impl InstanceManager {
                 correlation: Value::Null,
             })
             .await
+    }
+
+    /// Resolve an unpublished checkpoint before its identities are durably retired.
+    pub async fn pending_checkpoint_snapshots(
+        &self,
+        backend_id: BackendId,
+        request_id: &str,
+    ) -> Result<Vec<provider_protocol::ProviderSnapshotId>, ProviderControlError> {
+        if self.kind.0 != "e2b" {
+            return Ok(vec![provider_protocol::ProviderSnapshotId(format!(
+                "request:{request_id}"
+            ))]);
+        }
+        self.lifecycle
+            .delete(ProviderDeleteRequest {
+                backend_id,
+                instance_id: None,
+                snapshot_id: None,
+                reason: ProviderLifecycleReason::Reconcile,
+                correlation: serde_json::json!({"resolve_checkpoint_request":request_id}),
+            })
+            .await
+            .map(|outcome| outcome.retained_snapshots)
     }
 
     pub async fn delete_snapshot(
@@ -699,17 +729,84 @@ impl InstanceManager {
     /// automatic background retry — see [`Self::spawn_retry_loop`]. Either
     /// path can win the race to clean it up; both are serialized against
     /// each other by the same per-`runtime_id` lock `start_instance` uses.
-    /// Retire a Docker create intent whose session was never published.
+    /// Find a restore whose response was lost, without retiring its identity.
+    pub async fn pending_snapshot_load_instance(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<ProviderInstance>, ProviderControlError> {
+        if self.kind.0 != "e2b" {
+            return Ok(None);
+        }
+        if let Some(instance) = self
+            .ledger
+            .recorded_instance(&self.kind, runtime_id)
+            .await?
+        {
+            return Ok(Some(instance));
+        }
+        self.pending_correlated_instance("xgovernor_load_request", &format!("load:{runtime_id}"))
+            .await
+    }
+
+    pub async fn pending_created_instance(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<ProviderInstance>, ProviderControlError> {
+        if self.kind.0 != "e2b" {
+            return Ok(None);
+        }
+        self.pending_correlated_instance(
+            "xgovernor_create_request",
+            &format!("create:{runtime_id}"),
+        )
+        .await
+    }
+
+    async fn pending_correlated_instance(
+        &self,
+        metadata_key: &str,
+        request: &str,
+    ) -> Result<Option<ProviderInstance>, ProviderControlError> {
+        let instances = self.lifecycle.list_instances().await?;
+        let mut matching = instances
+            .into_iter()
+            .filter(|i| i.metadata["platform_metadata"][metadata_key].as_str() == Some(request));
+        let instance = matching.next();
+        if matching.next().is_some() {
+            return Err(ProviderControlError::Conflict {
+                message: "multiple E2B resources match the restore identity".into(),
+            });
+        }
+        Ok(instance)
+    }
+
+    /// Delete only an identity already persisted by the owning restore intent.
     pub async fn abort_pending_snapshot_load(
         &self,
         runtime_id: &str,
+        resolved: Option<ProviderInstance>,
     ) -> Result<(), ProviderControlError> {
+        if self.kind.0 == "e2b" {
+            let instance = resolved.ok_or_else(|| ProviderControlError::Conflict {
+                message: "E2B restore identity remains unresolved".into(),
+            })?;
+            self.lifecycle
+                .delete(ProviderDeleteRequest {
+                    backend_id: instance.backend_id,
+                    instance_id: None,
+                    snapshot_id: None,
+                    reason: ProviderLifecycleReason::ErrorCleanup,
+                    correlation: serde_json::json!({"abort_load_instance":instance.instance_id.0}),
+                })
+                .await?;
+            return Ok(());
+        }
         if self.kind.0 != "docker" {
             return Ok(());
         }
         self.lifecycle
             .delete(ProviderDeleteRequest {
-                backend_id: BackendId("docker".into()),
+                backend_id: BackendId(self.kind.0.clone()),
                 instance_id: None,
                 snapshot_id: None,
                 reason: ProviderLifecycleReason::ErrorCleanup,

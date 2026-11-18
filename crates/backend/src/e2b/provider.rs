@@ -40,6 +40,7 @@ use provider_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
@@ -636,6 +637,53 @@ impl E2bProvider {
         })
     }
 
+    async fn snapshots_for_request(
+        &self,
+        id: &str,
+    ) -> Result<Vec<CreateSnapshotResponse>, ProviderControlError> {
+        let options = parse_options(&Value::Null)?;
+        let connection = resolve_connection_options(&options)?;
+        let name = snapshot_request_name(id);
+        let response = new_e2b_http_client()?
+            .get(join_url(&connection.api_base, "/snapshots"))
+            .header("X-API-Key", resolve_api_key(&options)?)
+            .query(&[("name", name.as_str()), ("limit", "100")])
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| ProviderControlError::Transport {
+                message: e.to_string(),
+            })?;
+        if !response.status().is_success() || response.headers().contains_key("x-next-token") {
+            return Err(ProviderControlError::Transport {
+                message: format!(
+                    "incomplete E2B snapshot correlation query: {}",
+                    response.status()
+                ),
+            });
+        }
+        let snapshots: Vec<CreateSnapshotResponse> =
+            response
+                .json()
+                .await
+                .map_err(|e| ProviderControlError::Transport {
+                    message: e.to_string(),
+                })?;
+        // A server ignoring filters cannot authorize deletion of unrelated resources.
+        if snapshots.iter().any(|s| {
+            !s.names.iter().any(|n| {
+                n.split('/')
+                    .next_back()
+                    .is_some_and(|n| n.split(':').next() == Some(name.as_str()))
+            })
+        }) {
+            return Err(ProviderControlError::Conflict {
+                message: "E2B snapshot query returned an unrelated resource".into(),
+            });
+        }
+        Ok(snapshots)
+    }
+
     /// Delete a snapshot that has no live instance backing it. When the
     /// current process still has a registry record, reuse its connection
     /// options; after a daemon restart, fall back to the normal E2B
@@ -647,6 +695,11 @@ impl E2bProvider {
         snapshot_id: ProviderSnapshotId,
         correlation: Value,
     ) -> Result<ProviderDeleteOutcome, ProviderControlError> {
+        if snapshot_id.0.starts_with("request:") {
+            return Err(ProviderControlError::Conflict {
+                message: "legacy E2B snapshot has an unresolved creation result; no platform correlation was recorded".into(),
+            });
+        }
         let provider_options = {
             let registry = self.lock_registry()?;
             let found = registry
@@ -665,8 +718,8 @@ impl E2bProvider {
                     .filter(|value| !value.trim().is_empty())
                     .is_none()
             {
-                return Err(ProviderControlError::NotFound {
-                    resource_ref: snapshot_id.0.clone(),
+                return Err(ProviderControlError::Transport {
+                    message: "E2B snapshot deletion requires resolvable credentials".into(),
                 });
             }
             found.unwrap_or(Value::Null)
@@ -778,8 +831,17 @@ impl Provider for E2bProvider {
 impl ProviderLifecycle for E2bProvider {
     async fn create(
         &self,
-        request: ProviderCreateRequest,
+        mut request: ProviderCreateRequest,
     ) -> Result<ProviderInstance, ProviderControlError> {
+        if let Some(id) = request.correlation["request_id"].as_str() {
+            if request.provider_options.is_null() {
+                request.provider_options = json!({});
+            }
+            if !request.provider_options["metadata"].is_object() {
+                request.provider_options["metadata"] = json!({});
+            }
+            request.provider_options["metadata"]["xgovernor_create_request"] = json!(id);
+        }
         let (instance, live, provider_options) = self
             .provision_sandbox(
                 request.backend_id,
@@ -812,9 +874,19 @@ impl ProviderLifecycle for E2bProvider {
             owner_ref,
             source,
             resource_limits,
-            provider_options,
+            mut provider_options,
+            correlation,
             ..
         } = request;
+        if let Some(id) = correlation["request_id"].as_str() {
+            if provider_options.is_null() {
+                provider_options = json!({});
+            }
+            if !provider_options["metadata"].is_object() {
+                provider_options["metadata"] = json!({});
+            }
+            provider_options["metadata"]["xgovernor_load_request"] = json!(id);
+        }
 
         match source {
             ProviderLoadSource::Instance(id) => {
@@ -937,6 +1009,8 @@ impl ProviderLifecycle for E2bProvider {
             api_base.as_str(),
             api_key.as_str(),
             sandbox_id.as_str(),
+            None,
+            true,
         )
         .await?;
 
@@ -1040,6 +1114,8 @@ impl ProviderLifecycle for E2bProvider {
             api_base.as_str(),
             api_key.as_str(),
             sandbox_id.as_str(),
+            request.correlation["request_id"].as_str(),
+            request.correlation["memory"].as_bool().unwrap_or(true),
         )
         .await?;
         Ok(ProviderSnapshot {
@@ -1056,6 +1132,33 @@ impl ProviderLifecycle for E2bProvider {
         &self,
         request: ProviderDeleteRequest,
     ) -> Result<ProviderDeleteOutcome, ProviderControlError> {
+        if let Some(id) = request.correlation["resolve_checkpoint_request"].as_str() {
+            let snapshots = self.snapshots_for_request(id).await?;
+            return Ok(ProviderDeleteOutcome {
+                backend_id: request.backend_id,
+                provider: self.kind.clone(),
+                instance_id: None,
+                deleted: false,
+                retained_snapshots: snapshots
+                    .into_iter()
+                    .map(|s| ProviderSnapshotId(s.snapshot_id))
+                    .collect(),
+                deleted_snapshots: vec![],
+                correlation: request.correlation,
+            });
+        }
+        if let Some(id) = request.correlation["abort_load_instance"].as_str() {
+            self.reclaim_orphan_sandbox(Value::Null, id).await?;
+            return Ok(ProviderDeleteOutcome {
+                backend_id: request.backend_id,
+                provider: self.kind.clone(),
+                instance_id: None,
+                deleted: true,
+                retained_snapshots: vec![],
+                deleted_snapshots: vec![],
+                correlation: request.correlation,
+            });
+        }
         let Some(instance_id) = request.instance_id.clone() else {
             // No instance_id: the only thing left to satisfy is a
             // snapshot-only delete. Scoped to snapshots visible in the
@@ -1207,49 +1310,7 @@ impl ProviderLifecycle for E2bProvider {
         let connection = resolve_connection_options(&options)?;
         let http = new_e2b_http_client()?;
 
-        // Deliberately the SAME v1 REST surface as create/delete/snapshot
-        // (`/sandboxes`, no `/v2` prefix), so a self-hosted or older E2B
-        // deployment that only implements the v1 API still answers this
-        // call. `state=running` filters server-side; the v1 listing does
-        // not paginate (no `X-Next-Token`), so the whole list comes back
-        // in one response.
-        let response = http
-            .get(join_url(connection.api_base.as_str(), "/sandboxes"))
-            .header("X-API-Key", api_key.as_str())
-            .query(&[("state", "running")])
-            .send()
-            .await
-            .map_err(|error| {
-                let failure = E2bFailure::from_reqwest("failed to list e2b sandboxes", &error);
-                ProviderControlError::Transport {
-                    message: failure.message,
-                }
-            })?;
-
-        if response.status() != reqwest::StatusCode::OK {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            let message = parse_error_message(text.as_str()).unwrap_or(text);
-            let failure = E2bFailure::from_status("e2b list sandboxes", status, message);
-            return Err(ProviderControlError::ProviderFailure {
-                provider: ProviderKind(E2B_PROVIDER_KIND.to_string()),
-                message: failure.message,
-                details: Value::Null,
-            });
-        }
-
-        let entries: Vec<ListedSandboxEntry> =
-            response
-                .json()
-                .await
-                .map_err(|error| ProviderControlError::Transport {
-                    message: format!("failed to decode e2b list sandboxes response: {error}"),
-                })?;
-
-        Ok(entries
-            .into_iter()
-            .map(|entry| provider_instance_from_listed_sandbox(&self.kind, entry))
-            .collect())
+        list_all_instances(&http, &connection.api_base, &api_key, &self.kind).await
     }
 }
 
@@ -1360,8 +1421,7 @@ impl OperationAttach for E2bProvider {
     }
 }
 
-/// One entry from the v1 `GET /sandboxes` listing — the platform's real
-/// "what's running" view. Field set is deliberately narrower than the full
+/// One entry from the all-state `GET /v2/sandboxes` listing. Field set is deliberately narrower than the full
 /// `ListedSandbox` schema: only what `provider_instance_from_listed_sandbox`
 /// below actually uses (`endAt`/`envdVersion`/`alias`/`volumeMounts` are
 /// ignored).
@@ -1606,6 +1666,7 @@ async fn create_e2b_sandbox(
         .post(join_url(api_base, "/sandboxes"))
         .header("X-API-Key", api_key)
         .json(&Value::Object(body))
+        .timeout(Duration::from_secs(120))
         .send()
         .await
         .map_err(|error| {
@@ -1635,7 +1696,7 @@ async fn create_e2b_sandbox(
         return Err(ProviderControlError::ProviderFailure {
             provider: ProviderKind(E2B_PROVIDER_KIND.to_string()),
             message: failure.message,
-            details: Value::Null,
+            details: json!({"creation_rejected": matches!(status.as_u16(), 400 | 401 | 403 | 404 | 429)}),
         });
     }
 
@@ -1647,19 +1708,33 @@ async fn create_e2b_sandbox(
         })
 }
 
+fn snapshot_request_name(request_id: &str) -> String {
+    format!(
+        "xgovernor-checkpoint-{:x}",
+        Sha256::digest(request_id.as_bytes())
+    )
+}
+
 async fn create_snapshot(
     http: &reqwest::Client,
     api_base: &str,
     api_key: &str,
     sandbox_id: &str,
+    request_id: Option<&str>,
+    include_memory: bool,
 ) -> Result<CreateSnapshotResponse, ProviderControlError> {
+    let mut body = json!({"memory":include_memory});
+    if let Some(id) = request_id {
+        body["name"] = json!(snapshot_request_name(id));
+    }
     let response = http
         .post(join_url(
             api_base,
             format!("/sandboxes/{sandbox_id}/snapshots").as_str(),
         ))
         .header("X-API-Key", api_key)
-        .json(&Value::Object(Map::new()))
+        .json(&body)
+        .timeout(Duration::from_secs(120))
         .send()
         .await
         .map_err(|error| ProviderControlError::Transport {
@@ -1673,7 +1748,7 @@ async fn create_snapshot(
         return Err(ProviderControlError::ProviderFailure {
             provider: ProviderKind(E2B_PROVIDER_KIND.to_string()),
             message: format!("e2b create snapshot failed with HTTP {status}: {message}"),
-            details: Value::Null,
+            details: json!({"creation_rejected": matches!(status.as_u16(), 400 | 401 | 403 | 404 | 429)}),
         });
     }
 
@@ -1939,6 +2014,70 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+async fn list_all_instances(
+    http: &reqwest::Client,
+    api_base: &str,
+    api_key: &str,
+    kind: &ProviderKind,
+) -> Result<Vec<ProviderInstance>, ProviderControlError> {
+    // V2 without a state filter includes paused and transitional sandboxes.
+    let mut instances = Vec::new();
+    let mut token = None;
+    let mut seen = BTreeSet::new();
+    loop {
+        let mut request = http
+            .get(join_url(api_base, "/v2/sandboxes"))
+            .header("X-API-Key", api_key)
+            .query(&[("limit", "100")]);
+        if let Some(value) = &token {
+            request = request.query(&[("nextToken", value)]);
+        }
+        let response = request
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| ProviderControlError::Transport {
+                message: format!("failed to list all e2b sandboxes: {error}"),
+            })?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(ProviderControlError::Transport {
+                message: format!("e2b all-state listing returned {}", response.status()),
+            });
+        }
+        token = response
+            .headers()
+            .get("x-next-token")
+            .map(|v| v.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| ProviderControlError::Transport {
+                message: "invalid E2B pagination token".into(),
+            })?;
+        let entries: Vec<ListedSandboxEntry> =
+            response
+                .json()
+                .await
+                .map_err(|error| ProviderControlError::Transport {
+                    message: format!("failed to decode e2b list: {error}"),
+                })?;
+        instances.extend(
+            entries
+                .into_iter()
+                .map(|entry| provider_instance_from_listed_sandbox(kind, entry)),
+        );
+        match &token {
+            Some(value) if !value.is_empty() => {
+                if !seen.insert(value.clone()) {
+                    return Err(ProviderControlError::Conflict {
+                        message: "E2B pagination repeated a token".into(),
+                    });
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(instances)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,6 +2086,52 @@ mod tests {
     use provider_protocol::{BackendId, ProviderLifecycleReason};
     use std::cell::Cell;
     use std::future::ready;
+
+    #[tokio::test]
+    async fn all_state_listing_follows_pages_and_retains_paused_restore_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for page in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let n = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..n]);
+                assert!(request.starts_with("GET /v2/sandboxes?"));
+                assert!(!request.contains("state="));
+                if page == 1 {
+                    assert!(request.contains("nextToken=page2"));
+                }
+                let body = if page == 0 {
+                    "[]"
+                } else {
+                    r#"[{"sandboxID":"paused-restore","templateID":"base","state":"paused","metadata":{"xgovernor_load_request":"load:target"}}]"#
+                };
+                let next = if page == 0 {
+                    "X-Next-Token: page2\r\n"
+                } else {
+                    ""
+                };
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{next}Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let instances = list_all_instances(
+            &new_e2b_http_client().unwrap(),
+            &format!("http://{address}"),
+            "test",
+            &ProviderKind("e2b".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].state, ProviderLifecycleState::Paused);
+        assert_eq!(
+            instances[0].metadata["platform_metadata"]["xgovernor_load_request"],
+            "load:target"
+        );
+        server.await.unwrap();
+    }
 
     /// End-to-end smoke test against the real E2B platform: creates a
     /// sandbox via the provider-protocol control plane, attaches the
@@ -2366,7 +2551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_by_snapshot_id_reports_not_found_when_no_registry_record_matches() {
+    async fn delete_without_resolvable_snapshot_credentials_remains_unknown() {
         let provider = E2bProvider::new();
 
         let error = provider
@@ -2381,7 +2566,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, ProviderControlError::NotFound { .. }));
+        assert!(matches!(error, ProviderControlError::Transport { .. }));
     }
 
     #[tokio::test]

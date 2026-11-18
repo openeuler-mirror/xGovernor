@@ -264,6 +264,26 @@ impl ProviderInstanceLedger for SqliteProviderInstanceLedger {
         result.map_err(|error| transport_error(format!("ledger record_deleted failed: {error}")))
     }
 
+    async fn recorded_instance(
+        &self,
+        provider: &ProviderKind,
+        runtime_id: &str,
+    ) -> Result<Option<ProviderInstance>, ProviderControlError> {
+        let conn = self.conn.clone();
+        let provider = provider.0.clone();
+        let runtime_id = runtime_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|_| transport_error("ledger lock poisoned"))?;
+            let mut statement = conn.prepare("SELECT runtime_id, owner_ref, backend_id, provider, instance_id, state,
+                endpoint_json, snapshot_json, capabilities_json, resources_json, metadata_json, created_at_ms, updated_at_ms
+                FROM provider_instances WHERE runtime_id = ?1 AND provider = ?2").map_err(|e| transport_error(e.to_string()))?;
+            let mut rows = statement.query(params![runtime_id, provider]).map_err(|e| transport_error(e.to_string()))?;
+            rows.next().map_err(|e| transport_error(e.to_string()))?
+                .map(|row| row_to_active_entry(row).map_err(|e| transport_error(e.to_string()))?
+                    .map(|entry| entry.instance).map_err(transport_error)).transpose()
+        }).await.map_err(|e| transport_error(e.to_string()))?
+    }
+
     async fn list_active(
         &self,
         provider: &ProviderKind,
