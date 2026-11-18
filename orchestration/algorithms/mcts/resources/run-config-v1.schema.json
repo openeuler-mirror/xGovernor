@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xgovernor:mcts:run-config:1",
+  "type": "object",
+  "required": ["max_iters", "branching", "task"],
+  "properties": {
+    "max_iters": {"type": "integer", "minimum": 1},
+    "branching": {"type": "integer", "minimum": 1},
+    "max_concurrent": {"type": "integer", "minimum": 1, "default": 3},
+    "finish_reserve_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.1},
+    "task": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["generic", "sweverified", "zsoft", "deepswe"]},
+        "arguments": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

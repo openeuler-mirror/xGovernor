@@ -1,0 +1,36 @@
+{
+  "token_weight": 0.1820266911526469,
+  "hesitation_weight": 0.17251209676964702,
+  "threshold": 0.137308363293696,
+  "output_scale": 4000,
+  "hesitation_scale": 8,
+  "words": [
+    "perhaps",
+    "maybe",
+    "unclear",
+    "not sure",
+    "uncertain",
+    "alternative",
+    "reconsider",
+    "instead",
+    "still fails",
+    "might be",
+    "could be"
+  ],
+  "calibration": {
+    "tasks": 428,
+    "attempts": 866,
+    "failed_attempts": 59,
+    "prefixes": 29703,
+    "folds": 3,
+    "group": "instance_id",
+    "proxy": "failed attempt times independent sibling solve fraction",
+    "regularization": 0.002,
+    "feature_bin_width": 0.025,
+    "threshold_objective": "out-of-fold soft-label balanced accuracy",
+    "balanced_accuracy": 0.5199314288042862,
+    "prefix_trigger_fraction": 0.6600386863356895,
+    "sources": "swebench-run-1..3; swebench-3runs-per-case.csv; excludes sphinx and unevaluated errors",
+    "label_sha256": "ca611fb26c248323ffc78b1d4c9f1d0f881981076ee2886731862352a19e40d2"
+  }
+}
