@@ -1,0 +1,30 @@
+[package]
+name = "orchestration-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcts"
+path = "src/main.rs"
+
+[dependencies]
+orchestration-contract = { path = "../contract" }
+orchestration-run-manager = { path = "../run-manager" }
+orchestration-backend-own = { path = "../backends/own" }
+backend = { path = "../../crates/backend" }
+xgovernor-core = { path = "../../crates/core" }
+xgovernor-manager = { path = "../../crates/manager" }
+xgovernor-runtime-opencode = { path = "../../apps/runtime-opencode" }
+provider-protocol = { path = "../../crates/protocol/provider" }
+session-protocol = { path = "../../crates/protocol/session" }
+async-trait.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+xgovernor-mcp = { path = "../mcp" }
+clap.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "io-std"] }
+
+[dev-dependencies]
+rusqlite.workspace = true
