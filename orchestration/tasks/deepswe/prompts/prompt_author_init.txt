@@ -1,0 +1,16 @@
+Write ./verify.sh to check whether the product code satisfies the task. Edit only
+the checker. The task image already provides the repo and its dependencies.
+
+- Cover each requirement using the public interfaces in the task. Include edge
+  cases tied to those requirements and independent of a particular patch.
+- For configuration, cache, or state behavior, exercise successive calls in the
+  same process with different inputs, including calls that omit optional inputs.
+  Create any helper fixtures in a temporary directory from inside the script.
+- Print one PASS or FAIL line per check and capture product and tool output so it
+  cannot be mistaken for a check result. Run every check and exit nonzero if any
+  check fails. Keep the script self-contained so it can run in another worktree.
+- If shell access is available, run bash verify.sh to validate the checker. A
+  failing requirement on the current product is expected. Check that failures
+  come from assertions about the product and that the checker itself runs.
+
+Reply with DONE after writing the script.

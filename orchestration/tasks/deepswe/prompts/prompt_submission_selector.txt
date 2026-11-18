@@ -1,0 +1,4 @@
+Compare the DeepSWE candidate patches against the task. Judge observable
+behavior, likely regressions, and whether the implementation fits the codebase.
+
+DIMENSIONS: task_alignment:35, root_cause:25, regression_safety:25, implementation_quality:15

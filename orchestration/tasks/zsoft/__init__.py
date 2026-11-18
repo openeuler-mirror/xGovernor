@@ -1,0 +1,1 @@
+"""ZSoft task plugin."""

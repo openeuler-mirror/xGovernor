@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xgovernor:mcts:events:1",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "node"
+        },
+        "payload": {
+          "$ref": "#/$defs/node"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "score"
+        },
+        "payload": {
+          "$ref": "#/$defs/score"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "selection"
+        },
+        "payload": {
+          "$ref": "#/$defs/selection"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "artifact"
+        },
+        "payload": {
+          "$ref": "#/$defs/artifact"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "extension"
+        },
+        "payload": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "required": [
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "node": {
+      "type": "object",
+      "properties": {
+        "node_id": {"type": "string"},
+        "parents": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "role": {"type": "string"},
+        "status": {"type": "string"}
+      },
+      "required": [
+        "node_id",
+        "parents",
+        "role",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "score": {
+      "type": "object",
+      "properties": {
+        "node_id": {"type": "string"},
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {"type": "number"}
+        },
+        "evaluation_version": {"type": "string"}
+      },
+      "required": [
+        "node_id",
+        "metrics",
+        "evaluation_version"
+      ],
+      "additionalProperties": false
+    },
+    "selection": {
+      "type": "object",
+      "properties": {
+        "candidate_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "reason": {"type": "string"}
+      },
+      "required": [
+        "candidate_ids",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "properties": {
+        "reference": {
+          "type": "object",
+          "properties": {
+            "artifact_id": {"type": "string"},
+            "kind": {"type": "string"},
+            "media_type": {"type": "string"},
+            "expires_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "artifact_id",
+            "kind",
+            "media_type"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "reference"
+      ],
+      "additionalProperties": false
+    },
+    "extension": {
+      "type": "object",
+      "properties": {
+        "namespace": {
+          "const": "mcts"
+        },
+        "version": {
+          "const": "1"
+        },
+        "schema": {
+          "const": "urn:xgovernor:mcts:events:1"
+        },
+        "name": {
+          "enum": [
+            "expansion",
+            "oracle",
+            "search_stopped",
+            "plugin.started",
+            "plugin.progress",
+            "plugin.completed",
+            "plugin.cancelled",
+            "plugin.failed"
+          ]
+        },
+        "data": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "namespace",
+        "version",
+        "schema",
+        "name",
+        "data"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "expansion"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "required": [
+                  "node_id",
+                  "parent_id"
+                ],
+                "properties": {
+                  "node_id": {"type": "string"},
+                  "parent_id": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "oracle"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "required": [
+                  "node_id",
+                  "revision"
+                ],
+                "properties": {
+                  "node_id": {"type": "string"},
+                  "revision": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "const": "search_stopped"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "required": [
+                  "reason",
+                  "remaining_tokens"
+                ],
+                "properties": {
+                  "reason": {
+                    "enum": [
+                      "token_budget",
+                      "node_budget",
+                      "time_budget"
+                    ]
+                  },
+                  "remaining_tokens": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

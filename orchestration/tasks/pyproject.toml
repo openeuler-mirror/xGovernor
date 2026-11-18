@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xgovernor-tasks"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = ["xgovernor_tasks", "xgovernor_tasks.common", "xgovernor_tasks.zsoft", "xgovernor_tasks.swe_bench", "xgovernor_tasks.generic", "xgovernor_tasks.deepswe"]
+package-dir = {xgovernor_tasks = "."}
+include-package-data = false
+
+[tool.setuptools.package-data]
+xgovernor_tasks = ["**/*.txt", "**/*.json", "**/*.js"]

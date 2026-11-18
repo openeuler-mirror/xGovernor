@@ -1,0 +1,11 @@
+Revise ./verify.sh based on the supplied findings. Edit only the checker.
+
+- Check whether the reported failures reflect actual requirements. Fix mistakes
+  in the checker and preserve valid assertions.
+- For configuration, cache, or state behavior, check successive calls in one
+  process with different inputs and omitted options. Create helper fixtures in a
+  temporary directory from inside the script.
+- Preserve the PASS/FAIL output and nonzero exit contract. If shell access is
+  available, run bash verify.sh to validate the checker.
+
+Reply with DONE after writing the script.

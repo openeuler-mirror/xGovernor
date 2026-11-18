@@ -1,0 +1,194 @@
+{
+  "plugin_id": "mcts",
+  "resource_root": ".",
+  "modes": {
+    "zsoft": {
+      "task_plugin_root": "tasks/zsoft",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_author_step.txt"
+        },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_solver_init.txt"
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_solver_step.txt"
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_submission_selector.txt",
+          "output_mode": "final_text"
+        },
+        "trial-assessor": {
+          "role": "trial_assessor",
+          "owner": "xgovernor",
+          "source": "tasks/zsoft/prompts/prompt_trial_assessor.txt"
+        },
+        "memory-merge": {
+          "role": "memory_merge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_memory_merge.txt",
+          "tools_enabled": false
+        },
+        "fork-judge": {
+          "role": "fork_judge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_fork_judge.txt",
+          "tools_enabled": false,
+          "output_mode": "final_text"
+        }
+      }
+    },
+    "sweverified": {
+      "task_plugin_root": "tasks/swe_bench",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "tasks/swe_bench/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "tasks/swe_bench/prompts/prompt_author_step.txt"
+        },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "tasks/swe_bench/prompts/prompt_solver_init.txt"
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "tasks/swe_bench/prompts/prompt_solver_step.txt"
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "tasks/swe_bench/prompts/prompt_submission_selector.txt",
+          "output_mode": "final_text"
+        },
+        "memory-merge": {
+          "role": "memory_merge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_memory_merge.txt",
+          "tools_enabled": false
+        },
+        "fork-judge": {
+          "role": "fork_judge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_fork_judge.txt",
+          "tools_enabled": false,
+          "output_mode": "final_text"
+        }
+      }
+    },
+    "generic": {
+      "task_plugin_root": "tasks/generic",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "tasks/generic/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "tasks/generic/prompts/prompt_author_step.txt"
+        },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "tasks/generic/prompts/prompt_solver_init.txt"
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "tasks/generic/prompts/prompt_solver_step.txt"
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "tasks/generic/prompts/prompt_submission_selector.txt",
+          "output_mode": "final_text"
+        },
+        "memory-merge": {
+          "role": "memory_merge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_memory_merge.txt",
+          "tools_enabled": false
+        },
+        "fork-judge": {
+          "role": "fork_judge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_fork_judge.txt",
+          "tools_enabled": false,
+          "output_mode": "final_text"
+        }
+      }
+    },
+    "deepswe": {
+      "task_plugin_root": "tasks/deepswe",
+      "profiles": {
+        "author-init": {
+          "role": "author_initial",
+          "owner": "xgovernor",
+          "source": "tasks/deepswe/prompts/prompt_author_init.txt"
+        },
+        "author-step": {
+          "role": "author_step",
+          "owner": "xgovernor",
+          "source": "tasks/deepswe/prompts/prompt_author_step.txt"
+        },
+        "solver-init": {
+          "role": "solver_initial",
+          "owner": "xgovernor",
+          "source": "tasks/deepswe/prompts/prompt_solver_init.txt",
+          "prompt_metadata": {
+            "mcts_deepswe_solver": true
+          }
+        },
+        "solver-step": {
+          "role": "solver_step",
+          "owner": "xgovernor",
+          "source": "tasks/deepswe/prompts/prompt_solver_step.txt",
+          "prompt_metadata": {
+            "mcts_deepswe_solver": true
+          }
+        },
+        "submission-selector": {
+          "role": "submission_selector",
+          "owner": "xgovernor",
+          "source": "tasks/deepswe/prompts/prompt_submission_selector.txt",
+          "output_mode": "final_text",
+          "tools_enabled": false
+        },
+        "memory-merge": {
+          "role": "memory_merge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_memory_merge.txt",
+          "tools_enabled": false
+        },
+        "fork-judge": {
+          "role": "fork_judge",
+          "owner": "xgovernor",
+          "source": "roles/prompt_fork_judge.txt",
+          "tools_enabled": false,
+          "output_mode": "final_text"
+        }
+      }
+    }
+  }
+}

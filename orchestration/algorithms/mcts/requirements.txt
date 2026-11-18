@@ -1,0 +1,2 @@
+# Runtime dependency for the MCTS JSON-RPC v1 codec.
+jsonschema>=4.18,<5
