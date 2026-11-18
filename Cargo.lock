@@ -1624,6 +1624,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "orchestration-run-manager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libc",
+ "orchestration-contract",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "xgovernor-mcp",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

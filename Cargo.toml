@@ -2,6 +2,7 @@
 members = [
     "apps/server",
     "orchestration/mcp",
+    "orchestration/run-manager",
     "apps/runtime-pi",
     "apps/runtime-opencode",
     "apps/runtime-xiaoo",
